@@ -609,6 +609,26 @@ class MainModel(PredictorModel):
             'max_attempts': 1,                # Max refit attempts in case a model leads to nan loss
             'linear_cell': self.linear_cell if hasattr(self, 'linear_cell') else False, # If true, will use a linear cell instead of general regression cell (JUST FOR TESTS)
             'LSTM_cell': self.LSTM_cell,      # If true, will use an LSTM cell in the RNNs instead of general regression cell
+            'stage_1_state_transition_architecture': getattr(
+                self,
+                'stage_1_state_transition_architecture',
+                None,
+            ),
+            'stage_2_state_transition_architecture': getattr(
+                self,
+                'stage_2_state_transition_architecture',
+                None,
+            ),
+            'stage_1_lstm_arguments': getattr(
+                self,
+                'stage_1_lstm_arguments',
+                None,
+            ),
+            'stage_2_lstm_arguments': getattr(
+                self,
+                'stage_2_lstm_arguments',
+                None,
+            ),
             'allow_nonzero_Cz2': self.allow_nonzero_Cz2,  # If true, will use the states in the second stage to add to the decoding of behavior. 
                                               # This usually doesn't help and can even cause some overfitting for very large n2.
             'has_Dyz': self.has_Dyz,          # If true, will also fit a direct regression from Y to Z
@@ -640,9 +660,10 @@ class MainModel(PredictorModel):
     def fit(self, Y, Z=None, U=None, nx=None, n1=None, 
             epochs=2500,         # Max number of epochs to go over the whole training data
             batch_size=None,     # If not none, will set the batch_size of the MainModel to this value
-            init_model=None,     # Will initialize by provided method
-            init_method=None,    # Will initialize by the provided method
-            regression_init_method=None, # Will initialize regressions with the provided method
+            # Legacy initialisation arguments are not implemented.
+            init_model=None,
+            init_method=None,
+            regression_init_method=None,
             init_attempts = 1,  # Will retry with different (random) initializations at least this many times
             max_attempts = 10,  # Max refit attempts in case a model leads to nan loss
             early_stopping_patience = 3, # Will stop numerical optimization early any time this many epochs do not bring an improvement in the loss
@@ -657,6 +678,10 @@ class MainModel(PredictorModel):
             true_model = None,
             linear_cell = False, # If true, will use a linear cell instead of general regression cell (JUST FOR TESTS)
             LSTM_cell=False,     # If true, will use an LSTM cell in the RNNs instead of general regression cell
+            stage_1_state_transition_architecture = None,
+            stage_2_state_transition_architecture = None,
+            stage_1_lstm_arguments = None,
+            stage_2_lstm_arguments = None,
             allow_nonzero_Cz2=True, # If true, will use the states in the second stage to add to the decoding of behavior. 
                                     # This usually doesn't help and can even cause some overfitting for very large n2.
             has_Dyz = False,        # If true, will also fit a direct regression from Y to Z
@@ -689,6 +714,13 @@ class MainModel(PredictorModel):
             lr_scheduler_name = None, # Name of learning rate scheduler class (e.g., ExponentialDecay)
             lr_scheduler_args = None,  # Dict of arguments for the learning rate scheduler
         ): 
+        """Fit the two-stage model.
+
+        Notes
+        -----
+        ``init_model``, ``init_method``, and ``regression_init_method`` are
+        retained for compatibility but are not implemented.
+        """
         eagerly_flag_backup = set_global_tf_eagerly_flag(False)
         if clear_graph:
             tf.keras.backend.clear_session()
@@ -908,6 +940,18 @@ class MainModel(PredictorModel):
         self.K2_args = copy.deepcopy(K2_args)
         self.linear_cell = linear_cell
         self.LSTM_cell = LSTM_cell
+        self.stage_1_state_transition_architecture = (
+            stage_1_state_transition_architecture
+        )
+        self.stage_2_state_transition_architecture = (
+            stage_2_state_transition_architecture
+        )
+        self.stage_1_lstm_arguments = copy.deepcopy(
+            stage_1_lstm_arguments
+        )
+        self.stage_2_lstm_arguments = copy.deepcopy(
+            stage_2_lstm_arguments
+        )
         self.optimizer_name = optimizer_name
         self.optimizer_args = optimizer_args
         self.lr_scheduler_name = lr_scheduler_name
@@ -1583,6 +1627,10 @@ class MainModel(PredictorModel):
                 'CSettings': self.Cz1_args, 
                 'learn_initial_state': self.learn_initial_state
             })
+            if self.stage_1_lstm_arguments is not None:
+                rnn_cell_args['LSTMSettings'] = copy.deepcopy(
+                    self.stage_1_lstm_arguments
+                )
             this_log_dir = '' if self.log_dir == '' else os.path.join(self.log_dir, 'RNN1')
             # model1: RNN with input: [y,u], states: x1 => n1, outputs: z, feedthrough: u
             model1 = RNNModel(self.n1, self.ny+self.nu, 
@@ -1593,6 +1641,9 @@ class MainModel(PredictorModel):
                         n1_in=self.nu if self.nu > 0 and self.observable_U_in_Kfw else 0, # Supported observed U in Kfw
                         linear_cell=self.linear_cell, 
                         LSTM_cell=self.LSTM_cell, 
+                        state_transition_architecture=(
+                            self.stage_1_state_transition_architecture
+                        ),
                         stateful=self.stateful,
                         out_dist=zDist, 
                         optimizer_name=self.optimizer_name, optimizer_args=self.optimizer_args, 
@@ -1615,6 +1666,10 @@ class MainModel(PredictorModel):
                 'CSettings': self.Cy2_args,
                 'learn_initial_state': self.learn_initial_state
             })
+            if self.stage_2_lstm_arguments is not None:
+                rnn_cell_args['LSTMSettings'] = copy.deepcopy(
+                    self.stage_2_lstm_arguments
+                )
             this_log_dir = '' if self.log_dir == '' else os.path.join(self.log_dir, 'RNN2')
             # model2: RNN with input: [x1,y,u], states: x2 => n2, outputs: y, feedthrough: u
             nft2 = self.nu if self.has_UFT else 0
@@ -1626,6 +1681,9 @@ class MainModel(PredictorModel):
                         n1_in=self.n1+self.nu if self.nu > 0 and self.observable_U_in_Kfw else self.n1,  #supported including external input in forward prediction Kfw(e.g., if observable_U_in_Kfw=True: n1_in=self.n1+self.nu).
                         linear_cell=self.linear_cell,
                         LSTM_cell=self.LSTM_cell,
+                        state_transition_architecture=(
+                            self.stage_2_state_transition_architecture
+                        ),
                         stateful=self.stateful,
                         has_prior_pred=True, # From stage 1
                         out_dist=yDist, 

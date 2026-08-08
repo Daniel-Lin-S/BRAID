@@ -692,7 +692,9 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
                     has_prior_pred=False, # If true, will support a prior prediction during training
                     name='RNN_', # Name in computation graph
                     log_dir = '', # If not empty, will save logs with tensorboard
-                    linear_cell=False, LSTM_cell=False, missing_marker=None, cell_args={},
+                    linear_cell=False, LSTM_cell=False,
+                    state_transition_architecture=None,
+                    missing_marker=None, cell_args={},
                     initLSSM = None, # An LSSM to initialize the RNN with
                     optimizer_name = 'Adam', # Name of optimizer
                     optimizer_args = None, # Dict of arguments for the optimizer
@@ -719,6 +721,7 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
             'log_dir': log_dir, 
             'linear_cell': linear_cell, 
             'LSTM_cell': LSTM_cell, 
+            'state_transition_architecture': state_transition_architecture,
             'missing_marker': missing_marker, 
             'cell_args': cell_args, 
             'initLSSM': initLSSM,
@@ -784,6 +787,9 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
 
         self.linear_cell = linear_cell
         self.LSTM_cell = LSTM_cell
+        self.state_transition_architecture = (
+            state_transition_architecture
+        )
         self.build()
         if initLSSM is not None:
             self.setToLSSM(initLSSM)
@@ -793,7 +799,8 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
         config = super(RNNModel, self).get_config()
         initArgNames = ['nx', 'ny', 'block_samples', 'batch_size', 
             'ny_out', 'nft', 'out_dist', 'n1_in', 'has_prior_pred', 
-            'log_dir', 'linear_cell', 'LSTM_cell', 
+            'log_dir', 'linear_cell', 'LSTM_cell',
+            'state_transition_architecture',
             'missing_marker', 'cell_args', 'initLSSM',
             'optimizer_name', 'optimizer_args',
             'lr_scheduler_name', 'lr_scheduler_args',
@@ -808,7 +815,43 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
 
     def build(self):
         y_in = tf.keras.Input(shape=(self.block_samples, self.ny), batch_size=self.batch_size)       # y_k is the input to the RNN
-        if self.linear_cell:
+        if self.state_transition_architecture is not None:
+            if self.state_transition_architecture == 'lstm':
+                cell = NLRegLSTMCell(
+                    self.nx,
+                    ny_out=self.ny_out,
+                    nft=self.nft,
+                    n1_in=self.n1_in,
+                    missing_marker=self.missing_marker,
+                    steps_ahead=self.steps_ahead,
+                    enable_forward_pred=self.enable_forward_pred,
+                    multi_step_with_A_KC=self.multi_step_with_A_KC,
+                    observable_U_in_Cfw=self.observable_U_in_Cfw,
+                    name=self.name,
+                    **self.cell_args,
+                )
+            elif self.state_transition_architecture == (
+                'multilayer_perceptron'
+            ):
+                cell = NLRegRNNCell(
+                    self.nx,
+                    ny_out=self.ny_out,
+                    nft=self.nft,
+                    n1_in=self.n1_in,
+                    missing_marker=self.missing_marker,
+                    steps_ahead=self.steps_ahead,
+                    enable_forward_pred=self.enable_forward_pred,
+                    multi_step_with_A_KC=self.multi_step_with_A_KC,
+                    observable_U_in_Cfw=self.observable_U_in_Cfw,
+                    name=self.name,
+                    **self.cell_args,
+                )
+            else:
+                raise ValueError(
+                    'Unsupported state-transition architecture: '
+                    f'{self.state_transition_architecture}.'
+                )
+        elif self.linear_cell:
             if 'ASettings' in self.cell_args: self.cell_args.pop('ASettings')
             if 'KSettings' in self.cell_args: self.cell_args.pop('KSettings')
             if 'CSettings' in self.cell_args: self.cell_args.pop('CSettings')

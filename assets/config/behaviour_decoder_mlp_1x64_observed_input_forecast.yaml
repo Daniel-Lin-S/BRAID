@@ -1,0 +1,17 @@
+# This file overrides values in default.yaml.
+model:
+  dimensions:
+    behaviour_relevant_neural_state_size: 1
+    behaviour_irrelevant_neural_state_size: 0
+    non_neural_behaviour_state_size: none
+    preprocessing_state_size: none
+  stage_1:
+    behaviour_decoder:
+      hidden_size: 64
+      depth: 1
+      activation: relu
+      use_bias: true
+forecast:
+  steps_ahead: [1, 4, 5]
+  use_observed_input_in_dynamics: true
+  use_observed_input_in_decoder: true

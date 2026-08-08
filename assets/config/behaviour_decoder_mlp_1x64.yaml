@@ -1,0 +1,14 @@
+# Change the default linear behaviour decoder to one-hidden-layer MLP 
+# (ReLU activation) with 64 hidden units
+model:
+  dimensions:
+    behaviour_relevant_neural_state_size: 1
+    behaviour_irrelevant_neural_state_size: 0
+    non_neural_behaviour_state_size: 1
+    preprocessing_state_size: 1
+  stage_1:
+    behaviour_decoder:
+      hidden_size: 64
+      depth: 1
+      activation: relu
+      use_bias: true
