@@ -298,17 +298,59 @@ def evaluateDecoding(
 
 
 def evalPrediction(trueValue, prediction, measure, missing_marker=None):
-    """Evaluates prediction of data
+    """Evaluate predictions independently for every output dimension.
 
-    Args:
-        trueValue (np.array): true values. The first dimension is taken as the sample dimension
-            over which metrics are computed.
-        prediction (np.array): predicted values
-        measure (string): performance measure name
-        missing_marker: if not None, will ignore samples with this value (default: None)
+    Parameters
+    ----------
+    trueValue : numpy.ndarray of shape (n_samples, n_outputs)
+        Reference values. Axis 0 indexes time points, trials, or other
+        independent samples. Axis 1 indexes output dimensions. For
+        classification measures, entries are integer class labels.
+    prediction : numpy.ndarray
+        Predicted values aligned with ``trueValue`` on axes 0 and 1.
+        Regression measures require shape ``(n_samples, n_outputs)``. ``ACC``
+        and ``ACCD0`` through ``ACCD9`` accept either that shape containing
+        predicted class labels or shape ``(n_samples, n_outputs, n_classes)``
+        containing class scores or probabilities. ``AUC`` and ``CM`` require
+        the latter shape, where axis 2 indexes classes.
+    measure : {"CC", "MSE", "RMSE", "NRMSE", "MAE", "NMAE", "EV", "R2",
+               "ACC", "ACCD0", ..., "ACCD9", "AUC", "CM", "PoissonLL"}
+        Performance measure to calculate:
 
-    Returns:
-        perf (np.array): the value of performance measure, computed for each dimension of data
+        - ``"CC"``: Pearson correlation coefficient.
+        - ``"MSE"``: mean squared error.
+        - ``"RMSE"``: square root of mean squared error.
+        - ``"NRMSE"``: RMSE divided by the standard deviation of the
+          reference values.
+        - ``"MAE"``: mean absolute error.
+        - ``"NMAE"``: MAE divided by the mean absolute deviation of the
+          reference values from their mean.
+        - ``"EV"``: explained-variance score.
+        - ``"R2"``: coefficient of determination.
+        - ``"ACC"``: exact classification accuracy.
+        - ``"ACCD0"`` through ``"ACCD9"``: classification accuracy after
+          treating labels within the specified integer distance as equal.
+        - ``"AUC"``: macro one-versus-one ROC AUC for multiclass scores, or
+          binary ROC AUC using the final class-score axis.
+        - ``"CM"``: confusion matrix.
+        - ``"PoissonLL"``: mean Poisson loss without the constant
+          ``log(trueValue!)`` term, calculated as
+          ``prediction - trueValue * log(prediction)``.
+    missing_marker : float or int, optional
+        Marker used to exclude samples. A sample is retained only when every
+        predicted output is different from this value. When the marker is
+        ``numpy.nan``, samples with NaN predictions are excluded instead.
+        Default is ``None``.
+
+    Returns
+    -------
+    perf : numpy.ndarray
+        Per-output metric values with shape ``(n_outputs,)`` for every measure
+        except ``"CM"``. For ``"CM"``, the shape is
+        ``(n_classes, n_classes, n_outputs)``: axis 0 is the true class, axis
+        1 is the predicted class, and axis 2 is the output dimension. Metrics
+        undefined for a flat reference output are NaN for ``"CC"``,
+        ``"NRMSE"``, and ``"NMAE"``; they are zero for ``"EV"`` and ``"R2"``.
     """
     if missing_marker is not None:
         if np.isnan(missing_marker):

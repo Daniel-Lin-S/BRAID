@@ -16,6 +16,7 @@ import re
 import time
 import warnings
 from datetime import datetime
+from typing import Optional, Sequence
 
 import tensorflow as tf
 
@@ -45,6 +46,17 @@ from .tools.tools import get_one_hot
 logger = logging.getLogger(__name__)
 
 make_list = lambda w: w if isinstance(w,list) else [w]
+
+
+def _has_multi_step_forecast(
+    steps_ahead: Optional[Sequence[int]],
+) -> bool:
+    """Return whether a forecast horizon exceeds one step."""
+    return steps_ahead is not None and any(
+        step_ahead > 1 for step_ahead in steps_ahead
+    )
+
+
 class MinimalRNNCell(tf.keras.layers.Layer):
     """A basic reference implementation of an RNN cell that implements a linear Kalman-like filter 
     """
@@ -175,7 +187,11 @@ class NLRegRNNCell(tf.keras.layers.Layer):
             self.Afw = RegressionModel(n_in=n_in_Afw, n_out=self.units, **self.AfwSettings) # A for recursions without input/with missing data
             if self.n1_in > 0 and not self.unifiedAK: # and self.n1_in<ny_in: in case n1_in==ny_in, it means y=None initialy and either K or Kfw can be used in forward. For now I use Kfw but this can be avoided to just not make Kfw.
                 self.Kfw = RegressionModel(n_in=self.n1_in, n_out=self.units,  **self.KfwSettings) # K for inputs with missing data (only the first n1 dims available)
-            if self.nft > 0 and not self.observable_U_in_Cfw:
+            if (
+                self.nft > 0
+                and not self.observable_U_in_Cfw
+                and _has_multi_step_forecast(self.steps_ahead)
+            ):
                 self.Cfw = RegressionModel(n_in=self.units, n_out=self.ny_out, **self.CfwSettings) # C for readouts without feedthrough
         self.initial_state = tf.Variable(
             name='initial_state', 
@@ -558,7 +574,11 @@ class NLRegLSTMCell(NLRegRNNCell):
             self.LSTMCellfw = tf.keras.layers.LSTMCell(units=self.units, **self.LSTMfwSettings) # A for recursions without input/with missing data
             if self.n1_in > 0 and not self.unifiedAK:
                 self.Kfw = RegressionModel(n_in=self.n1_in, n_out=self.units,  **self.KfwSettings) # K for inputs with missing data (only the first n1 dims available)
-            if self.nft > 0 and not self.observable_U_in_Cfw:
+            if (
+                self.nft > 0
+                and not self.observable_U_in_Cfw
+                and _has_multi_step_forecast(self.steps_ahead)
+            ):
                 self.Cfw = RegressionModel(n_in=self.units, n_out=self.ny_out, **self.CfwSettings) # C for readouts without feedthrough
         self.initial_state = tf.Variable(
             name='initial_state', 

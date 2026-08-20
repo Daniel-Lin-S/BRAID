@@ -16,7 +16,8 @@ model:
   # neural_decoder_uses_full_state makes stage_1.neural_decoder unused
   # and delegate stage_2.neural_decoder to decode the full state.
   neural_decoder_uses_full_state: false
-  behaviour_decoder_uses_full_state: true
+  # Set true only when Cz2 should decode the full neural state.
+  behaviour_decoder_uses_full_state: false
   # skip_neural_decoder omits neural_decoder ONLY when no stage-2 state
   # exists and neural_decoder_uses_full_state is false.
   skip_neural_decoder: false

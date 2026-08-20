@@ -154,21 +154,102 @@ def shift_1s_to_ms_series(Y_shifted_steps, steps_ahead, missing_marker=None, tim
         Y.append(pred_shifted_back) 
     return tuple(Y)
 
+def _trim_alignment_padding(
+    true_values: np.ndarray,
+    prediction: np.ndarray,
+    step_ahead: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Remove NaN padding used to align a multi-step prediction.
+
+    Parameters
+    ----------
+    true_values : numpy.ndarray
+        Time-first target array with time on axis 0.
+    prediction : numpy.ndarray
+        Time-first prediction array aligned to ``true_values``. Alignment
+        padding may occupy the first or final ``step_ahead - 1`` samples.
+    step_ahead : int
+        Forecast horizon represented by ``prediction``.
+
+    Returns
+    -------
+    tuple[numpy.ndarray, numpy.ndarray]
+        Target and prediction arrays with only intentional leading or trailing
+        NaN alignment padding removed. Other NaNs remain, so invalid model
+        outputs are not hidden by metric logging.
+    """
+    if step_ahead < 1:
+        raise ValueError(
+            "step_ahead must be at least 1, but got {}.".format(step_ahead)
+        )
+    if true_values.shape[0] != prediction.shape[0]:
+        raise ValueError(
+            "Aligned targets and predictions must have the same number of "
+            "time samples, but got {} and {}.".format(
+                true_values.shape[0],
+                prediction.shape[0],
+            )
+        )
+
+    padding_size = step_ahead - 1
+    if padding_size == 0 or not np.issubdtype(prediction.dtype, np.inexact):
+        return true_values, prediction
+
+    padding_axes = tuple(range(1, prediction.ndim))
+    leading_padding = np.all(
+        np.isnan(prediction[:padding_size]),
+        axis=padding_axes,
+    )
+    trailing_padding = np.all(
+        np.isnan(prediction[-padding_size:]),
+        axis=padding_axes,
+    )
+    if np.all(leading_padding):
+        return true_values[padding_size:], prediction[padding_size:]
+    if np.all(trailing_padding):
+        return true_values[:-padding_size], prediction[:-padding_size]
+    return true_values, prediction
+
+
 def getLossLogStr(trueVals, predVals, steps, sigType, lossFuncs):
-    if not isinstance(trueVals, (list,tuple)):
+    """Format per-horizon training metrics without alignment padding.
+
+    Multi-step predictions are shifted to align each prediction with its
+    target. This function removes only the NaN rows inserted by that shift
+    before calculating metrics; it retains all other samples and NaNs.
+    """
+    if not isinstance(trueVals, (list, tuple)):
         trueVals = [trueVals]
-    if not isinstance(predVals, (list,tuple)):
+    if not isinstance(predVals, (list, tuple)):
         predVals = [predVals]
     if steps is None:
         steps = [1]
-    strs = []
-    for ind in range(len(predVals)):
-        trueVal = trueVals[ind%len(trueVals)]
-        predVal = predVals[ind%len(predVals)]
-        step = steps[ind%len(steps)]
-        lossVals = [lossFunc(trueVal, predVal.T) if sigType in ['cont', 'count_process'] else lossFunc(trueVal, predVal.transpose([1,0,2])) for lossFunc in lossFuncs]
-        strs.append(f'{step}-step: '+', '.join( [f'{lossFunc.__name__}={lossVal:.3g}' for lossFunc, lossVal in zip(lossFuncs, lossVals)]) )
-    return '\n'.join(strs)
+    strings = []
+    for index, pred_val in enumerate(predVals):
+        true_val = trueVals[index % len(trueVals)]
+        step_ahead = steps[index % len(steps)]
+        if sigType in ["cont", "count_process"]:
+            prediction = pred_val.T
+        else:
+            prediction = pred_val.transpose([1, 0, 2])
+        true_val, prediction = _trim_alignment_padding(
+            true_val,
+            prediction,
+            step_ahead,
+        )
+        loss_values = [
+            loss_func(true_val, prediction) for loss_func in lossFuncs
+        ]
+        strings.append(
+            "{}-step: {}".format(
+                step_ahead,
+                ", ".join(
+                    "{}={:.3g}".format(loss_func.__name__, loss_value)
+                    for loss_func, loss_value in zip(lossFuncs, loss_values)
+                ),
+            )
+        )
+    return "\n".join(strings)
     
 def MainModelPrepareArgs(methodCode):
     """Parses a method code and preprares the arguments for the MainModel constructor.

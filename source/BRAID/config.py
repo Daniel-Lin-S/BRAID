@@ -9,7 +9,10 @@ from typing import Any, Dict, Union
 
 import yaml
 
-DEFAULT_CONFIG_DIRECTORY = Path(__file__).parents[2] / "assets" / "config"
+BRAID_PACKAGE_DIRECTORY = Path(__file__).resolve().parent
+DEFAULT_CONFIG_DIRECTORY = (
+    BRAID_PACKAGE_DIRECTORY.parents[1] / "assets" / "config"
+)
 DIMENSIONS_KEY = "dimensions"
 MODEL_KEY = "model"
 TRAINING_KEY = "training"
