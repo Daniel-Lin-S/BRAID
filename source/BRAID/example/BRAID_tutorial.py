@@ -1,9 +1,10 @@
 import logging
 import os
 import sys
+from pathlib import Path
 
-sys.path.insert(0, os.path.join("..", ".."))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+SOURCE_DIRECTORY = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(SOURCE_DIRECTORY))
 
 # Setting up logs
 logging.basicConfig(level=logging.INFO)
