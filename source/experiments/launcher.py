@@ -12,7 +12,7 @@ import subprocess
 import sys
 
 from .configuration import argument_parser, resolve_configuration
-from .runtime import launch_directory
+from .runtime import launch_directory, thread_environment
 
 
 def main() -> None:
@@ -29,6 +29,14 @@ def main() -> None:
     command = [python, "-u", "-m", "experiments.runner"]
     command.extend(value for value in sys.argv[1:] if value != "--detach")
     environment = dict(os.environ, NHP_LAUNCH_LOG_DIR=str(directory))
+    environment.update(
+        thread_environment(
+            settings["runtime"]["cpu_threads"],
+            settings["runtime"]["cpu_interop_threads"],
+        )
+    )
+    if settings["runtime"]["device"] == "cpu":
+        environment["CUDA_VISIBLE_DEVICES"] = "-1"
     environment["TF_USE_LEGACY_KERAS"] = "1"
     environment["MPLBACKEND"] = "Agg"
     environment.setdefault(

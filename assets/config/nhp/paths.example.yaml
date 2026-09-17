@@ -6,6 +6,7 @@ paths:
   log_root: null
 runtime:
   python: null  # Optional: otherwise use the launcher's interpreter.
-  device: auto
+  device: auto  # Most free GPU memory; also accepts cpu or GPU index/UUID.
   cpu_threads: 4
+  cpu_interop_threads: 1
   log_level: INFO

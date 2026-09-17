@@ -8,7 +8,7 @@ Obtain the Indy `.mat` spike/task files from the [public reaching dataset](https
 
 Copy `assets/config/nhp/paths.example.yaml` to `assets/config/nhp/paths.local.yaml`. Set its absolute dataset, cache, artifact and log directories. Set the optional Python interpreter and runtime preferences there. These machine settings are ignored by Git.
 
-Use Python 3.11 with the dependencies in `requirements.txt`; the exact validated package lock is `assets/environment/requirements-gpu.lock.txt`. The launcher selects legacy Keras and requires a working GPU for fitting.
+Use Python 3.11 with the dependencies in `requirements.txt`; the exact validated package lock is `assets/environment/requirements-gpu.lock.txt`. The launcher selects legacy Keras and defaults to automatic GPU selection; explicit CPU execution is also supported.
 
 ## Experiment selection
 
@@ -95,3 +95,20 @@ fitting uses `fitted_previews/<checkpoint checksum>/`. The independent
 has an index and checksum
 manifest; source artifacts are preserved. Keep regeneration settings and
 outputs outside version control.
+
+
+### Execution device
+
+`train_nhp.sh` defaults to `--device auto`: among GPUs permitted by
+`CUDA_VISIBLE_DEVICES`, select the most free memory, then lowest utilization.
+Use `--device INDEX` or a full GPU UUID to select a physical device explicitly.
+BRAID supports CUDA fitting through TensorFlow; the runner verifies a real
+forward/backward operation and records the selected device in run metadata.
+GPU selection is a snapshot, not a reservation against other processes.
+
+Use `--device cpu --cpu-threads 8 --cpu-interop-threads 1` for CPU execution.
+The corresponding YAML keys are `runtime.device`, `runtime.cpu_threads` and
+`runtime.cpu_interop_threads`. Compute threads control TensorFlow intra-op
+and numerical-library thread pools; inter-op threads control TensorFlow's
+concurrent operations. GPU failures raise an error without a silent CPU
+fallback. Preprocessing and preview stages do not require GPU selection.

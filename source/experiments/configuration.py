@@ -97,7 +97,11 @@ def argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stage", choices=STAGES, default="fit")
     parser.add_argument("--session", action="append")
     parser.add_argument("--fold", type=int, action="append")
-    parser.add_argument("--device")
+    parser.add_argument(
+        "--device", help="auto (most free GPU memory), cpu, GPU index or UUID"
+    )
+    parser.add_argument("--cpu-threads", type=int)
+    parser.add_argument("--cpu-interop-threads", type=int)
     parser.add_argument(
         "--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"]
     )
@@ -155,12 +159,21 @@ def resolve_configuration(arguments: argparse.Namespace) -> dict:
         data["previews"]["enabled"] = False
     if arguments.no_plots:
         resolved["plotting"]["enabled"] = False
-    for key in ("device", "log_level"):
+    for key in ("device", "log_level", "cpu_threads", "cpu_interop_threads"):
         value = getattr(arguments, key)
         if value is not None:
             runtime[key] = value
     if runtime["log_level"] not in ("DEBUG", "INFO", "WARNING", "ERROR"):
         raise ValueError("Unsupported runtime.log_level.")
-    if runtime["cpu_threads"] < 1:
-        raise ValueError("runtime.cpu_threads must be positive.")
+    runtime.setdefault("cpu_interop_threads", 1)
+    for key in ("cpu_threads", "cpu_interop_threads"):
+        if type(runtime[key]) is not int or runtime[key] < 1:
+            raise ValueError(f"runtime.{key} must be a positive integer.")
+    device = runtime["device"]
+    if not isinstance(device, str) or not (
+        device in ("auto", "cpu")
+        or device.isdecimal()
+        or device.startswith("GPU-")
+    ):
+        raise ValueError("device must be auto, cpu, a GPU index or GPU UUID.")
     return resolved

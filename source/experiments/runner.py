@@ -28,7 +28,7 @@ from .contracts import Dataset, FeatureSet, plugin
 from .previews import preprocessing_previews
 from .runtime import (
     case_logging,
-    configure_gpu,
+    configure_device,
     configure_logging,
     launch_directory,
 )
@@ -361,7 +361,11 @@ def main() -> None:
     np.random.seed(experiment["seed"])
     gpu = None
     if arguments.stage != "preprocess":
-        gpu = configure_gpu(runtime["device"], runtime["cpu_threads"])
+        gpu = configure_device(
+            runtime["device"],
+            runtime["cpu_threads"],
+            runtime["cpu_interop_threads"],
+        )
     cases = (
         []
         if arguments.stage == "preprocess"
