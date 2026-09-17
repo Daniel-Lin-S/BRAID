@@ -75,3 +75,5 @@ results/
 tmp/
 temp/
 *.tmp
+# Machine paths and private experiment configurations
+*.local.yaml

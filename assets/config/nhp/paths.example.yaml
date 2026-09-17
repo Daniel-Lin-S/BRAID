@@ -1,0 +1,11 @@
+# Copy to paths.local.yaml and fill in absolute paths for this machine.
+paths:
+  dataset_root: null
+  cache_root: null
+  artifact_root: null
+  log_root: null
+runtime:
+  python: null  # Optional: otherwise use the launcher's interpreter.
+  device: auto
+  cpu_threads: 4
+  log_level: INFO

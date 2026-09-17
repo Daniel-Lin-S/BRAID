@@ -1,13 +1,15 @@
-# python version: 3.9.2
-tensorflow==2.7.4
-numpy==1.22.4
-coloredlogs==15.0.1
-tqdm==4.65.0
-xxhash
-sympy==1.8
-ipython==7.22.0
-ipykernel==5.5.3
-matplotlib==3.4.2
-scipy==1.6.3
-scikit-learn==0.24.2
+# Python 3.11; export TF_USE_LEGACY_KERAS=1 before importing TensorFlow.
+tensorflow[and-cuda]==2.21.0
+tf-keras==2.21.0
+tensorboard==2.20.0
+numpy==1.26.4
+scipy==1.15.3
+h5py==3.14.0
+matplotlib==3.10.8
+scikit-learn==1.7.2
 PyYAML==6.0.2
+coloredlogs==15.0.1
+tqdm==4.70.1
+xxhash==4.0.1
+sympy==1.14.0
+ipython==9.17.1

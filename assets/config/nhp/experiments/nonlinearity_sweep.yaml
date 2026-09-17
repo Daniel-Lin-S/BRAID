@@ -1,0 +1,3 @@
+name: nonlinearity_sweep
+enabled: false
+reason: Deferred; architecture variants and comparison controls are unspecified.

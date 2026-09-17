@@ -1,68 +1,32 @@
-# Complete YAML reference for BRAID fitting. Y, Z, and U are caller-provided arrays.
-# YAML value "none" is converted to Python None.
 model:
   dimensions:
-    behaviour_relevant_neural_state_size: none
-    behaviour_irrelevant_neural_state_size: none  # set to 0 omits stage_2
-    non_neural_behaviour_state_size: none  # optional stage, set to none to omit
-    preprocessing_state_size: none  # optional
-  # allow_stage_2_behaviour_contribution is overridden when
-  # behaviour_decoder_uses_full_state is true or no stage-1 state
-  # exists. allow_stage_2_behaviour_contribution: 
-  allow_stage_2_behaviour_contribution: true  # false leaves stage_2.behaviour_decoder unused.
+    behaviour_relevant_neural_state_size: 16
+    behaviour_irrelevant_neural_state_size: 0
+    non_neural_behaviour_state_size: null
+    preprocessing_state_size: 150
+  allow_stage_2_behaviour_contribution: false
   include_direct_neural_to_behaviour_mapping: false
-  include_input_feedthrough: true
-  include_input_in_decoders: true
-  # neural_decoder_uses_full_state makes stage_1.neural_decoder unused
-  # and delegate stage_2.neural_decoder to decode the full state.
+  include_input_feedthrough: false
+  include_input_in_decoders: false
   neural_decoder_uses_full_state: false
-  # Set true only when Cz2 should decode the full neural state.
   behaviour_decoder_uses_full_state: false
-  # skip_neural_decoder omits neural_decoder ONLY when no stage-2 state
-  # exists and neural_decoder_uses_full_state is false.
   skip_neural_decoder: false
   stage_1:
-    # combine_state_and_input_mapping makes input_mapping invalid and
-    # rejected when true.
     combine_state_and_input_mapping: false
     state_transition:
       architecture: multilayer_perceptron
-      hidden_size: none  # width of every hidden layer
-      depth: none  # number of hidden layers
-      activation: linear  # applied to hidden layers
+      hidden_size: none
+      depth: none
+      activation: linear
       output_activation: linear
       use_bias: false
       dropout_rate: 0.0
       kernel_initialiser: uniform
       bias_initialiser: zeros
       kernel_regulariser: none
-      # kernel_regulariser_arguments, bias_regulariser_arguments, and LSTM
-      # constraint arguments are TensorFlow constructor keyword arguments.
       kernel_regulariser_arguments: none
       bias_regulariser: none
       bias_regulariser_arguments: none
-      # state_transition.architecture: lstm uses the following TensorFlow LSTMCell settings.
-      # activation: tanh
-      # recurrent_activation: sigmoid
-      # use_bias: true
-      # kernel_initialiser: glorot_uniform
-      # recurrent_initialiser: orthogonal
-      # bias_initialiser: zeros
-      # unit_forget_bias: true  # adds one to the forget-gate bias during initialisation
-      # dropout_rate: 0.0
-      # recurrent_dropout_rate: 0.0
-      # kernel_regulariser: none
-      # kernel_regulariser_arguments: none
-      # recurrent_regulariser: none
-      # recurrent_regulariser_arguments: none
-      # bias_regulariser: none
-      # bias_regulariser_arguments: none
-      # kernel_constraint: none
-      # kernel_constraint_arguments: none
-      # recurrent_constraint: none
-      # recurrent_constraint_arguments: none
-      # bias_constraint: none
-      # bias_constraint_arguments: none
     input_mapping:
       hidden_size: none
       depth: none
@@ -77,11 +41,11 @@ model:
       bias_regulariser: none
       bias_regulariser_arguments: none
     neural_decoder:
-      hidden_size: none
-      depth: none
-      activation: linear
+      hidden_size: 64
+      depth: 1
+      activation: relu
       output_activation: linear
-      use_bias: false
+      use_bias: true
       dropout_rate: 0.0
       kernel_initialiser: glorot_uniform
       bias_initialiser: zeros
@@ -90,11 +54,11 @@ model:
       bias_regulariser: none
       bias_regulariser_arguments: none
     behaviour_decoder:
-      hidden_size: none
-      depth: none
-      activation: linear
+      hidden_size: 64
+      depth: 1
+      activation: relu
       output_activation: linear
-      use_bias: false
+      use_bias: true
       dropout_rate: 0.0
       kernel_initialiser: uniform
       bias_initialiser: zeros
@@ -102,8 +66,6 @@ model:
       kernel_regulariser_arguments: none
       bias_regulariser: none
       bias_regulariser_arguments: none
-  # An omitted stage_2 copies stage_1 settings and creates independent
-  # stage_2 weights.
   stage_2:
     combine_state_and_input_mapping: false
     state_transition:
@@ -134,11 +96,11 @@ model:
       bias_regulariser: none
       bias_regulariser_arguments: none
     neural_decoder:
-      hidden_size: none
-      depth: none
-      activation: linear
+      hidden_size: 64
+      depth: 1
+      activation: relu
       output_activation: linear
-      use_bias: false
+      use_bias: true
       dropout_rate: 0.0
       kernel_initialiser: uniform
       bias_initialiser: zeros
@@ -147,11 +109,11 @@ model:
       bias_regulariser: none
       bias_regulariser_arguments: none
     behaviour_decoder:
-      hidden_size: none
-      depth: none
-      activation: linear
+      hidden_size: 64
+      depth: 1
+      activation: relu
       output_activation: linear
-      use_bias: false
+      use_bias: true
       dropout_rate: 0.0
       kernel_initialiser: glorot_uniform
       bias_initialiser: zeros
@@ -160,24 +122,20 @@ model:
       bias_regulariser: none
       bias_regulariser_arguments: none
 training:
-  # Opt-in controls for externally split independent-sequence experiments.
-  honor_explicit_validation: false
-  restore_best_weights: false
-  independent_windows: false
-  sequence_length: none
-  epoch_artifacts: false
   maximum_epochs: 2500
-  training_batch_size: none
+  # Maximum; effective size follows available windows in each session/fold.
+  training_batch_size: 32
   initialisation_attempts: 1
-  maximum_refit_attempts: 10
-  early_stopping_patience: 3
-  early_stopping_measure: loss
+  maximum_refit_attempts: 1
+  early_stopping_patience: 10
+  early_stopping_measure: val_loss
   recurrent_early_stopping_start_epoch: 0
   decoder_early_stopping_start_epoch: 0
   create_validation_from_training: false
   validation_set_ratio: 0.2
   optimiser: Adam
-  optimiser_arguments: none
+  optimiser_arguments:
+    learning_rate: 0.001
   learning_rate_schedule: none
   learning_rate_schedule_arguments: none
   trainable_components: none
@@ -185,12 +143,23 @@ training:
   verbose: true
   save_training_logs: true
   skip_prediction_calculation: false
+  honor_explicit_validation: true
+  restore_best_weights: true
+  independent_windows: true
+  sequence_length: 128
+  epoch_artifacts: true
 forecast:
-  enable_forward_prediction: true  # false rejects steps_ahead values greater than one.
-  steps_ahead: none
-  steps_ahead_loss_weights: none  # ordered to match steps_ahead
-  # use_observed_input_in_dynamics and use_observed_input_in_decoder have
-  # no effect without forward prediction or input U.
+  enable_forward_prediction: true
+  steps_ahead:
+  - 1
+  - 2
+  - 4
+  - 8
+  steps_ahead_loss_weights:
+  - 1
+  - 1
+  - 1
+  - 1
   use_observed_input_in_dynamics: false
   use_observed_input_in_decoder: false
 preprocessing:

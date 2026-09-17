@@ -30,6 +30,11 @@ OPTIONAL_DIMENSIONS = {
     "preprocessing_state_size": "n_pre",
 }
 TRAINING_NAMES = {
+    "honor_explicit_validation": "honor_explicit_validation",
+    "restore_best_weights": "restore_best_weights",
+    "independent_windows": "independent_windows",
+    "sequence_length": "sequence_length",
+    "epoch_artifacts": "epoch_artifacts",
     "maximum_epochs": "epochs",
     "training_batch_size": "batch_size",
     "initialisation_attempts": "init_attempts",

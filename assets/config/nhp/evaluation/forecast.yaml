@@ -1,0 +1,8 @@
+horizons:
+- 1
+- 2
+- 4
+- 8
+- 16
+- 32
+neural_scoring_fraction: 0.25

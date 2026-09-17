@@ -1,0 +1,24 @@
+enabled: true
+curves:
+- name: neural_population
+  parameter: population_scale
+  where:
+    target: neural
+    metric: cc
+    horizon: 4
+    evaluation_set: smallest
+    nx:
+    - 16
+    - 64
+  group: nx
+- name: behavior_population
+  parameter: population_scale
+  where:
+    target: behavior
+    metric: cc
+    horizon: 4
+    evaluation_set: smallest
+    nx:
+    - 16
+    - 64
+  group: nx

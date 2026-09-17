@@ -71,7 +71,7 @@ class EarlyStoppingWithMinEpochs(tf.keras.callbacks.EarlyStopping):
     
     def on_epoch_end(self, epoch, logs=None):
         current = self.get_monitor_value(logs)
-        if current is None or epoch <= self.start_from_epoch:
+        if current is None or epoch < self.start_from_epoch:
             # If no monitor value exists or still in initial warm-up stage.
             return
         if self.restore_best_weights and self.best_weights is None:
@@ -103,6 +103,12 @@ class EarlyStoppingWithMinEpochs(tf.keras.callbacks.EarlyStopping):
                     'Restoring model weights from the end of the best epoch: '
                     f'{self.best_epoch + 1} (stopped at {self.stopped_epoch} epochs).')
                 self.model.set_weights(self.best_weights)
+    def on_train_end(self, logs=None):
+        """Restore the selected weights even when the epoch cap ends fitting."""
+        super().on_train_end(logs)
+        if self.restore_best_weights and self.best_weights is not None:
+            self.model.set_weights(self.best_weights)
+
 '''
 # To add a customized learning rate scheduler, you can use something like 
 # this as a callback that monitors improvement of loss and if not much, 
@@ -161,7 +167,8 @@ class ModelWithFitWithRetry:
     def fit_with_retry(self, init_attempts=1, 
         early_stopping_patience=3, early_stopping_measure='loss', start_from_epoch=0, early_stopping_restore_best_weights=False, 
         tb_make_prediction_plots=False, tb_make_prediction_scatters=False, tb_plot_epoch_mod=20,
-        x=None, y=None, callbacks=None, validation_data=None, keep_latest_nonnan_weights=True, **kwargs):
+        x=None, y=None, callbacks=None, validation_data=None,
+        keep_latest_nonnan_weights=True, epoch_artifacts=False, **kwargs):
         """Calls keras fit for the model, with the option to redo the fitting multiple 
         times with different initializations
 
@@ -239,6 +246,9 @@ class ModelWithFitWithRetry:
             if init_attempts > 1:
                 logger.info('Starting fit attempt {} of {}'.format(attempt, init_attempts))
             callbacks_this = copy.deepcopy(callbacks)
+            if epoch_artifacts:
+                from .training_artifacts import EpochArtifacts
+                callbacks_this.append(EpochArtifacts(self.log_dir, attempt))
             # Early stopping:
             early_stopping_callback = EarlyStoppingWithMinEpochs(
                 monitor=early_stopping_measure, patience=early_stopping_patience, 

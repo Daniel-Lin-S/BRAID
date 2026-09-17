@@ -1,0 +1,26 @@
+plugin: experiments.nhp:NHPDataset
+features: spike
+sampling_rate_hz: 20
+cache_mode: reuse
+spike_smoothing:
+  sigma_ms: 50
+  truncate: 4
+  boundary: reflect
+cv:
+  folds: 5
+  guard_seconds: 1.8
+infer_velocity: true
+previews:
+  enabled: true
+  windows: 3
+  seconds: 5
+  channels: 3
+  seed: 42
+  presentation:
+    title_font: 22
+    label_font: 18
+    tick_font: 16
+    legend_font: 16
+    width_inches: 16
+    panel_height_inches: 3.5
+    dpi: 150

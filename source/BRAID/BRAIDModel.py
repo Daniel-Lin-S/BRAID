@@ -105,7 +105,9 @@ class BRAIDModel(MainModel):
             args_pre['model2_Cz_Full']=False
             args_pre['allow_nonzero_Cz2']=True
             args_pre['has_UFT_reg']=False
-            sId_pre = MainModel(log_dir=self.log_dir,
+            sId_pre = MainModel(
+                    log_dir=(os.path.join(self.log_dir, "preprocessing")
+                             if self.log_dir else ""),
                     missing_marker=self.missing_marker)
             sId_pre.fit(Y, Z, U=U, nx=n_pre, n1=0,
                     YType=YType, ZType=ZType, 
@@ -152,7 +154,9 @@ class BRAIDModel(MainModel):
         if noFT:
             args['has_UFT']=False
             args['has_UFT_reg']=False
-        sId = MainModel(log_dir=self.log_dir,
+        sId = MainModel(
+                log_dir=(os.path.join(self.log_dir, "main")
+                         if self.log_dir else ""),
                 missing_marker=self.missing_marker)
         sId.fit(Y, transposeIf(zPredRes1Train), U=U, nx=nxThis, n1=n1This, 
                 YType=YType, ZType=ZType, 

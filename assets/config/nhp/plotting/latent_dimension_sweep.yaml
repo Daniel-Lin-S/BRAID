@@ -1,0 +1,38 @@
+enabled: true
+curves:
+- name: neural_horizon
+  parameter: horizon
+  where:
+    target: neural
+    metric: cc
+    nx: 16
+    population_scale: 1.0
+    evaluation_set: full
+  group: null
+- name: neural_dimension
+  parameter: nx
+  where:
+    target: neural
+    metric: cc
+    horizon: 4
+    population_scale: 1.0
+    evaluation_set: full
+  group: null
+- name: behavior_horizon
+  parameter: horizon
+  where:
+    target: behavior
+    metric: cc
+    nx: 16
+    population_scale: 1.0
+    evaluation_set: full
+  group: null
+- name: behavior_dimension
+  parameter: nx
+  where:
+    target: behavior
+    metric: cc
+    horizon: 4
+    population_scale: 1.0
+    evaluation_set: full
+  group: null

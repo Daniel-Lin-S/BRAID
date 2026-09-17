@@ -1,0 +1,25 @@
+name: neural_population_sweep
+enabled: true
+seed: 42
+modules:
+  data: ../data/spikes.yaml
+  model: ../models/BRAID.yaml
+  evaluation: ../evaluation/forecast.yaml
+  plotting: ../plotting/neural_population_sweep.yaml
+model_plugin: experiments.braid_backend:BRAIDBackend
+suite_plugin: experiments.braid_backend:build_cases
+report_plugin: experiments.reporting:braid_report
+selection:
+  sessions: null
+  folds: null
+suite:
+  nx_values:
+  - 16
+  - 64
+  n1_max: 16
+  n_pre: 150
+  population_scales:
+  - 0.25
+  - 0.5
+  - 1.0
+preview_model_plugin: experiments.braid_backend:checkpoint_preview_arrays

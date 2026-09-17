@@ -30,6 +30,7 @@ except Exception:
 import matplotlib.pyplot as plt
 import numpy as np
 
+from .sequence import independent_indices
 from .RegressionModel import RegressionModel
 from .tools.model_base_classes import ModelWithFitWithRetry, Reconstructable
 from .tools.plot import plotPredictionScatter, plotTimeSeriesPrediction
@@ -990,7 +991,9 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
                 init_attempts=1, # Number of initialization retries for each model fitting attempt. Will keep the best outcome after each series of attempts 
                 max_attempts=1,  # Maximum number of times that the whole model fitting will be repeated in case of a blow-up or nan loss
                 prior_pred_shift_by_one=False, # Will be passes to self.predict after fitting only when checking for blow-ups
-                early_stopping_patience=3, start_from_epoch=0, early_stopping_measure='loss'):
+                early_stopping_patience=3, start_from_epoch=0,
+                early_stopping_measure='loss', restore_best_weights=False,
+                epoch_artifacts=False, independent_windows=False):
         
         steps_ahead = [1] if self.steps_ahead is None else self.steps_ahead
         max_steps_ahead = np.max(steps_ahead)
@@ -1025,13 +1028,31 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
                 yOutIndsSteps = [yOutIndsThisStep[~np.isin(yOutIndsThisStep, yOutStepsRemInds[saInd])] for saInd, yOutIndsThisStep in enumerate(yOutIndsSteps)]
                 num_batch = num_batch - len(remBatchInds)
 
+            boundary_masks = None
+            if independent_windows:
+                yInInds, yOutIndsSteps, boundary_masks = independent_indices(
+                    Ndat, self.block_samples, steps_ahead, self.batch_size
+                )
+                yOutInds = yOutIndsSteps[steps_ahead.index(1)]
+                num_batch = len(yInInds) // (
+                    self.block_samples * self.batch_size
+                )
             if num_batch < 1:
-                return None, None, num_batch
+                raise ValueError(
+                    "Not enough complete windows for one training batch."
+                )
 
             yInTrain = Y_in[:, yInInds].T.reshape((num_batch*self.batch_size, self.block_samples, self.ny))
             yOutTrain = Y_out[:, yOutInds].T.reshape((num_batch*self.batch_size, self.block_samples, self.ny_out))
             yOutStepsTrain = [Y_out[:, yOutIndsThisStep].T.reshape((num_batch*self.batch_size, self.block_samples, self.ny_out)) for yOutIndsThisStep in yOutIndsSteps]
             
+            if boundary_masks is not None:
+                if self.missing_marker is None:
+                    raise ValueError(
+                        "Independent windows require a finite missing marker."
+                    )
+                for target, mask in zip(yOutStepsTrain, boundary_masks):
+                    target.reshape(-1, self.ny_out)[mask] = self.missing_marker
             inputTrain = (yInTrain,)
             if self.nft > 0:
                 # Feedthrough is from the same indices as the output
@@ -1091,6 +1112,8 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
                 early_stopping_patience=early_stopping_patience,
                 early_stopping_measure=early_stopping_measure,
                 start_from_epoch=start_from_epoch,
+                early_stopping_restore_best_weights=restore_best_weights,
+                epoch_artifacts=epoch_artifacts,
                 # The rest of the arguments will be passed to keras model.fit 
                 x=yInTrain, y=yOutTrain, shuffle=False, 
                 batch_size=self.batch_size, epochs=epochs, 
@@ -1178,7 +1201,7 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
         batch_count = int(batch_count)
         for bi in range(batch_count): # Pass in batches, because keras expects the same
             xThisBatch = tuple([val[(bi*self.batch_size):((bi+1)*self.batch_size), ...] for val in inputs])
-            rnn_outs = self.model.predict(xThisBatch)
+            rnn_outs = self.model.predict(xThisBatch, verbose=0)
             for saInd in range(len(steps_ahead)):
                 yHatThisBatch = rnn_outs[saInd]
                 yHat[saInd] = yHatThisBatch if bi == 0 else np.concatenate((yHat[saInd], yHatThisBatch))

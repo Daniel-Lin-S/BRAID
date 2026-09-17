@@ -292,11 +292,25 @@ class RegressionModel(tf.keras.layers.Layer, ModelWithFitWithRetry, Reconstructa
         self.trainable = trainable
         self.compile() # "make sure to call compile() again on your model for your changes to be taken into account."
 
-    def fit(self, X_in, X_out, prior_pred=None, X_in_val=None, X_out_val=None, prior_pred_val=None, 
-                epochs=100, batch_size=None, verbose=False, 
-                init_attempts=1, # Number of initialization retries for each model fitting attempt. Will keep the best outcome after each series of attempts 
-                max_attempts=1,  # Maximum number of times that the whole model fitting will be repeated in case of a blow-up or nan loss
-                early_stopping_patience=3, start_from_epoch=0, early_stopping_measure='loss'):
+    def fit(
+        self,
+        X_in,
+        X_out,
+        prior_pred=None,
+        X_in_val=None,
+        X_out_val=None,
+        prior_pred_val=None,
+        epochs=100,
+        batch_size=None,
+        verbose=False,
+        init_attempts=1,  # Number of initialization retries for each model fitting attempt. Will keep the best outcome after each series of attempts
+        max_attempts=1,  # Maximum number of times that the whole model fitting will be repeated in case of a blow-up or nan loss
+        early_stopping_patience=3,
+        start_from_epoch=0,
+        early_stopping_measure="loss",
+        restore_best_weights=False,
+        epoch_artifacts=False,
+    ):
         """
         Inputs: 
         - (1) X_in: input data. Expected dimensions: dim x samples
@@ -344,6 +358,8 @@ class RegressionModel(tf.keras.layers.Layer, ModelWithFitWithRetry, Reconstructa
                 early_stopping_patience=early_stopping_patience,
                 early_stopping_measure=early_stopping_measure,
                 start_from_epoch=start_from_epoch,
+                early_stopping_restore_best_weights=restore_best_weights,
+                epoch_artifacts=epoch_artifacts,
                 # The rest of the arguments will be passed to keras model.fit 
                 x=inputs, y=outputs, 
                 batch_size=batch_size, epochs=epochs, 
@@ -370,16 +386,18 @@ class RegressionModel(tf.keras.layers.Layer, ModelWithFitWithRetry, Reconstructa
         if self.num_classes is not None:
             if self.has_prior_pred:
                 prior_pred = np.log(prior_pred) # To invert the softmax
-                X_out = self.model.predict([X_in.T, prior_pred.transpose([1,0,2])])
+                X_out = self.model.predict(
+                    [X_in.T, prior_pred.transpose([1, 0, 2])], verbose=0
+                )
             else:
-                X_out = self.model.predict(X_in.T)
+                X_out = self.model.predict(X_in.T, verbose=0)
             X_out_softmax = tf.keras.layers.Softmax(input_shape=X_out.shape)(X_out).numpy()
             X_out = np.transpose(X_out_softmax, [1, 0, 2])
         else:
             if self.has_prior_pred:
-                X_out = self.model.predict([X_in.T, prior_pred.T]).T
+                X_out = self.model.predict([X_in.T, prior_pred.T], verbose=0).T
             else:
-                X_out = self.model.predict(X_in.T).T
+                X_out = self.model.predict(X_in.T, verbose=0).T
         if self.missing_marker is not None:
             isOkX = getIsOk(X_in, self.missing_marker)
             X_out[:, np.any(~isOkX, axis=0), ...] = self.missing_marker

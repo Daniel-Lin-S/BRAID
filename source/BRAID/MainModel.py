@@ -53,6 +53,7 @@ from .tools.tf_losses import (
     masked_R2,
 )
 from .tools.tf_tools import convertHistoryToDict, set_global_tf_eagerly_flag
+from .sequence import window_shift
 from .tools.tools import get_one_hot, get_trials_from_cat_data, getIsOk, isFlat
 
 logger = logging.getLogger(__name__)
@@ -211,7 +212,8 @@ def _trim_alignment_padding(
     return true_values, prediction
 
 
-def getLossLogStr(trueVals, predVals, steps, sigType, lossFuncs):
+def getLossLogStr(trueVals, predVals, steps, sigType, lossFuncs,
+                  window_length=None, missing_marker=None):
     """Format per-horizon training metrics without alignment padding.
 
     Multi-step predictions are shifted to align each prediction with its
@@ -232,6 +234,14 @@ def getLossLogStr(trueVals, predVals, steps, sigType, lossFuncs):
             prediction = pred_val.T
         else:
             prediction = pred_val.transpose([1, 0, 2])
+        if window_length is not None and step_ahead > 1:
+            positions = np.arange(len(prediction)) % window_length
+            padding = step_ahead - 1
+            edges = ((positions < padding)
+                     | (positions >= window_length - padding))
+            marked = np.all(prediction == missing_marker, axis=1)
+            valid = ~(edges & marked)
+            true_val, prediction = true_val[valid], prediction[valid]
         true_val, prediction = _trim_alignment_padding(
             true_val,
             prediction,
@@ -531,6 +541,29 @@ class MainModel(PredictorModel):
     x2(k) => Latent states unrelated to z 
     """   
      
+    def _shift_forecasts(self, values, horizons, *args, **kwargs):
+        """Align forecasts without crossing independent sequence boundaries."""
+        size = (self.block_samples
+                if getattr(self, 'independent_windows', False) else None)
+        return window_shift(
+            shift_ms_to_1s_series, values, horizons, size, *args, **kwargs
+        )
+
+    def _reverse_shift_forecasts(self, values, horizons, *args, **kwargs):
+        """Align forecast targets within independent windows."""
+        size = (self.block_samples
+                if getattr(self, 'independent_windows', False) else None)
+        return window_shift(
+            shift_1s_to_ms_series, values, horizons, size, *args, **kwargs
+        )
+
+    def _loss_log(self, *args):
+        """Exclude only declared window-edge padding from text metrics."""
+        length = (self.block_samples
+                  if getattr(self, 'independent_windows', False) else None)
+        return getLossLogStr(*args, window_length=length,
+                             missing_marker=self.missing_marker)
+
     def __init__(self, 
             block_samples=128,   # Number os timesteps in each training sample block
             batch_size=32,       # Each batch consists of this many blocks with block_samples time steps
@@ -739,6 +772,11 @@ class MainModel(PredictorModel):
         self.fit(Y, Z=Z, U=U, **soft_defaults)
 
     def fit(self, Y, Z=None, U=None, nx=None, n1=None, 
+            honor_explicit_validation=False,
+            restore_best_weights=False,
+            independent_windows=False,
+            sequence_length=None,
+            epoch_artifacts=False,
             epochs=2500,         # Max number of epochs to go over the whole training data
             batch_size=None,     # If not none, will set the batch_size of the MainModel to this value
             # Legacy initialisation arguments are not implemented.
@@ -813,7 +851,13 @@ class MainModel(PredictorModel):
             raise(Exception('At least one of Y or U should be not None in MainModel!'))
         
         # Prepare validation data
-        if 'val' in early_stopping_measure:
+        if sequence_length is not None:
+            if sequence_length < 2:
+                raise ValueError("sequence_length must be at least 2.")
+            self.block_samples = sequence_length
+        self.independent_windows = independent_windows
+        if ('val' in early_stopping_measure
+                and not honor_explicit_validation):
             logger.info(f'Early stopping measure is "{early_stopping_measure}". Includes validation loss, so we will ignore any provided validation data and creating validation data fom the training data to avoid overfitting')
             create_val_from_training = True
             Y_validation, Z_validation, U_validation = None, None, None # Ignore any provided validation data
@@ -848,6 +892,19 @@ class MainModel(PredictorModel):
         else:
             self.stateful = True
             self.learn_initial_state = False
+        if independent_windows:
+            self.stateful = False
+            self.learn_initial_state = False
+            for label, data in (("training", Y),
+                                ("validation", Y_validation)):
+                if data is None or data.shape[1] % self.block_samples:
+                    raise ValueError(
+                        f"{label} data must contain complete "
+                        f"{self.block_samples}-sample windows."
+                    )
+        if honor_explicit_validation and 'val' in early_stopping_measure:
+            if Y_validation is None or Z_validation is None:
+                raise ValueError("Explicit Y/Z validation data are required.")
         Ndat = Y.shape[1] if Y is not None else U.shape[1]
         if create_val_from_training:
             if isTrialBased: # Train/validation sets must be a multiple of trial length
@@ -876,6 +933,8 @@ class MainModel(PredictorModel):
         if num_batch < 2:
             num_batch = 1
         self.batch_size = int(np.floor((Ndat_for_batch_size-1)/self.block_samples/num_batch))
+        if independent_windows and batch_size is not None:
+            self.batch_size = batch_size
         if self.batch_size < 1:
             raise Exception('Not enough samples for model fitting')
 
@@ -1093,10 +1152,13 @@ class MainModel(PredictorModel):
         logs = {}
 
         rnn_fit_args = {
+            'independent_windows': independent_windows,
             'epochs': epochs, 
             'init_attempts': init_attempts, 'max_attempts': max_attempts,
             'early_stopping_patience': early_stopping_patience,
             'early_stopping_measure': early_stopping_measure,
+            'restore_best_weights': restore_best_weights,
+            'epoch_artifacts': epoch_artifacts,
             'start_from_epoch': start_from_epoch_rnn
         }
         reg_fit_args = {
@@ -1104,6 +1166,8 @@ class MainModel(PredictorModel):
             'init_attempts': init_attempts, 'max_attempts': max_attempts,
             'early_stopping_patience': early_stopping_patience,
             'early_stopping_measure': early_stopping_measure,
+            'restore_best_weights': restore_best_weights,
+            'epoch_artifacts': epoch_artifacts,
             'start_from_epoch': start_from_epoch_reg
         }
         
@@ -1130,10 +1194,21 @@ class MainModel(PredictorModel):
                 allZp = allZp1_steps[0]
 
                 if verbose:
-                    logger.info('Training Z pred after fitting RNN1: \n'+getLossLogStr(
-                        ZTrue, 
-                        shift_ms_to_1s_series(allZp1_steps, steps_ahead_model1, self.missing_marker, time_first=False),
-                        steps_ahead_model1, ZType, ZLossFuncs) )
+                    logger.info(
+                        "Training Z pred after fitting RNN1: \n"
+                        + self._loss_log(
+                            ZTrue,
+                            self._shift_forecasts(
+                                allZp1_steps,
+                                steps_ahead_model1,
+                                self.missing_marker,
+                                time_first=False,
+                            ),
+                            steps_ahead_model1,
+                            ZType,
+                            ZLossFuncs,
+                        )
+                    )
 
                 if YU_validation is not None:
                     preds1_val = model1.predict(YU_validation, FT_in=FT_in_validation, n1_in=n1_in1_validation)
@@ -1186,11 +1261,37 @@ class MainModel(PredictorModel):
                 if verbose or epochs > 0 or not skip_predictions:
                     allYp1_steps_Shifted = [model1_Cy.predict(tmp) for tmp in allXp1U_steps_Shifted] # n-step
                     allYp = allYp1_steps_Shifted[0] # 1-step
-                    logger.info('Training Y pred after fitting model1_Cy: \n'+getLossLogStr(YTrue, keeper_func_model1_Cy(get_steps_ahead_from_model1(allYp1_steps_Shifted)), steps_ahead_model1_Cy, YType, YLossFuncs) )
+                    logger.info(
+                        "Training Y pred after fitting model1_Cy: \n"
+                        + self._loss_log(
+                            YTrue,
+                            keeper_func_model1_Cy(
+                                get_steps_ahead_from_model1(
+                                    allYp1_steps_Shifted
+                                )
+                            ),
+                            steps_ahead_model1_Cy,
+                            YType,
+                            YLossFuncs,
+                        )
+                    )
 
                     if need_fw_reg_models: # We have feedthrough and multi-step ahead, so we also need fw models
                         allYp1_steps_Shifted_fw = [model1_Cy_fw.predict(tmp) for tmp in allXp1_steps_Shifted] # n-step 
-                        logger.info('Training Y pred after fitting model1_Cy_fw: \n'+getLossLogStr(YTrue, keeper_func_model1_Cy_fw(get_steps_ahead_from_model1(allYp1_steps_Shifted_fw)), steps_ahead_model1_Cy_fw, YType, YLossFuncs) )
+                        logger.info(
+                            "Training Y pred after fitting model1_Cy_fw: \n"
+                            + self._loss_log(
+                                YTrue,
+                                keeper_func_model1_Cy_fw(
+                                    get_steps_ahead_from_model1(
+                                        allYp1_steps_Shifted_fw
+                                    )
+                                ),
+                                steps_ahead_model1_Cy_fw,
+                                YType,
+                                YLossFuncs,
+                            )
+                        )
 
 
         else:
@@ -1218,8 +1319,20 @@ class MainModel(PredictorModel):
                     FT_in2_validation = U_validation if self.has_UFT else None
                 else:
                     if self.has_UFT:
-                        UReverseShifted_steps = shift_1s_to_ms_series(U, steps_ahead, self.missing_marker, time_first=False)
-                        UValReverseShifted_steps = shift_1s_to_ms_series(U_validation, steps_ahead, self.missing_marker, time_first=False)
+                        UReverseShifted_steps = self._reverse_shift_forecasts(
+                            U,
+                            steps_ahead,
+                            self.missing_marker,
+                            time_first=False,
+                        )
+                        UValReverseShifted_steps = (
+                            self._reverse_shift_forecasts(
+                                U_validation,
+                                steps_ahead,
+                                self.missing_marker,
+                                time_first=False,
+                            )
+                        )
                         FT_in2 = UReverseShifted_steps if self.has_UFT else None
                         FT_in2_validation = UValReverseShifted_steps if self.has_UFT else None
                     else:
@@ -1238,10 +1351,23 @@ class MainModel(PredictorModel):
                     preds2_val = model2.predict(Y_in_res_valU, FT_in=FT_in2_validation, n1_in=n1_in_val, prior_pred=prior_preds_vals, prior_pred_shift_by_one=True) 
                     allXp2_steps_val = preds2_val[:len(steps_ahead)]
                 if verbose:
-                    logger.info('Training Y pred after fitting RNN2: \n'+getLossLogStr(
-                        YTrue, 
-                        shift_ms_to_1s_series(preds2[len(steps_ahead):2*len(steps_ahead)], steps_ahead, self.missing_marker, time_first=False),
-                        steps_ahead, YType, YLossFuncs) )
+                    logger.info(
+                        "Training Y pred after fitting RNN2: \n"
+                        + self._loss_log(
+                            YTrue,
+                            self._shift_forecasts(
+                                preds2[
+                                    len(steps_ahead) : 2 * len(steps_ahead)
+                                ],
+                                steps_ahead,
+                                self.missing_marker,
+                                time_first=False,
+                            ),
+                            steps_ahead,
+                            YType,
+                            YLossFuncs,
+                        )
+                    )
 
         else:
             allXp2_steps, allXp2_steps_val = None, None
@@ -1320,12 +1446,37 @@ class MainModel(PredictorModel):
                 allZp = model2_Cz.predict(allXpForCz[0], prior_pred=priorForCzFit[0] if priorForCzFit is not None else None)
                 if verbose:
                     allZp_steps_Shifted = [model2_Cz.predict(allXpForCz[saInd], prior_pred=priorForCzFit[saInd] if priorForCzFit is not None else None) for saInd in range(len(allXpForCz))] # n-step 
-                    allZp_steps_Shifted = shift_1s_to_ms_series(allZp_steps_Shifted, steps_ahead, self.missing_marker, time_first=False)
-                    logger.info('Training Z pred after fitting model2_Cz: \n'+getLossLogStr(ZTrue, keeper_func_model2_Cz(allZp_steps_Shifted), steps_ahead_model2_Cz, ZType, ZLossFuncs) )
+                    allZp_steps_Shifted = self._reverse_shift_forecasts(
+                        allZp_steps_Shifted,
+                        steps_ahead,
+                        self.missing_marker,
+                        time_first=False,
+                    )
+                    logger.info(
+                        "Training Z pred after fitting model2_Cz: \n"
+                        + self._loss_log(
+                            ZTrue,
+                            keeper_func_model2_Cz(allZp_steps_Shifted),
+                            steps_ahead_model2_Cz,
+                            ZType,
+                            ZLossFuncs,
+                        )
+                    )
 
                     if need_fw_reg_models: # We have feedthrough and multi-step ahead, so we also need fw models
                         allZp_steps_Shifted_fw = [model2_Cz_fw.predict(allXpForCz_fw[saInd], prior_pred=priorForCzFit_fw[saInd] if priorForCzFit_fw is not None else None) for saInd in range(len(allXpForCz_fw))] # n-step 
-                        logger.info('Training Z pred after fitting model2_Cz_fw: \n'+getLossLogStr(ZTrue, keeper_func_model2_Cz_fw(allZp_steps_Shifted_fw), steps_ahead_model2_Cz_fw, ZType, ZLossFuncs) )
+                        logger.info(
+                            "Training Z pred after fitting model2_Cz_fw: \n"
+                            + self._loss_log(
+                                ZTrue,
+                                keeper_func_model2_Cz_fw(
+                                    allZp_steps_Shifted_fw
+                                ),
+                                steps_ahead_model2_Cz_fw,
+                                ZType,
+                                ZLossFuncs,
+                            )
+                        )
 
         if model1_Cy_Full:
             if epochs > 0 or not skip_predictions:
@@ -1371,10 +1522,28 @@ class MainModel(PredictorModel):
                 allYp = model1_Cy.predict(allXpUForCy_steps[0])
                 if verbose:
                     allYp_steps_Shifted = [model1_Cy.predict(tmp) for tmp in allXpUForCy_steps_Shifted] # n-step 
-                    logger.info('Training Y pred after fitting model1_Cy: \n'+getLossLogStr(YTrue, allYp_steps_Shifted, steps_ahead, YType, YLossFuncs) )
+                    logger.info(
+                        "Training Y pred after fitting model1_Cy: \n"
+                        + self._loss_log(
+                            YTrue,
+                            allYp_steps_Shifted,
+                            steps_ahead,
+                            YType,
+                            YLossFuncs,
+                        )
+                    )
                     if need_fw_reg_models: # We have feedthrough and multi-step ahead, so we also need fw models
                         allYp_steps_Shifted_fw = [model1_Cy_fw.predict(tmp) for tmp in allXpForCy_steps_Shifted] # n-step 
-                        logger.info('Training Y pred after fitting model1_Cy_fw: \n'+getLossLogStr(YTrue, allYp_steps_Shifted_fw, steps_ahead, YType, YLossFuncs) )
+                        logger.info(
+                            "Training Y pred after fitting model1_Cy_fw: \n"
+                            + self._loss_log(
+                                YTrue,
+                                allYp_steps_Shifted_fw,
+                                steps_ahead,
+                                YType,
+                                YLossFuncs,
+                            )
+                        )
                     
 
         if ny > 0 and YType == 'cont' and not skip_Cy:
@@ -1502,7 +1671,9 @@ class MainModel(PredictorModel):
         if Y is None and U is None:
             return None, None, None
         if self.nu > 0 and self.has_UFT_reg:
-            UReverseShifted_steps = shift_1s_to_ms_series(U, steps_ahead, self.missing_marker, time_first=False)
+            UReverseShifted_steps = self._reverse_shift_forecasts(
+                U, steps_ahead, self.missing_marker, time_first=False
+            )
             # Here we expect UReverseShifted_steps to be the U for the same timesteps that allXp1_steps predict
             allXp1U_steps = []
             for allXp1_this_step, UReverseShifted_this_step in zip(allXp1_steps, UReverseShifted_steps):
@@ -1511,7 +1682,9 @@ class MainModel(PredictorModel):
         else:
             allXp1U_steps = allXp1_steps
 
-        allXp1U_steps_Shifted = shift_ms_to_1s_series(allXp1U_steps, steps_ahead, self.missing_marker, time_first=False)
+        allXp1U_steps_Shifted = self._shift_forecasts(
+            allXp1U_steps, steps_ahead, self.missing_marker, time_first=False
+        )
         YRep = [Y for _ in range(len(steps_ahead))]
         return allXp1U_steps, allXp1U_steps_Shifted, YRep
 
@@ -1525,7 +1698,9 @@ class MainModel(PredictorModel):
         Returns:
             _type_: _description_
         """        
-        allXp1_steps_Shifted = shift_ms_to_1s_series(allXp1_steps, steps_ahead, self.missing_marker, time_first=False)
+        allXp1_steps_Shifted = self._shift_forecasts(
+            allXp1_steps, steps_ahead, self.missing_marker, time_first=False
+        )
         return allXp1_steps_Shifted
 
     def prepare_inputs_to_model2_Cz(self, Y, Z, U, allX_steps, allXp2_steps, allZp_steps, steps_ahead):
@@ -1547,18 +1722,48 @@ class MainModel(PredictorModel):
             return None, None, None
         
         if not self.model2_Cz_Full:
-            allXpForCz = shift_ms_to_1s_series(allXp2_steps, steps_ahead, self.missing_marker, time_first=False)
-            priorForCzFit = shift_ms_to_1s_series(allZp_steps, steps_ahead, self.missing_marker, time_first=False) if allZp_steps is not None else None
+            allXpForCz = self._shift_forecasts(
+                allXp2_steps,
+                steps_ahead,
+                self.missing_marker,
+                time_first=False,
+            )
+            priorForCzFit = (
+                self._shift_forecasts(
+                    allZp_steps,
+                    steps_ahead,
+                    self.missing_marker,
+                    time_first=False,
+                )
+                if allZp_steps is not None
+                else None
+            )
         else:
-            allXpForCz = shift_ms_to_1s_series(allX_steps, steps_ahead, self.missing_marker, time_first=False)
+            allXpForCz = self._shift_forecasts(
+                allX_steps, steps_ahead, self.missing_marker, time_first=False
+            )
             priorForCzFit = None
         if self.has_Dyz and (self.n1 == 0 or self.model2_Cz_Full): # If Dyz not included in model1, then we need to learn it in model2_Cz
-            YReverseShifted_steps = shift_1s_to_ms_series(Y, steps_ahead, self.missing_marker, time_first=False)
-            Y_steps = shift_ms_to_1s_series(YReverseShifted_steps, steps_ahead, self.missing_marker, time_first=False)
+            YReverseShifted_steps = self._reverse_shift_forecasts(
+                Y, steps_ahead, self.missing_marker, time_first=False
+            )
+            Y_steps = self._shift_forecasts(
+                YReverseShifted_steps,
+                steps_ahead,
+                self.missing_marker,
+                time_first=False,
+            )
             allXpForCz = [np.concatenate((tmp_step, Y_This_step)) for tmp_step, Y_This_step  in zip(allXpForCz,Y_steps)]
         if self.nu > 0 and self.has_UFT_reg: 
-            UReverseShifted_steps = shift_1s_to_ms_series(U, steps_ahead, self.missing_marker, time_first=False)
-            U_steps = shift_ms_to_1s_series(UReverseShifted_steps, steps_ahead, self.missing_marker, time_first=False)
+            UReverseShifted_steps = self._reverse_shift_forecasts(
+                U, steps_ahead, self.missing_marker, time_first=False
+            )
+            U_steps = self._shift_forecasts(
+                UReverseShifted_steps,
+                steps_ahead,
+                self.missing_marker,
+                time_first=False,
+            )
             allXpForCz = [np.concatenate((tmp_step, U_This_step)) for tmp_step, U_This_step in zip(allXpForCz, U_steps)]
 
         ZRep = [Z for _ in range(len(steps_ahead))]
@@ -1577,10 +1782,26 @@ class MainModel(PredictorModel):
             _type_: _description_
         """        
         if not self.model2_Cz_Full:
-            allXpForCz_fw = shift_ms_to_1s_series(allXp2_steps, steps_ahead, self.missing_marker, time_first=False)
-            priorForCzFit_fw = shift_ms_to_1s_series(allZp_steps, steps_ahead, self.missing_marker, time_first=False) if allZp_steps is not None else None
+            allXpForCz_fw = self._shift_forecasts(
+                allXp2_steps,
+                steps_ahead,
+                self.missing_marker,
+                time_first=False,
+            )
+            priorForCzFit_fw = (
+                self._shift_forecasts(
+                    allZp_steps,
+                    steps_ahead,
+                    self.missing_marker,
+                    time_first=False,
+                )
+                if allZp_steps is not None
+                else None
+            )
         else:
-            allXpForCz_fw = shift_ms_to_1s_series(allX_steps, steps_ahead, self.missing_marker, time_first=False)
+            allXpForCz_fw = self._shift_forecasts(
+                allX_steps, steps_ahead, self.missing_marker, time_first=False
+            )
             priorForCzFit_fw = None
 
         return allXpForCz_fw, priorForCzFit_fw
@@ -1614,13 +1835,20 @@ class MainModel(PredictorModel):
         if FT_in is not None and self.observable_U_in_Cfw:
             _, _, steps_ahead_model1, _, model1_orig_step_inds \
              = self.get_model_steps_ahead(self.steps_ahead)
-            FTReverseShifted_steps = shift_1s_to_ms_series(FT_in, steps_ahead_model1, self.missing_marker, time_first=False)
+            FTReverseShifted_steps = self._reverse_shift_forecasts(
+                FT_in,
+                steps_ahead_model1,
+                self.missing_marker,
+                time_first=False,
+            )
             FT_in = FTReverseShifted_steps
 
         if U is not None and self.nu>0 and self.observable_U_in_Kfw:
             _, _, steps_ahead_model1, _, model1_orig_step_inds \
              = self.get_model_steps_ahead(self.steps_ahead)
-            UReverseShifted_steps = shift_1s_to_ms_series(U, steps_ahead_model1, self.missing_marker, time_first=False)
+            UReverseShifted_steps = self._reverse_shift_forecasts(
+                U, steps_ahead_model1, self.missing_marker, time_first=False
+            )
             n1_in = UReverseShifted_steps
         else:
             n1_in = None
@@ -1657,7 +1885,12 @@ class MainModel(PredictorModel):
                 n1_in = allXp1U_steps
             else:
                 _, _, steps_ahead_model1, _, model1_orig_step_inds = self.get_model_steps_ahead(self.steps_ahead)
-                UReverseShifted_steps = shift_1s_to_ms_series(U, steps_ahead_model1, self.missing_marker, time_first=False)
+                UReverseShifted_steps = self._reverse_shift_forecasts(
+                    U,
+                    steps_ahead_model1,
+                    self.missing_marker,
+                    time_first=False,
+                )
                 n1_in = []
                 for allXp1_this_step, UReverseShifted_this_step in zip(allXp1_steps, UReverseShifted_steps):
                     n1_in_this_step = np.concatenate( (allXp1_this_step, UReverseShifted_this_step) )
@@ -1666,7 +1899,9 @@ class MainModel(PredictorModel):
             n1_in = allXp1_steps
         elif U is not None and self.nu>0 and self.observable_U_in_Kfw:
             _, _, steps_ahead_model1, _, model1_orig_step_inds = self.get_model_steps_ahead(self.steps_ahead)
-            UReverseShifted_steps = shift_1s_to_ms_series(U, steps_ahead_model1, self.missing_marker, time_first=False)
+            UReverseShifted_steps = self._reverse_shift_forecasts(
+                U, steps_ahead_model1, self.missing_marker, time_first=False
+            )
             n1_in = UReverseShifted_steps
         else:
             n1_in = None
@@ -2807,11 +3042,21 @@ class MainModel(PredictorModel):
                 FT_in = None
             
             if FT_in is not None and self.observable_U_in_Cfw:
-                FTReverseShifted_steps = shift_1s_to_ms_series(FT_in, steps_ahead_model1, self.missing_marker, time_first=False)
+                FTReverseShifted_steps = self._reverse_shift_forecasts(
+                    FT_in,
+                    steps_ahead_model1,
+                    self.missing_marker,
+                    time_first=False,
+                )
                 FT_in = FTReverseShifted_steps
 
             if U is not None and self.nu > 0 and self.observable_U_in_Kfw:
-                n1_in1 = shift_1s_to_ms_series(UT, steps_ahead_model1, self.missing_marker, time_first=False)
+                n1_in1 = self._reverse_shift_forecasts(
+                    UT,
+                    steps_ahead_model1,
+                    self.missing_marker,
+                    time_first=False,
+                )
             else:
                 n1_in1 = None
             
@@ -2884,7 +3129,12 @@ class MainModel(PredictorModel):
             elif self.n1 > 0:
                 n1_in = allXp1_steps
             elif U is not None and (self.nu>0 and self.observable_U_in_Kfw):
-                n1_in = shift_1s_to_ms_series(UT, steps_ahead_model1, self.missing_marker, time_first=False)
+                n1_in = self._reverse_shift_forecasts(
+                    UT,
+                    steps_ahead_model1,
+                    self.missing_marker,
+                    time_first=False,
+                )
             else:
                 n1_in = None
 
@@ -2893,7 +3143,9 @@ class MainModel(PredictorModel):
                 FT_in2 = UT if U is not None and self.has_UFT else None
             else:
                 if self.has_UFT:
-                    UReverseShifted_steps = shift_1s_to_ms_series(UT, steps_ahead, self.missing_marker, time_first=False)
+                    UReverseShifted_steps = self._reverse_shift_forecasts(
+                        UT, steps_ahead, self.missing_marker, time_first=False
+                    )
                     FT_in2 = UReverseShifted_steps if self.has_UFT else None
                 else:
                     FT_in2 = None
@@ -2970,12 +3222,17 @@ class MainModel(PredictorModel):
         if multi_step_with_data_gen: # The second approach for forecasting
             # Propagate without adding noise
             if U is not None:
-                allU_steps = shift_1s_to_ms_series(UT, steps_ahead_model1_backup, self.missing_marker, time_first=False)
+                allU_steps = self._reverse_shift_forecasts(
+                    UT,
+                    steps_ahead_model1_backup,
+                    self.missing_marker,
+                    time_first=False,
+                )
             else:
                 allU_steps = None
             # if self.has_UFT and self.observable_U_in_Cfw:
             #     FT_1_Step = np.concatenate( (U, np.nan*np.ones((1, U.shape[-1]))), axis=0 )[1:, :].T
-            #     FTReverseShifted_steps = shift_1s_to_ms_series(FT_1_Step, steps_ahead_model1_backup, self.missing_marker, time_first=False)
+            #     FTReverseShifted_steps = self._reverse_shift_forecasts(FT_1_Step, steps_ahead_model1_backup, self.missing_marker, time_first=False)
             #     FT_gen_steps = FTReverseShifted_steps
             # else:
             #     FT_gen_steps = None
