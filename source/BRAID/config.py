@@ -163,15 +163,18 @@ def get_default_config_path(config_name: str) -> Path:
 
 def load_braid_fit_arguments(config_path: Union[str, Path]) -> Dict[str, Any]:
     """Load fit-ready BRAIDModel.fit keyword arguments from YAML."""
-    configuration_path = Path(config_path)
-    configuration = _load_yaml_mapping(configuration_path)
-    if configuration_path.resolve() != get_default_config_path(
-        "default.yaml"
-    ).resolve():
-        configuration = _deep_merge_mappings(
-            _load_yaml_mapping(get_default_config_path("default.yaml")),
-            configuration,
-        )
+    return resolve_braid_fit_arguments(
+        _load_yaml_mapping(Path(config_path))
+    )
+
+
+def resolve_braid_fit_arguments(configuration: Mapping) -> Dict[str, Any]:
+    """Resolve a YAML mapping to the exact defaulted fit arguments."""
+    configuration = _replace_none_values(copy.deepcopy(configuration))
+    configuration = _deep_merge_mappings(
+        _load_yaml_mapping(get_default_config_path("default.yaml")),
+        configuration,
+    )
     model_settings = _require_mapping(
         configuration.get(MODEL_KEY, {}),
         MODEL_KEY,

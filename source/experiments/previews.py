@@ -12,6 +12,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+from .artifacts import artifact_path
 from .cache import file_digest, fingerprint
 from .contracts import FeatureSet, plugin
 
@@ -139,7 +140,7 @@ def fitted_previews(
         features=fold,
         windows=windows,
     )
-    checkpoint = run / "model.p"
+    checkpoint = artifact_path(run, "model.p")
     base = fold.path or (run / "previews")
     return publish_previews(
         session,

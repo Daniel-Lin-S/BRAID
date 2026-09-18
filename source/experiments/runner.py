@@ -23,11 +23,22 @@ import subprocess
 import numpy as np
 import yaml
 
+from .artifacts import (
+    artifact_path,
+    compatible_run,
+    compatibility_identity,
+    resolved_fit,
+    fit_seed,
+    model_directory,
+    model_identity,
+    prepare_run,
+)
 from .cache import atomic_json, file_digest, fingerprint, writer_lock
 from .contracts import Dataset, FeatureSet, plugin
 from .previews import preprocessing_previews
 from .runtime import (
-    case_logging,
+    session_logging,
+    lifecycle_scope,
     configure_device,
     configure_logging,
     launch_directory,
@@ -62,7 +73,7 @@ def run_case(
     snapshots: dict,
     gpu: dict,
     root: Path,
-) -> None:
+) -> bool:
     """Fit or evaluate one configuration through the model protocol."""
     from .evaluation import evaluate_forecasts
 
@@ -97,38 +108,62 @@ def run_case(
             k: v for k, v in model_overrides.items() if k != "verbose"
         },
     )
-    key = fingerprint(identity)
-    directory = root / session.metadata["session"] / f"fold_{fold}" / key[:16]
+    identity["resolved_fit"] = resolved_fit(identity, features)
+    key = fingerprint(compatibility_identity(identity))
+    model_root = model_directory(root, snapshots, case)
+    directory = (
+        model_root / session.metadata["session"] / f"fold_{fold}" / key[:16]
+    )
+    existing = compatible_run(root, identity)
+    if existing is not None:
+        directory = existing
+    from .model_summary import register_model_run
+
+    register_model_run(model_root, directory)
     directory.mkdir(parents=True, exist_ok=True)
-    log_directory = (
+    session_log = (
         arguments.log_directory
         / "sessions"
-        / session.metadata["session"]
-        / f"fold_{fold}"
-        / f"{case['name']}-{key[:16]}"
+        / f"{session.metadata['session']}.log"
     )
-    with writer_lock(directory / "run.lock"), case_logging(log_directory):
-        status_path = directory / "status.json"
+    LOGGER.info("Model case %s fold %s at %s", case["name"], fold, directory)
+    with writer_lock(directory / "run.lock"):
+        status_path = artifact_path(directory, "status.json")
         if status_path.exists():
             status = json.loads(status_path.read_text())
             if status["state"] == "complete":
-                recorded = json.loads((directory / "identity.json").read_text())
-                if recorded != identity:
+                recorded = json.loads(
+                    (artifact_path(directory, "identity.json")).read_text()
+                )
+                fit_path = artifact_path(directory, "fit_arguments.json")
+                if "resolved_fit" not in recorded and fit_path.exists():
+                    recorded["resolved_fit"] = json.loads(fit_path.read_text())
+                if compatibility_identity(recorded) != compatibility_identity(
+                    identity
+                ):
                     raise ValueError("Completed experiment identity mismatch.")
                 for filename, checksum in status["checksums"].items():
-                    if file_digest(directory / filename) != checksum:
+                    if (
+                        file_digest(artifact_path(directory, filename))
+                        != checksum
+                    ):
                         raise ValueError(
                             "Completed artifact checksum mismatch: "
                             f"{directory / filename}"
                         )
                 LOGGER.info("Reusing completed experiment %s", directory)
-                return
-        model_configuration = directory / "model_configuration.yaml"
+                return False
+        prepare_run(directory)
+        model_configuration = artifact_path(
+            directory, "model_configuration.yaml"
+        )
         model_configuration.write_text(yaml.safe_dump(snapshots["model"]))
-        atomic_json(directory / "identity.json", identity)
-        atomic_json(directory / "resolved_configurations.json", snapshots)
+        atomic_json(artifact_path(directory, "identity.json"), identity)
         atomic_json(
-            directory / "runtime.json",
+            artifact_path(directory, "resolved_configurations.json"), snapshots
+        )
+        atomic_json(
+            artifact_path(directory, "runtime.json"),
             dict(
                 gpu=gpu,
                 pid=os.getpid(),
@@ -140,12 +175,12 @@ def run_case(
                     ["git", "diff"], cwd=REPOSITORY, text=True
                 ),
                 cache=str(features.path) if features.path else None,
-                text_log_directory=str(log_directory),
+                text_log=str(session_log.resolve()),
                 independent_windows=True,
             ),
         )
         np.savez_compressed(
-            directory / "selection.npz",
+            artifact_path(directory, "selection.npz"),
             selected_columns=columns,
             channel_ids=features.arrays["ids"][columns],
             unit_dimensions=features.arrays["units"][columns],
@@ -155,18 +190,10 @@ def run_case(
         )
         atomic_json(status_path, dict(state="running", pid=os.getpid()))
         try:
-            run_seed = int(
-                fingerprint(
-                    dict(
-                        session=session.metadata["session"],
-                        fold=fold,
-                        case=case,
-                        seed=settings["seed"],
-                    )
-                )[:8],
-                16,
-            ) % (2**31 - 1)
-            atomic_json(directory / "seed.json", {"seed": run_seed})
+            run_seed = fit_seed(identity)
+            atomic_json(
+                artifact_path(directory, "seed.json"), {"seed": run_seed}
+            )
             backend = plugin(
                 settings["model_plugin"],
                 configuration=str(model_configuration),
@@ -174,27 +201,40 @@ def run_case(
                 seed=run_seed,
                 previews=preview_settings,
             )
-            checkpoint = directory / "model.p"
-            if arguments.stage == "evaluate":
+            checkpoint = artifact_path(directory, "model.p")
+            fit_complete = artifact_path(directory, "fit_complete.json")
+            if arguments.stage == "evaluate" or fit_complete.exists():
+                if fit_complete.exists():
+                    fit_record = json.loads(fit_complete.read_text())
+                    if (
+                        file_digest(checkpoint)
+                        != fit_record["checkpoint_sha256"]
+                    ):
+                        raise ValueError(
+                            f"Fitted checkpoint checksum mismatch: {checkpoint}"
+                        )
                 backend.load(checkpoint)
             else:
                 backend.fit(features, columns, case["dimensions"], directory)
                 backend.save(checkpoint)
-                if preview_settings["enabled"]:
-                    from .previews import fitted_previews
+                atomic_json(
+                    fit_complete, {"checkpoint_sha256": file_digest(checkpoint)}
+                )
+            if preview_settings["enabled"]:
+                from .previews import fitted_previews
 
-                    revision = fitted_previews(
-                        session,
-                        features,
-                        preview_settings,
-                        directory,
-                        snapshots["experiment"]["preview_model_plugin"],
-                        columns,
-                    )
-                    atomic_json(
-                        directory / "preview_reference.json",
-                        {"directory": str(revision)},
-                    )
+                revision = fitted_previews(
+                    session,
+                    features,
+                    preview_settings,
+                    directory,
+                    snapshots["experiment"]["preview_model_plugin"],
+                    columns,
+                )
+                atomic_json(
+                    artifact_path(directory, "preview_reference.json"),
+                    {"directory": str(revision)},
+                )
             from .history import summarize_histories
 
             summarize_histories(directory, plots=not arguments.no_plots)
@@ -232,14 +272,18 @@ def run_case(
             metadata = dict(
                 session=session.metadata["session"],
                 fold=fold,
-                configuration=case["name"],
+                configuration=model_root.name,
+                case_name=case["name"],
+                model_settings=model_identity(snapshots, case),
                 hyper_parameters=case["dimensions"],
                 **case["summary_parameters"],
                 population_scale=case["population_scale"],
                 neural_channels=len(columns),
                 behavior_dimensions=truth["Z"].shape[1],
             )
-            with np.load(directory / "fit_indices.npz") as fit_indices:
+            with np.load(
+                artifact_path(directory, "fit_indices.npz")
+            ) as fit_indices:
                 source_indices = fit_indices["training"].ravel()
             training = np.searchsorted(arrays["indices"], source_indices)
             baseline = dict(
@@ -262,7 +306,9 @@ def run_case(
                     pid=os.getpid(),
                     checkpoint_reload_verified=True,
                     checksums={
-                        filename: file_digest(directory / filename)
+                        filename: file_digest(
+                            artifact_path(directory, filename)
+                        )
                         for filename in (
                             "model.p",
                             "metrics.json",
@@ -272,6 +318,7 @@ def run_case(
                 ),
             )
             LOGGER.info("Completed experiment %s", directory)
+            return True
         except BaseException as error:
             atomic_json(
                 status_path,
@@ -383,34 +430,60 @@ def main() -> None:
         or experiment["selection"]["folds"]
         or list(range(data["cv"]["folds"]))
     )
+    from .model_summary import register_model_work, write_model_summary
+
+    if cases:
+        for case in cases:
+            register_model_work(root, snapshots, case, selected, folds)
+            write_model_summary(model_directory(root, snapshots, case))
     for session in selected:
-        source = dataset.load(session)
-        for fold in folds:
-            if arguments.stage == "preprocess":
-                features = dataset.fold(source, fold, data["infer_velocity"])
-                preprocessing_previews(
-                    source,
-                    features,
-                    data["previews"],
-                    root / "uncached_previews",
-                )
-                LOGGER.info(
-                    "Cached %s fold %s at %s", session, fold, features.path
-                )
-                continue
-            for case in cases:
-                run_case(
-                    dataset,
-                    source,
-                    fold,
-                    case,
-                    settings,
-                    arguments,
-                    shared,
-                    snapshots,
-                    gpu,
-                    root,
-                )
+        with lifecycle_scope(arguments.log_directory, session):
+            with session_logging(arguments.log_directory, session):
+                source = dataset.load(session)
+                for fold in folds:
+                    with lifecycle_scope(
+                        arguments.log_directory,
+                        session,
+                        fold,
+                    ) as fold_state:
+                        if arguments.stage == "preprocess":
+                            features = dataset.fold(
+                                source,
+                                fold,
+                                data["infer_velocity"],
+                            )
+                            preprocessing_previews(
+                                source,
+                                features,
+                                data["previews"],
+                                root / "uncached_previews",
+                            )
+                            LOGGER.info(
+                                "Cached fold %s at %s", fold, features.path
+                            )
+                            continue
+                        changed = []
+                        for case in cases:
+                            try:
+                                changed.append(
+                                    run_case(
+                                        dataset,
+                                        source,
+                                        fold,
+                                        case,
+                                        settings,
+                                        arguments,
+                                        shared,
+                                        snapshots,
+                                        gpu,
+                                        root,
+                                    )
+                                )
+                            finally:
+                                write_model_summary(
+                                    model_directory(root, snapshots, case),
+                                )
+                        fold_state["skipped"] = not any(changed)
     if arguments.stage != "preprocess":
         plugin(
             experiment["report_plugin"],

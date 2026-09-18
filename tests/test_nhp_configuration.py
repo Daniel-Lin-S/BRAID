@@ -14,7 +14,7 @@ from experiments.configuration import (
     read_yaml,
     resolve_configuration,
 )
-from experiments.runtime import case_logging, launch_directory
+from experiments.runtime import session_logging, launch_directory
 
 
 def local_settings(tmp_path: Path) -> Path:
@@ -149,10 +149,10 @@ def test_launch_and_case_logs_are_isolated(tmp_path):
     assert first.parent.name == "fit"
     assert first.parent.parent.name == "latent_dimension_sweep"
     for directory, token in ((first, "first-fit"), (second, "second-fit")):
-        with case_logging(directory / "sessions" / "session" / "fold_0"):
+        with session_logging(directory, "session"):
             logging.getLogger(__name__).warning(token)
-    first_log = next(first.rglob("experiment.log")).read_text()
-    second_log = next(second.rglob("experiment.log")).read_text()
+    first_log = (first / "sessions" / "session.log").read_text()
+    second_log = (second / "sessions" / "session.log").read_text()
     assert "first-fit" in first_log and "second-fit" not in first_log
     assert "second-fit" in second_log and "first-fit" not in second_log
 

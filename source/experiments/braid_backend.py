@@ -6,19 +6,20 @@ component epoch artifacts, fitted-stage previews, and the native BRAID model.
 Forecasts are returned as (horizon, time, output) arrays with explicit masks.
 """
 
-import copy
 import logging
-import shutil
+import json
 from pathlib import Path
 
 import numpy as np
+import yaml
 
 from BRAID.BRAIDModel import BRAIDModel
 from BRAID.MainModel import shift_ms_to_1s_series
-from BRAID.config import load_braid_fit_arguments
+from BRAID.config import resolve_braid_fit_arguments
 from BRAID.sequence import window_shift
 
-from .cache import atomic_json, file_digest
+from .artifacts import artifact_path
+from .cache import atomic_json, file_digest, cached, load_entry
 from .contracts import FeatureSet
 from .nhp import TRAIN, VALIDATION
 from .previews import preview_windows
@@ -40,11 +41,43 @@ class BRAIDBackend:
         previews: dict | None = None,
     ) -> None:
         self.seed = seed
+        self.configuration = yaml.safe_load(Path(configuration).read_text())
+        self.overrides = overrides or {}
         self.previews = previews
-        self.arguments = load_braid_fit_arguments(configuration)
-        self.arguments["args_base"].update(overrides or {})
+        self.arguments = self.resolve_fit_configuration(
+            self.configuration, {}, self.overrides
+        )
         self.length = self.arguments["args_base"]["sequence_length"]
         self.model = None
+
+    @staticmethod
+    def resolve_fit_configuration(
+        configuration: dict,
+        dimensions: dict,
+        overrides: dict | None = None,
+        features: FeatureSet | None = None,
+    ) -> dict:
+        """Resolve defaults, case overrides and data-dependent batch size.
+
+        Features, when supplied, contain time-first arrays and split roles.
+        The returned mapping is passed unchanged to BRAIDModel.fit.
+        """
+        arguments = resolve_braid_fit_arguments(configuration)
+        arguments.update(dimensions)
+        base = arguments["args_base"]
+        base.update(overrides or {})
+        if features is not None:
+            length = base["sequence_length"]
+            counts = [
+                len(window_indices(features, role, length))
+                for role in (TRAIN, VALIDATION)
+            ]
+            if min(counts) < 1:
+                raise ValueError(
+                    "Fitting requires training and validation windows."
+                )
+            base["batch_size"] = min(base["batch_size"], *counts)
+        return arguments
 
     def fit(
         self,
@@ -70,15 +103,18 @@ class BRAIDBackend:
 
         tf.keras.utils.set_random_seed(self.seed)
         self.feature_cache = features.path
-        arguments = copy.deepcopy(self.arguments)
-        arguments.update(dimensions)
+        self.run_directory = directory
+        self.preview_excerpts = []
+        arguments = self.resolve_fit_configuration(
+            self.configuration, dimensions, self.overrides, features
+        )
         base = arguments["args_base"]
         training = window_indices(features, TRAIN, self.length)
         validation = window_indices(features, VALIDATION, self.length)
-        batch = min(base["batch_size"], len(training), len(validation))
+        batch = base["batch_size"]
         training = training[: len(training) // batch * batch]
         validation = validation[: len(validation) // batch * batch]
-        configured_batch = base["batch_size"]
+        configured_batch = self.arguments["args_base"]["batch_size"]
         if batch != configured_batch:
             LOGGER.warning(
                 "Effective batch size %s (configured %s): limited by the "
@@ -86,9 +122,8 @@ class BRAIDBackend:
                 batch,
                 configured_batch,
             )
-        base["batch_size"] = batch
         atomic_json(
-            directory / "training_deviations.json",
+            artifact_path(directory, "training_deviations.json"),
             dict(
                 configured_batch_size=configured_batch,
                 effective_batch_size=batch,
@@ -97,11 +132,11 @@ class BRAIDBackend:
         )
         directory.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
-            directory / "fit_indices.npz",
+            artifact_path(directory, "fit_indices.npz"),
             training=features.arrays["indices"][training],
             validation=features.arrays["indices"][validation],
         )
-        atomic_json(directory / "fit_arguments.json", arguments)
+        atomic_json(artifact_path(directory, "fit_arguments.json"), arguments)
         arrays = features.arrays
         self.model = BRAIDModel(
             log_dir=str(directory / "components"),
@@ -120,18 +155,14 @@ class BRAIDBackend:
             **arguments,
         )
         if self.previews and self.previews["enabled"]:
-            for number, indices in enumerate(
-                preview_windows(features, self.previews)
-            ):
-                self._previews(features, columns, indices, directory, number)
+            for indices in preview_windows(features, self.previews):
+                self._previews(features, columns, indices)
 
     def _previews(
         self,
         features: FeatureSet,
         columns: np.ndarray,
         indices: np.ndarray,
-        directory: Path,
-        number: int,
     ) -> None:
         """Save checkpoint-specific transforms on the raw-preview time grid."""
         arrays = features.arrays
@@ -159,17 +190,16 @@ class BRAIDBackend:
         for name, value in dict(normalized, learned_Z=learned).items():
             if not np.isfinite(value).all():
                 raise FloatingPointError(f"Nonfinite fitted preview: {name}.")
-        suffix = "" if number == 0 else f"_{number}"
-        stem = directory / f"fitted_preprocessing{suffix}"
-        np.savez_compressed(
-            stem.with_suffix(".npz"),
-            t=arrays["t"][indices],
-            channel_ids=arrays["ids"][columns],
-            source_indices=arrays["indices"][indices],
-            context_indices=arrays["indices"][context],
-            learned_Z=learned,
-            raw_Z=z,
-            **normalized,
+        self.preview_excerpts.append(
+            dict(
+                t=arrays["t"][indices],
+                channel_ids=arrays["ids"][columns],
+                source_indices=arrays["indices"][indices],
+                context_indices=arrays["indices"][context],
+                learned_Z=learned,
+                raw_Z=z,
+                **normalized,
+            )
         )
 
     def predict(
@@ -204,25 +234,34 @@ class BRAIDBackend:
         """Save all BRAID stages using its native reconstruction format."""
         self.model.saveToFile(str(path))
         self.model.restoreModels()
-        if (
-            getattr(self, "feature_cache", None) is not None
-            and self.previews
-            and self.previews["enabled"]
-        ):
-            target = self.feature_cache / "fitted_previews" / file_digest(path)
-            target.mkdir(parents=True, exist_ok=True)
-            sources = list(path.parent.glob("fitted_preprocessing*"))
-            sources.append(path.parent / "fit_indices.npz")
-            for source in sources:
-                shutil.copy2(source, target / source.name)
-            atomic_json(
-                target / "provenance.json",
-                {
-                    "checkpoint": str(path.resolve()),
-                    "sha256": file_digest(path),
-                    "scope": "this fitted checkpoint only",
-                },
+        if self.preview_excerpts:
+            base = self.feature_cache or (self.run_directory / "data")
+            arrays = {
+                f"window_{i}_{key}": value
+                for i, excerpt in enumerate(self.preview_excerpts)
+                for key, value in excerpt.items()
+            }
+            identity = dict(checkpoint_sha256=file_digest(path), version=1)
+            entry = cached(
+                base / "fitted_previews" / identity["checkpoint_sha256"],
+                "excerpts",
+                identity,
+                "reuse",
+                lambda: FeatureSet(
+                    arrays, {"windows": len(self.preview_excerpts)}
+                ),
             )
+            atomic_json(
+                artifact_path(self.run_directory, "fitted_excerpts.json"),
+                dict(
+                    directory=str(entry.path),
+                    identity=json.loads(
+                        (entry.path / "manifest.json").read_text()
+                    )["identity"],
+                    manifest_sha256=file_digest(entry.path / "manifest.json"),
+                ),
+            )
+            self.preview_excerpts = []
 
     def load(self, path: Path) -> None:
         """Restore all BRAID stages without fitting or changing parameters."""
@@ -291,17 +330,43 @@ def checkpoint_preview_arrays(
     """
     from BRAID.tools.file_tools import pickle_load
 
-    model = pickle_load(str(source_run / "model.p"))["model"]
-    with np.load(source_run / "selection.npz", allow_pickle=False) as saved:
+    model = pickle_load(str(artifact_path(source_run, "model.p")))["model"]
+    with np.load(
+        artifact_path(source_run, "selection.npz"), allow_pickle=False
+    ) as saved:
         columns = saved["selected_columns"]
         ids = saved["channel_ids"]
         units = saved["unit_dimensions"]
     np.testing.assert_array_equal(features.arrays["ids"][columns], ids)
     np.testing.assert_array_equal(features.arrays["units"][columns], units)
+    reference = artifact_path(source_run, "fitted_excerpts.json")
     excerpts = []
-    for path in sorted(source_run.glob("fitted_preprocessing*.npz")):
-        with np.load(path, allow_pickle=False) as saved:
-            excerpts.append(dict(saved))
+    if reference.exists():
+        info = json.loads(reference.read_text())
+        directory = Path(info["directory"])
+        if file_digest(directory / "manifest.json") != info["manifest_sha256"]:
+            raise ValueError(f"Fitted excerpt manifest changed: {directory}")
+        if (
+            file_digest(artifact_path(source_run, "model.p"))
+            != info["identity"]["checkpoint_sha256"]
+        ):
+            raise ValueError(
+                f"Fitted excerpts belong to another checkpoint: {source_run}"
+            )
+        entry = load_entry(directory, info["identity"])
+        for number in range(entry.metadata["windows"]):
+            prefix = f"window_{number}_"
+            excerpts.append(
+                {
+                    key[len(prefix) :]: value
+                    for key, value in entry.arrays.items()
+                    if key.startswith(prefix)
+                }
+            )
+    else:
+        for path in sorted(source_run.glob("fitted_preprocessing*.npz")):
+            with np.load(path, allow_pickle=False) as saved:
+                excerpts.append(dict(saved))
     output = []
     for indices in windows:
         time = features.arrays["t"][indices]

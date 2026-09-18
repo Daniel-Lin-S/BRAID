@@ -1105,7 +1105,6 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
         while not fitWasOk and attempt < max_attempts:
             for input_i, inputTrainThis in enumerate(yInTrain):
                 if self.missing_marker in inputTrainThis:
-                    print('Warning!! final RNN input for fitting includes missing marker in field {}'.format(input_i))
                     logger.info('Warning!! final RNN input for fitting includes missing marker in field {}'.format(input_i))
             attempt += 1 
             history = self.fit_with_retry(init_attempts=init_attempts, 
@@ -1131,6 +1130,9 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
                 if not fitWasOk and attempt < max_attempts:
                     logger.info(f'RNN fit was not stable (blew-up and led to nan loss). Retrying with attempt {attempt+1}')
                     self.set_batch_size(batch_size=batch_size_backup) # Switch to batch size of 1 to facilitate future predictions
+        if epoch_artifacts and (max_attempts == 1 or fitWasOk):
+            from .tools.training_artifacts import complete_component
+            complete_component(self.model, self.log_dir, history)
         return history
 
     def set_steps_ahead(self, steps_ahead):

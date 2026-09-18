@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .artifacts import artifact_path
 from .cache import file_digest, load_entry
 from .contracts import plugin
 from .preview_publication import publish_previews
@@ -43,7 +44,7 @@ def regenerate_previews(settings: dict) -> Path:
             "Set an absolute previews.source_run in configuration."
         )
     run = Path(reference).resolve()
-    runtime = json.loads((run / "runtime.json").read_text())
+    runtime = json.loads((artifact_path(run, "runtime.json")).read_text())
     if not runtime.get("cache"):
         raise ValueError("Source run has no saved fold-cache reference.")
     fold_path = Path(runtime["cache"])
@@ -51,6 +52,11 @@ def regenerate_previews(settings: dict) -> Path:
     session_path = Path(fold_manifest["metadata"]["session_cache"])
     session_manifest = json.loads((session_path / "manifest.json").read_text())
     sources = [p for p in run.rglob("*") if p.is_file()]
+    fitted_reference = artifact_path(run, "fitted_excerpts.json")
+    if fitted_reference.exists():
+        reference = json.loads(fitted_reference.read_text())
+        directory = Path(reference["directory"])
+        sources.extend([directory / "arrays.npz", directory / "manifest.json"])
     for cache in (session_path, fold_path):
         sources.extend([cache / "arrays.npz", cache / "manifest.json"])
     hashes = {str(p.resolve()): file_digest(p) for p in sorted(sources)}
@@ -86,7 +92,9 @@ def regenerate_previews(settings: dict) -> Path:
         features=fold,
         windows=windows,
     )
-    with np.load(run / "selection.npz", allow_pickle=False) as saved:
+    with np.load(
+        artifact_path(run, "selection.npz"), allow_pickle=False
+    ) as saved:
         columns = saved["selected_columns"]
     destination = (
         Path(settings["paths"]["cache_root"])
@@ -103,7 +111,7 @@ def regenerate_previews(settings: dict) -> Path:
         windows,
         columns,
         fitted,
-        run / "model.p",
+        artifact_path(run, "model.p"),
         hashes,
     )
     LOGGER.info("Completed artifact-only previews: %s", result)

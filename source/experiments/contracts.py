@@ -38,6 +38,14 @@ class Model(Protocol):
 
     length: int
 
+    @staticmethod
+    def resolve_fit_configuration(
+        configuration: dict,
+        dimensions: dict,
+        overrides: dict | None = None,
+        features: FeatureSet | None = None,
+    ) -> dict: ...
+
     def fit(
         self,
         features: FeatureSet,

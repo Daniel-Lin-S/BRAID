@@ -1,7 +1,8 @@
 """Launch one configured stage with an isolated console log and metadata.
 
-Each launch creates log_root/experiment/stage/UTC-id containing console.log,
-experiment.log and launch.json. Detached workers start a new OS session.
+Each launch creates console.log for launch diagnostics, experiment.log for
+session/fold lifecycle notices, and flat sessions/<session>.log detail files.
+launch.json records the invocation. Detached workers start a new OS session.
 Dry runs print resolved settings and do not create logs or artifacts.
 """
 

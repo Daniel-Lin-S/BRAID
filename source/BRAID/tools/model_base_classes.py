@@ -186,6 +186,14 @@ class ModelWithFitWithRetry:
         Returns:
             history (A History object): the output of keras model fit
         """        
+        if epoch_artifacts:
+            from .training_artifacts import (
+                restore_completed_component, previous_attempts)
+            saved_history = restore_completed_component(
+                self.model, self.log_dir)
+            if saved_history is not None:
+                return saved_history
+            artifact_offset = previous_attempts(self.log_dir)
         if callbacks is None:
             callbacks = []
         # Early stopping:
@@ -248,7 +256,8 @@ class ModelWithFitWithRetry:
             callbacks_this = copy.deepcopy(callbacks)
             if epoch_artifacts:
                 from .training_artifacts import EpochArtifacts
-                callbacks_this.append(EpochArtifacts(self.log_dir, attempt))
+                callbacks_this.append(EpochArtifacts(
+                    self.log_dir, attempt + artifact_offset))
             # Early stopping:
             early_stopping_callback = EarlyStoppingWithMinEpochs(
                 monitor=early_stopping_measure, patience=early_stopping_patience, 
@@ -439,6 +448,8 @@ class ModelWithFitWithRetry:
                     history.history[key][-1] = history.history[key][epoch_ind]
                 picked_epoch = history.epoch[epoch_ind]
             history.params['picked_epoch'] = picked_epoch
+            if epoch_artifacts:
+                history.params['artifact_attempt'] = attempt + artifact_offset
             if init_attempts > 1:
                 weights = self.model.get_weights()
                 modelsWeightsAll.append(weights)

@@ -106,7 +106,8 @@ class BRAIDModel(MainModel):
             args_pre['allow_nonzero_Cz2']=True
             args_pre['has_UFT_reg']=False
             sId_pre = MainModel(
-                    log_dir=(os.path.join(self.log_dir, "preprocessing")
+                    artifact_role="behaviour_preprocess",
+                    log_dir=(os.path.join(self.log_dir, "behaviour_preprocess")
                              if self.log_dir else ""),
                     missing_marker=self.missing_marker)
             sId_pre.fit(Y, Z, U=U, nx=n_pre, n1=0,
@@ -155,6 +156,7 @@ class BRAIDModel(MainModel):
             args['has_UFT']=False
             args['has_UFT_reg']=False
         sId = MainModel(
+                artifact_role="main",
                 log_dir=(os.path.join(self.log_dir, "main")
                          if self.log_dir else ""),
                 missing_marker=self.missing_marker)
@@ -187,7 +189,8 @@ class BRAIDModel(MainModel):
             else:
                 Z3_validation = None
 
-            sId_post = MainModel(log_dir=self.log_dir,
+            sId_post = MainModel(
+                    artifact_role="input_only", log_dir=self.log_dir,
                     missing_marker=self.missing_marker)
 
             sId_post.fit(None, Z3, U=U, nx=n3This, n1=n3This, 

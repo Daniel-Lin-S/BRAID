@@ -9,12 +9,17 @@ import csv
 import json
 from pathlib import Path
 
+from .artifacts import artifact_path, discover_runs
 from .evaluation import aggregate, collect_results
 from .plots import forecast_example, plot_suite
 
 
 def braid_report(root: Path, settings: dict, sample_rate: float) -> None:
     """Produce the required BRAID tables and optional figures from artifacts."""
+    from .model_summary import write_model_summary
+
+    for manifest in root.glob("*/model_manifest.json"):
+        write_model_summary(manifest.parent)
     destination = root / "summary"
     summaries = aggregate(collect_results(root), destination)
     table = {}
@@ -44,9 +49,16 @@ def braid_report(root: Path, settings: dict, sample_rate: float) -> None:
     plot_suite(summaries, destination, settings)
     if not settings["enabled"]:
         return
-    for identity in sorted(root.glob("*/fold_*/*/identity.json")):
+    for run in discover_runs(root):
+        identity = artifact_path(run, "identity.json")
         case = json.loads(identity.read_text())["case"]
-        predictions = identity.parent / "predictions.npz"
+        predictions = artifact_path(run, "predictions.npz")
+        status = artifact_path(run, "status.json")
+        if (
+            not status.exists()
+            or json.loads(status.read_text())["state"] != "complete"
+        ):
+            continue
         if case["dimensions"]["nx"] == 64 and predictions.exists():
             forecast_example(
                 predictions,

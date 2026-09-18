@@ -26,6 +26,7 @@ from .RegressionModel import RegressionModel
 from .RNNModel import RNNModel
 from .tools import LSSM
 from .tools.abstract_classes import PredictorModel
+from .tools.component_artifacts import component_paths
 from .tools.file_tools import bytes_to_string, pickle_load, pickle_save
 from .tools.LinearMapping import (
     LinearMappingSequence,
@@ -1929,6 +1930,7 @@ class MainModel(PredictorModel):
 
         need_Cfw = np.any(np.array(steps_ahead)!=1) and ((self.nu > 0 and self.has_UFT and not self.observable_U_in_Cfw) or self.has_Dyz) # replace with "(self.nu > 0 and self.has_UFT and not self.observable_U_in_Cfw)" for supporting observable U in Cfw
         need_fw_reg_models = np.any(np.array(steps_ahead)!=1) and ((self.nu > 0 and self.has_UFT_reg and not self.observable_U_in_Cfw) or self.has_Dyz) # replace with "(self.nu > 0 and self.has_UFT_reg and not self.observable_U_in_Cfw)" for supporting observable U in reg model
+        artifact_paths = component_paths(self, need_fw_reg_models)
 
         # Stage 1
         if self.n1 > 0:
@@ -1947,7 +1949,7 @@ class MainModel(PredictorModel):
                 rnn_cell_args['LSTMSettings'] = copy.deepcopy(
                     self.stage_1_lstm_arguments
                 )
-            this_log_dir = '' if self.log_dir == '' else os.path.join(self.log_dir, 'RNN1')
+            this_log_dir = artifact_paths["RNN1"]
             # model1: RNN with input: [y,u], states: x1 => n1, outputs: z, feedthrough: u
             model1 = RNNModel(self.n1, self.ny+self.nu, 
                         self.block_samples, 
@@ -1986,7 +1988,7 @@ class MainModel(PredictorModel):
                 rnn_cell_args['LSTMSettings'] = copy.deepcopy(
                     self.stage_2_lstm_arguments
                 )
-            this_log_dir = '' if self.log_dir == '' else os.path.join(self.log_dir, 'RNN2')
+            this_log_dir = artifact_paths["RNN2"]
             # model2: RNN with input: [x1,y,u], states: x2 => n2, outputs: y, feedthrough: u
             nft2 = self.nu if self.has_UFT else 0
             model2 = RNNModel(self.n2, self.n1+self.ny+self.nu, 
@@ -2022,7 +2024,7 @@ class MainModel(PredictorModel):
             ):
             reg_args = copy.deepcopy(self.Cz2_args)
             reg_args['has_prior_pred'] = True # From stage 1
-            this_log_dir = '' if self.log_dir == '' else os.path.join(self.log_dir, 'Cz2')
+            this_log_dir = artifact_paths["Cz2"]
             # model2_Cz [if not full]: regression with input: [x2], outputs: z
             # model2_Cz [if full]: regression with input: [x1,x2,u], outputs: z
             input_dim = self.n2 if not self.model2_Cz_Full else self.n1+self.n2
@@ -2039,7 +2041,7 @@ class MainModel(PredictorModel):
                         lr_scheduler_name=self.lr_scheduler_name, lr_scheduler_args=self.lr_scheduler_args, 
                         **reg_args)
             if need_fw_reg_models: # Now: Only goes in when want fwd pred and FT is modeled (1-step ahead) and want to exclude in multisteps ahead. Otherwise use original C in fwd pred
-                this_log_dir = '' if self.log_dir == '' else os.path.join(self.log_dir, 'Cz2_fw')
+                this_log_dir = artifact_paths["Cz2_fw"]
                 input_dim = self.n2 if not self.model2_Cz_Full else self.n1+self.n2
                 # This case won't observe U in fw now throw a warning message.!!! should have done input_dim+=nu if (self.has_Dyz and (self.n1 == 0 or self.model2_Cz_Full)) and (ubservable_U_fw and self.nu>0 and self.has_UFT_reg). but since requires new settings for Cfw, not supported for now.
                 model2_Cz_fw = RegressionModel(input_dim, # Without feedthrough even if nu > 0, and without Dyz. If ft modeled in fwd, then need_fw_reg_models should have been False
@@ -2057,7 +2059,7 @@ class MainModel(PredictorModel):
 
         if (self.n1 > 0 and (self.n2 > 0 or self.skip_Cy is False)) and not self.model1_Cy_Full:
             reg_args = copy.deepcopy(self.Cy1_args)
-            this_log_dir = '' if self.log_dir == '' else os.path.join(self.log_dir, 'Cy1')
+            this_log_dir = artifact_paths["Cy1"]
             # model1_Cy [if not full]: regression with input: [x1,u], outputs: y
             input_dim_Cy = self.n1+self.nu if self.has_UFT_reg else self.n1
             model1_Cy = RegressionModel(input_dim_Cy, #self.n1+self.nu,
@@ -2069,7 +2071,7 @@ class MainModel(PredictorModel):
                     lr_scheduler_name=self.lr_scheduler_name, lr_scheduler_args=self.lr_scheduler_args, 
                     **reg_args)
             if need_fw_reg_models: # Now: Only goes in when want fwd pred and FT is modeled (1-step ahead) and want to exclude in multisteps ahead. Otherwise use original C in fwd pred
-                this_log_dir = '' if self.log_dir == '' else os.path.join(self.log_dir, 'Cy1_fw')
+                this_log_dir = artifact_paths["Cy1_fw"]
                 # model1_Cy_fw [if not full]: regression with input: [x1], outputs: y
                 model1_Cy_fw = RegressionModel(self.n1,  # Without feedthrough even if nu > 0. If ft modeled in fwd, then need_fw_reg_models should have been False
                     self.ny, 
@@ -2086,7 +2088,7 @@ class MainModel(PredictorModel):
 
         if self.model1_Cy_Full:
             reg_args = copy.deepcopy(self.Cy2_args)
-            this_log_dir = '' if self.log_dir == '' else os.path.join(self.log_dir, 'Cy1')
+            this_log_dir = artifact_paths["Cy1"]
             # model1_Cy [if full]: regression with input: [x1,x2,u], outputs: y
             input_dim_Cy = self.n1+self.n2+self.nu if self.has_UFT else self.n1+self.n2
             model1_Cy = RegressionModel(input_dim_Cy, #self.n1+self.n2+self.nu,
@@ -2098,7 +2100,7 @@ class MainModel(PredictorModel):
                         lr_scheduler_name=self.lr_scheduler_name, lr_scheduler_args=self.lr_scheduler_args,
                         **reg_args)
             if need_fw_reg_models: # Now: Only goes in when want fwd pred and FT is modeled (1-step ahead) and want to exclude in multisteps ahead. Otherwise use original C in fwd pred
-                this_log_dir = '' if self.log_dir == '' else os.path.join(self.log_dir, 'Cy1_fw')
+                this_log_dir = artifact_paths["Cy1_fw"]
                 # model1_Cy_fw [if full]: regression with input: [x1,x2], outputs: y
                 model1_Cy_fw = RegressionModel(self.n1+self.n2,   # Without feedthrough even if nu > 0. If ft modeled in fwd, then need_fw_reg_models should have been False
                         self.ny, 

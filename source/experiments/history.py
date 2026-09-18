@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .artifacts import artifact_path
 from .cache import atomic_json
 from .previews import trace_plot
 
@@ -64,4 +65,4 @@ def summarize_histories(directory: Path, plots: bool = True) -> None:
                 )
     if not summaries:
         raise ValueError("No persisted component history to summarize.")
-    atomic_json(directory / "stage_loss_summary.json", summaries)
+    atomic_json(artifact_path(directory, "stage_loss_summary.json"), summaries)

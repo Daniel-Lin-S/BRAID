@@ -371,6 +371,9 @@ class RegressionModel(tf.keras.layers.Layer, ModelWithFitWithRetry, Reconstructa
                 logger.info(f'Regression model fit led to nan loss. Retrying with attempt {attempt+1}')
         num_batch = history.params['steps']
         logger.info('Model fitting finished. Had {} batches each with batch_size of {} samples each (ny_in={}, ny_out={})'.format(num_batch, int(outputs.shape[0]/num_batch), X_in.shape[0], X_out.shape[0]))
+        if epoch_artifacts and (max_attempts == 1 or fitWasOk):
+            from .tools.training_artifacts import complete_component
+            complete_component(self.model, self.log_dir, history)
         return history
 
     def predict(self, X_in, prior_pred = None):

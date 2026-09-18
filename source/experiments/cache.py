@@ -20,19 +20,10 @@ from typing import Callable, Iterator
 import numpy as np
 
 from .contracts import FeatureSet
+from artifact_io import file_digest
 
 LOGGER = logging.getLogger(__name__)
-BUFFER_SIZE = 8 * 1024 * 1024
 CACHE_VERSION = 1
-
-
-def file_digest(path: Path, algorithm: str = "sha256") -> str:
-    """Hash a file incrementally without retaining its bytes in memory."""
-    digest = hashlib.new(algorithm)
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(BUFFER_SIZE), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def fingerprint(value: object) -> str:

@@ -5,7 +5,7 @@ Automatic selection ranks visible GPUs by free memory, then utilization.
 CPU execution must be explicitly requested; GPU failures are not hidden.
 """
 
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 import logging
 from typing import Iterator
@@ -13,6 +13,7 @@ from uuid import uuid4
 import os
 from pathlib import Path
 import subprocess
+import sys
 
 
 def launch_directory(settings: dict, stage: str) -> Path:
@@ -41,35 +42,120 @@ def launch_directory(settings: dict, stage: str) -> Path:
     return directory.resolve()
 
 
+LIFECYCLE_LOGGER = "experiments.lifecycle"
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+
+
 @contextmanager
-def case_logging(directory: Path) -> Iterator[None]:
-    """Route one model fit's text to its session/fold/case directory."""
-    directory.mkdir(parents=True, exist_ok=True)
-    handler = logging.FileHandler(directory / "experiment.log")
-    handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    )
-    logger = logging.getLogger()
-    logger.addHandler(handler)
+def session_logging(directory: Path, session: str) -> Iterator[None]:
+    """Exclusively capture Python and native session output in one flat file.
+
+    Parameters
+    ----------
+    directory : Path
+        Launch log root, containing sessions/<session>.log.
+    session : str
+        Single safe filename component identifying the dataset session.
+
+    Yields
+    ------
+    None
+        Session scope. An exception is logged here once and exits with code 1.
+    """
+    if not session or Path(session).name != session:
+        raise ValueError("Session log name must be one filename component.")
+    path = directory / "sessions" / f"{session}.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    root = logging.getLogger()
+    previous = root.handlers[:]
+    child_routes = []
+    for name, logger in logging.Logger.manager.loggerDict.items():
+        if isinstance(logger, logging.Logger) and name != LIFECYCLE_LOGGER:
+            child_routes.append((logger, logger.handlers[:], logger.propagate))
+            logger.handlers = []
+            logger.propagate = True
+    sys.stdout.flush()
+    sys.stderr.flush()
+    saved = [os.dup(fd) for fd in (1, 2)]
+    with path.open("a", buffering=1) as stream:
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(logging.Formatter(LOG_FORMAT))
+        try:
+            for fd in (1, 2):
+                os.dup2(stream.fileno(), fd)
+            root.handlers = [handler]
+            with redirect_stdout(stream), redirect_stderr(stream):
+                try:
+                    yield
+                except BaseException:
+                    root.exception("Session failed: %s", session)
+                    raise SystemExit(1) from None
+        finally:
+            stream.flush()
+            root.handlers = previous
+            for logger, handlers, propagate in child_routes:
+                logger.handlers = handlers
+                logger.propagate = propagate
+            handler.close()
+            for fd, original in zip((1, 2), saved):
+                os.dup2(original, fd)
+                os.close(original)
+
+
+@contextmanager
+def lifecycle_scope(
+    directory: Path,
+    session: str,
+    fold: int | None = None,
+) -> Iterator[dict]:
+    """Record a session/fold boundary without copying detailed session text.
+
+    Parameters
+    ----------
+    directory : Path
+        Launch log directory.
+    session : str
+        Session identifier.
+    fold : int, optional
+        Fold identifier; default None denotes the entire session.
+
+    Yields
+    ------
+    dict
+        Set skipped=True when every selected unit reused completed work.
+    """
+    logger = logging.getLogger(LIFECYCLE_LOGGER)
+    label = f"session={session}" + (f" fold={fold}" if fold is not None else "")
+    path = (directory / "sessions" / f"{session}.log").resolve()
+    state = {"skipped": False}
+    logger.info("Started %s; details: %s", label, path)
     try:
-        yield
-    finally:
-        logger.removeHandler(handler)
-        handler.close()
+        yield state
+    except BaseException:
+        logger.error("Failed %s; details: %s", label, path)
+        raise
+    else:
+        event = "Skipped completed" if state["skipped"] else "Finished"
+        logger.info("%s %s; details: %s", event, label, path)
 
 
 def configure_logging(directory: Path, level: str) -> None:
-    """Route application text logs to an absolute directory and stderr."""
+    """Separate lifecycle notifications from launch/session diagnostic text."""
     directory.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=getattr(logging, level),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[
-            logging.FileHandler(directory / "experiment.log"),
-            logging.StreamHandler(),
-        ],
+        format=LOG_FORMAT,
+        handlers=[logging.StreamHandler()],
         force=True,
     )
+    lifecycle = logging.getLogger(LIFECYCLE_LOGGER)
+    for handler in lifecycle.handlers:
+        handler.close()
+    handler = logging.FileHandler(directory / "experiment.log")
+    handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    lifecycle.handlers = [handler]
+    lifecycle.setLevel(logging.INFO)
+    lifecycle.propagate = False
 
 
 def thread_environment(threads: int, inter_threads: int) -> dict[str, str]:

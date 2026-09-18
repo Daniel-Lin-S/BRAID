@@ -16,6 +16,7 @@ setuptools.setup(
     long_description_content_type="text/markdown",
     url="https://github.com/ShanechiLab/BRAID",
     packages=setuptools.find_packages(),
+    py_modules=["artifact_io"],
     install_requires=["PyYAML==6.0.2"],
     classifiers=[
         "Programming Language :: Python :: 3",

@@ -15,6 +15,12 @@ import numpy as np
 
 from BRAID.tools.evaluation import evalPrediction
 
+from .artifacts import (
+    artifact_path,
+    discover_runs,
+    model_directory,
+    validate_completion,
+)
 from .cache import atomic_json
 
 LOGGER = logging.getLogger(__name__)
@@ -95,9 +101,9 @@ def evaluate_forecasts(
                 )
                 row[f"{target}_baseline_mse"] = mse.tolist()
             rows.append(row)
-    atomic_json(directory / "metrics.json", rows)
+    atomic_json(artifact_path(directory, "metrics.json"), rows)
     np.savez_compressed(
-        directory / "predictions.npz",
+        artifact_path(directory, "predictions.npz"),
         **predictions,
         true_Y=truth["Y"],
         true_Z=truth["Z"],
@@ -112,13 +118,24 @@ def collect_results(root: Path) -> list[dict]:
     """Read only completed evaluation artifacts, excluding unfinished runs."""
     rows = []
     completed = set()
-    for path in sorted(root.glob("*/fold_*/*/metrics.json")):
-        status = path.parent / "status.json"
+    for run in discover_runs(root):
+        path = artifact_path(run, "metrics.json")
+        status = artifact_path(run, "status.json")
         if (
             status.exists()
             and json.loads(status.read_text())["state"] == "complete"
         ):
-            result = json.loads(path.read_text())
+            validate_completion(run, json.loads(status.read_text()))
+            identity = json.loads(
+                artifact_path(run, "identity.json").read_text()
+            )
+            label = model_directory(
+                root, identity["configurations"], identity["case"]
+            ).name
+            result = [
+                dict(row, configuration=label)
+                for row in json.loads(path.read_text())
+            ]
             if not result:
                 raise ValueError(f"Empty completed metrics: {path.resolve()}")
             key = tuple(

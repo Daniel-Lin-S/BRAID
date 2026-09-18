@@ -52,12 +52,37 @@ Text logs use this structure beneath the configured log root:
   launch.json
   console.log
   experiment.log
-  sessions/<session>/fold_<number>/<case>-<identity>/experiment.log
+  sessions/<session>.log
 ```
 
-Every invocation has a unique directory, including repeated invocations of the same experiment. Detached launches print the worker PID and absolute log location. Existing running jobs retain their original log destinations.
+Every invocation has a unique directory. `experiment.log` contains session/fold lifecycle notifications and absolute detail-log paths. `console.log` contains launch-level diagnostics. All Python logs, progress output and native library output within a session go only to its session log, including all folds and model settings. Detached launches print the worker PID and absolute log location.
 
-Model artifacts use `<artifact_root>/<experiment>/<session>/fold_<number>/<identity>/`. They include resolved settings, source/cache references, selected channels, fit indices, component histories/checkpoints, predictions, channelwise metrics and completion/failure status. Completed compatible results are validated before reuse; completed artifacts are not overwritten.
+Model artifacts use `<artifact_root>/<experiment>/<model-settings>/<session>/fold_<number>/<run-identity>/`. Model-settings names combine the readable case name with a scientific-settings fingerprint. The run hash and completion lookup use the same scientific identity. Model adapters resolve defaults and case overrides for both hashing and fitting; run identities include the effective batch size after window-count capping. Omitted defaults and their explicit equivalents have the same identity. The model-settings directory groups the resolved model configuration before session-specific capping. Launch timestamps, output paths, CPU/GPU choices, logging, previews, configuration filenames and session/fold invocation filters do not enter that identity. Actual source contents, channel identities, fold definition, training and evaluation settings remain significant; dependency versions and preprocessing implementation identity guard compatibility. Each model-settings directory contains `model_manifest.json` and `model_summary.csv`, with session/fold scores, validity indicators and explicit missing/failed states.
+
+Each run groups files by purpose:
+
+```text
+configuration/  # Resolved YAML/settings and fit arguments
+provenance/     # Identity, runtime, seed, deviations, status and references
+data/           # Channel selections and fitting indices
+checkpoints/    # Native fitted model
+evaluation/     # Predictions and channelwise/aggregate metrics
+diagnostics/   # Stage loss summaries
+components/
+  behaviour_preprocess/
+    01_neural_dynamics/
+    02_behaviour_decoder/
+  main/
+    01_behaviour_relevant_neural_dynamics/
+    02_neural_decoder/
+    03_residual_neural_dynamics/
+```
+
+Component numbers follow fitting order within their group. Optional components appear only when enabled, including separate forward decoders, `residual_behaviour_decoder`, and the input-only `non_neural_behaviour_dynamics`. Each component records its role, inputs, target and original internal identifier in `component.json`. TensorBoard timestamps remain beneath component directories. The main residual behaviour decoder is disabled for NHP.
+
+Completed compatible runs and component fits are checksum-validated and restored without retraining. CPU/GPU selection, logging, presentation and session-selection changes do not invalidate numerical results. Historical layouts are read without rewriting completed files. Epoch histories and checkpoints are published during fitting; component completion records preserve selected weights across interruptions.
+
+Fit indices have one canonical copy in the run. Fitted preview excerpts have one canonical payload under the checkpoint-specific fold cache (or run data when caching is disabled), referenced with checksums from provenance. Complementary histories, TensorBoard events, figures and recovery/final checkpoints remain available.
 
 The cache root contains reusable `session` and split-specific `fold` entries. Manifests and payload checksums validate reuse. Choose `--cache-mode reuse`, `rebuild` or `off` explicitly. Inspection figures and numeric excerpts remain separate from numerical feature identity. Normalization and learned behavior previews belong to their fitted checkpoint.
 
