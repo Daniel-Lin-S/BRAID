@@ -168,6 +168,8 @@ def resolve_configuration(arguments: argparse.Namespace) -> dict:
                 f"Expected evaluation_set full or common, got {scoring_set!r}."
             )
     data = resolved["data"]
+    if "presentation" in data.get("previews", {}):
+        raise ValueError("Configure figure style under plotting.presentation.")
     data.update(
         root=paths["dataset_root"],
         cache_root=paths["cache_root"],

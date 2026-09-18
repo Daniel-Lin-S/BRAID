@@ -1,0 +1,20 @@
+presentation:
+  title_font: 32
+  label_font: 28
+  tick_font: 24
+  legend_font: 24
+  width_inches: 16
+  panel_height_inches: 4
+  single_size: [12, 7]
+  horizon_size: [20, 7]
+  dpi: 200
+  pair_colors: ['#1764a0', '#d55e00']
+  horizon_colors:
+    - '#1f77b4'
+    - '#ff7f0e'
+    - '#2ca02c'
+    - '#d62728'
+    - '#9467bd'
+    - '#8c564b'
+    - '#e377c2'
+    - '#7f7f7f'

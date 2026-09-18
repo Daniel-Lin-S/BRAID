@@ -20,6 +20,7 @@ import yaml
 from .artifacts import (
     ARTIFACT_PATHS, artifact_path, fit_identity, fit_seed, prepare_run,
     prepare_model_settings, validate_completion,
+    completed_fit,
 )
 from .cache import atomic_json, file_digest, writer_lock
 from .contracts import FeatureSet, Model, plugin
@@ -52,7 +53,7 @@ def make_backend(identity: dict, run: Path, previews: dict) -> Model:
 
 def ensure_fit(
     run: Path, identity: dict, features: FeatureSet, columns: np.ndarray,
-    arguments: argparse.Namespace, previews: dict, gpu: dict | None,
+    arguments: argparse.Namespace, gpu: dict | None,
 ) -> bool:
     """Reuse a validated fit or complete only its unfinished training work.
 
@@ -68,8 +69,6 @@ def ensure_fit(
         Ordered neural input/output columns.
     arguments : Namespace
         Invocation stage and logging preferences.
-    previews : dict
-        Fitted-excerpt capture settings.
     gpu : dict or None
         Diagnostic allocation record, excluded from fit identity.
 
@@ -79,18 +78,15 @@ def ensure_fit(
         True only when a fit was completed during this invocation.
     """
     completion = artifact_path(run, "fit_complete.json")
+    if completed_fit(run, identity):
+        LOGGER.info("Reusing completed fit %s", run.resolve())
+        return False
     if arguments.stage == "evaluate" and not completion.exists():
         raise ValueError(f"Evaluation requires a completed fit: {run}")
     prepare_model_settings(run.parents[2], identity)
     run.mkdir(parents=True, exist_ok=True)
     with writer_lock(run / "fit.lock"):
-        if completion.exists():
-            validate_completion(run)
-            recorded = json.loads(
-                artifact_path(run, "identity.json").read_text()
-            )
-            if recorded["identity"] != fit_identity(identity):
-                raise ValueError(f"Completed fit identity mismatch: {run}")
+        if completed_fit(run, identity):
             LOGGER.info("Reusing completed fit %s", run)
             return False
         if arguments.stage == "evaluate":
@@ -135,7 +131,7 @@ def ensure_fit(
             from .restart import prepare_components
 
             prepare_components(run / "components")
-            backend = make_backend(identity, run, previews)
+            backend = make_backend(identity, run, {"enabled": False})
             backend.fit(features, columns, identity["case"]["dimensions"], run)
             backend.save(artifact_path(run, "model.p"))
             atomic_json(status, dict(state="complete"))

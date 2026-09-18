@@ -1,6 +1,6 @@
 """Build signal-separated data previews from cached arrays and fitted stages.
 
-Each window contains neural/, behavior/, input/ PNGs and excerpts.npz.
+Each split contains descriptively named PNGs and excerpts.npz.
 Numerical excerpts retain native and aligned timestamps, channel/unit IDs,
 source indices, spike events, and optional pre/main normalized arrays.
 The renderer is shared by preprocessing, completed fits and offline review.
@@ -49,11 +49,12 @@ def preview_columns(
         if set(requested) - {ids[i] for i in allowed}:
             raise ValueError("Requested preview channel is absent from model.")
         return np.array([ids.index(name) for name in requested])
-    count = min(settings["channels"], len(allowed))
-    if count < 1:
-        raise ValueError("No neural channels available for previews.")
-    rng = np.random.default_rng(settings["seed"])
-    return np.sort(rng.choice(allowed, count, replace=False))
+    count = settings["channels"]
+    if count < 1 or len(allowed) < count:
+        raise ValueError(
+            f"Expected {count} preview channels, got {len(allowed)}."
+        )
+    return np.asarray(allowed[:count], dtype=int)
 
 
 def window_excerpts(
@@ -168,8 +169,10 @@ def fitted_stages(
 
 
 def signal_stages(excerpts: dict) -> list[tuple[str, str, list[PreviewStage]]]:
-    """Build one figure description per neural channel or coordinate pair."""
+    """Describe preprocessing-only or fitted-only figures from their arrays."""
     time = excerpts["t"]
+    fitted = "pre_Y" in excerpts
+    suffix = "fitted" if fitted else "preprocessing"
     figures = []
     for number, (channel, unit) in enumerate(
         zip(
@@ -177,99 +180,114 @@ def signal_stages(excerpts: dict) -> list[tuple[str, str, list[PreviewStage]]]:
             excerpts["unit_dimensions"],
         )
     ):
-        stages = [
-            PreviewStage(
-                "spikes",
-                "Original spike events",
-                "Events",
-                excerpts[f"spikes_{number}"],
-                None,
-                "spikes",
-            ),
-            PreviewStage(
-                "counts",
-                "50-ms binned counts",
-                "Spikes/bin",
-                time,
-                excerpts["counts"][:, number],
-                "counts",
-            ),
-            PreviewStage(
-                "smoothed",
-                "Smoothed counts (offline Gaussian)",
-                "Spikes/bin",
-                time,
-                excerpts["smoothed"][:, number],
-            ),
-        ] + fitted_stages(excerpts, "Y", number)
-        filename = f"neural/{channel.replace(' ', '_')}_unit_{unit}.png"
-        figures.append((filename, f"{channel}, unit {unit}", stages))
+        if fitted:
+            stages = fitted_stages(excerpts, "Y", number)
+        else:
+            stages = [
+                PreviewStage(
+                    "spikes",
+                    "Original spike events",
+                    "Events",
+                    excerpts[f"spikes_{number}"],
+                    None,
+                    "spikes",
+                ),
+                PreviewStage(
+                    "counts",
+                    "Binned counts",
+                    "Spikes/bin",
+                    time,
+                    excerpts["counts"][:, number],
+                    "counts",
+                ),
+                PreviewStage(
+                    "smoothed",
+                    "Smoothed counts (offline Gaussian)",
+                    "Spikes/bin",
+                    time,
+                    excerpts["smoothed"][:, number],
+                ),
+            ]
+        safe = str(channel).replace(" ", "_")
+        if Path(safe).name != safe or safe in (".", ".."):
+            raise ValueError(f"Unsafe preview channel filename: {channel!r}")
+        figures.append(
+            (
+                f"neural_{safe}_unit_{unit}_{suffix}.png",
+                f"{channel}, unit {unit}",
+                stages,
+            )
+        )
     for name, group in (("Z", "behavior"), ("U", "input")):
-        if excerpts[name].shape[1] not in ((2, 4) if name == "Z" else (2,)):
+        values = excerpts[f"pre_{name}" if fitted else name]
+        if values.shape[1] not in ((2, 4) if name == "Z" else (2,)):
             raise ValueError(f"Unsupported coordinate count for {name}.")
-        for dimension in range(0, excerpts[name].shape[1], 2):
+        for dimension in range(0, values.shape[1], 2):
             pair = slice(dimension, dimension + 2)
-            velocity = name == "Z" and dimension >= len(COORDINATES)
+            velocity = name == "Z" and dimension == 2
             quantity = (
                 "velocity"
                 if velocity
-                else ("position" if name == "Z" else "target")
+                else "position"
+                if name == "Z"
+                else "target"
             )
-            label = f"{quantity.capitalize()} x and y"
-            native_label = "Native position" if name == "Z" else "Native target"
-            kind = "held" if name == "U" else "line"
-            stages = [
-                PreviewStage(
-                    f"native_{name}",
-                    native_label,
-                    "mm",
-                    excerpts["native_t"],
-                    excerpts[f"native_{name}"][:, :2],
-                    kind,
-                )
-            ]
-            stages.append(
-                PreviewStage(
-                    "aligned_position" if velocity else f"aligned_{name}",
-                    "Aligned position"
-                    if name == "Z"
-                    else "Aligned target (held)",
-                    "mm",
-                    time,
-                    excerpts["position"][:, :2]
-                    if name == "Z"
-                    else excerpts[name][:, pair],
-                    kind,
-                )
-            )
-            if velocity:
-                stages.append(
+            if fitted:
+                stages = fitted_stages(excerpts, name, pair)
+            else:
+                stages = [
                     PreviewStage(
-                        "velocity",
-                        "Inferred backward-difference velocity",
-                        "mm/s",
+                        f"native_{name}",
+                        "Native position" if name == "Z" else "Native target",
+                        "mm",
+                        excerpts["native_t"],
+                        excerpts[f"native_{name}"][:, :2],
+                    ),
+                    PreviewStage(
+                        "aligned_position" if name == "Z" else "aligned_U",
+                        "Aligned position"
+                        if name == "Z"
+                        else "Aligned target (held)",
+                        "mm",
                         time,
-                        excerpts["Z"][:, pair],
+                        excerpts["position"][:, :2]
+                        if name == "Z"
+                        else excerpts["U"],
+                    ),
+                ]
+                if velocity:
+                    stages.append(
+                        PreviewStage(
+                            "velocity",
+                            "Inferred backward-difference velocity",
+                            "mm/s",
+                            time,
+                            excerpts["Z"][:, pair],
+                        )
                     )
-                )
-            stages += fitted_stages(excerpts, name, pair)
             stages = [
                 replace(
                     stage,
                     coordinates=tuple(
                         (
                             "Position"
-                            if velocity and i < 2
+                            if velocity and i < 2 and not fitted
                             else quantity.capitalize()
                         )
-                        + f" {c}"
-                        for c in COORDINATES
+                        + f" {coordinate}"
+                        for coordinate in COORDINATES
                     ),
                     kind="held" if name == "U" else stage.kind,
                 )
                 for i, stage in enumerate(stages)
             ]
-            figures.append((f"{group}/{quantity}_xy.png", label, stages))
+            figures.append(
+                (
+                    f"{group}_{quantity}_{suffix}.png",
+                    f"{quantity.capitalize()} x and y",
+                    stages,
+                )
+            )
     return figures
 
 
@@ -301,5 +319,20 @@ def render_window(
                 ],
             )
         )
-    np.savez_compressed(destination / "excerpts.npz", **excerpts)
+    payload = excerpts
+    if "pre_Y" in excerpts:
+        payload = {
+            key: value
+            for key, value in excerpts.items()
+            if key
+            in (
+                "t",
+                "channel_ids",
+                "unit_dimensions",
+                "source_indices",
+                "learned_Z",
+            )
+            or key.startswith(("pre_", "main_"))
+        }
+    np.savez_compressed(destination / "excerpts.npz", **payload)
     return records

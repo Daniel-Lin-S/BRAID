@@ -13,15 +13,13 @@ import argparse
 import copy
 import json
 import logging
-from importlib.metadata import version
-import platform
 import os
 from pathlib import Path
 import random
 
 import numpy as np
 
-from .artifacts import fit_directory, resolved_fit
+from .artifacts import fit_directory, prepare_model_settings, resolved_fit
 from .cache import file_digest, writer_lock
 from .contracts import Dataset, FeatureSet, plugin
 from .previews import preprocessing_previews
@@ -54,7 +52,10 @@ def population_order(inventory: dict[str, list[str]], seed: int) -> list[str]:
 
 
 def case_identity(
-    features: FeatureSet, fold: int, case: dict, snapshots: dict,
+    features: FeatureSet,
+    fold: int,
+    case: dict,
+    snapshots: dict,
     shared_order: list[str],
 ) -> tuple[dict, np.ndarray]:
     """Resolve effective fitting inputs before any artifact lookup."""
@@ -63,8 +64,11 @@ def case_identity(
     ids = features.arrays["ids"].tolist()
     columns = population_columns(ids, shared_order, case["population_scale"])
     identity = dict(
-        configurations=snapshots, case=case, fold=fold,
-        source=features.metadata, selected_ids=[ids[i] for i in columns],
+        configurations=snapshots,
+        case=case,
+        fold=fold,
+        source=features.metadata,
+        selected_ids=[ids[i] for i in columns],
         model_overrides=dict(epoch_artifacts=True),
     )
     identity["resolved_fit"] = resolved_fit(identity, features)
@@ -72,8 +76,13 @@ def case_identity(
 
 
 def plan_analysis(
-    dataset: Dataset, sessions: list[str], folds: list[int],
-    cases: list[dict], snapshots: dict, shared_order: list[str], root: Path,
+    dataset: Dataset,
+    sessions: list[str],
+    folds: list[int],
+    cases: list[dict],
+    snapshots: dict,
+    shared_order: list[str],
+    root: Path,
 ) -> Path:
     """Resolve all requested fit references and scoring IDs before training."""
     from .analysis import initialize_analysis, member_key
@@ -95,21 +104,36 @@ def plan_analysis(
                 )
                 run = fit_directory(root, identity)
                 members[member_key(case, name, fold)] = dict(
-                    case=case, session=name, fold=fold, fit_id=run.name,
+                    case=case,
+                    session=name,
+                    fold=fold,
+                    fit_id=run.name,
                     fit=str(run.relative_to(root.resolve())),
-                    common_ids=common, state="pending",
+                    common_ids=common,
+                    state="pending",
                 )
     return initialize_analysis(root, snapshots, members)
 
 
 def run_case(
-    dataset: Dataset, session: FeatureSet, fold: int, case: dict,
-    settings: dict, arguments: argparse.Namespace, shared_order: list[str],
-    snapshots: dict, gpu: dict | None, root: Path, analysis_root: Path,
+    dataset: Dataset,
+    session: FeatureSet,
+    fold: int,
+    case: dict,
+    settings: dict,
+    arguments: argparse.Namespace,
+    shared_order: list[str],
+    snapshots: dict,
+    gpu: dict | None,
+    root: Path,
+    analysis_root: Path,
+    rendering_errors: list[str] | None = None,
 ) -> bool:
     """Complete a shared fit and publish this analysis's scoring separately."""
     from .analysis import member_key, read_manifest
     from .fitting import canonical_horizons, ensure_fit, ensure_predictions
+    from .diagnostics import history_monitor, render_safely
+    from .presentation import presentation
 
     features = dataset.fold(session, fold, settings["velocity"])
     identity, columns = case_identity(
@@ -121,32 +145,71 @@ def run_case(
     if member["fit_id"] != run.name:
         raise ValueError(f"Analysis fit provenance changed: {run}")
     previews = copy.deepcopy(settings["previews"])
+    style = presentation(snapshots["plotting"].get("presentation"))
+    previews["presentation"] = style
+    previews["context_samples"] = identity["resolved_fit"]["args_base"][
+        "sequence_length"
+    ]
     if arguments.no_previews:
         previews["enabled"] = False
-    trained = ensure_fit(
-        run, identity, features, columns, arguments, previews, gpu
+    errors = [] if rendering_errors is None else rendering_errors
+    prepare_model_settings(run.parents[2], identity)
+    render_safely(
+        errors,
+        f"Preprocessing previews {run.resolve()}",
+        preprocessing_previews,
+        session,
+        features,
+        previews,
+        run,
+        columns,
     )
+    with history_monitor(
+        run,
+        style,
+        errors,
+        enabled=not arguments.no_plots and snapshots["plotting"]["enabled"],
+    ):
+        trained = ensure_fit(run, identity, features, columns, arguments, gpu)
+    from .previews import fitted_previews
+
+    if previews["enabled"]:
+        render_safely(
+            errors,
+            f"Fitted previews {run.resolve()}",
+            fitted_previews,
+            session,
+            features,
+            previews,
+            run,
+            snapshots["experiment"]["preview_model_plugin"],
+            columns,
+        )
     horizons = canonical_horizons(settings["horizons"])
-    predictions = ensure_predictions(
-        run, identity, features, columns, horizons
-    )
+    predictions = ensure_predictions(run, identity, features, columns, horizons)
     scored = score_member(
         analysis_root, key, run, predictions, identity, horizons, root
     )
-    render_case(
-        session, features, previews, run, columns, snapshots,
-        arguments, analysis_root, key,
-    )
+    if rendering_errors is None and errors:
+        raise RuntimeError("Rendering failed: " + "; ".join(errors))
     return trained or scored
 
 
 def score_member(
-    analysis_root: Path, key: str, run: Path, predictions: Path,
-    identity: dict, horizons: list[int], root: Path,
+    analysis_root: Path,
+    key: str,
+    run: Path,
+    predictions: Path,
+    identity: dict,
+    horizons: list[int],
+    root: Path,
 ) -> bool:
     """Publish missing analysis metrics from a completed forecast bundle."""
     from .analysis import (
-        prepare_metrics, read_manifest, update_member, validate_member,
+        prepare_metrics,
+        read_manifest,
+        update_member,
+        validate_member,
     )
     from .evaluation import evaluate_forecasts
     from .populations import scoring_indices
@@ -161,13 +224,18 @@ def score_member(
             with np.load(predictions, allow_pickle=False) as saved:
                 payload = dict(saved)
             truth = dict(
-                Y=payload["true_Y"], Z=payload["true_Z"],
-                t=payload["t"], indices=payload["source_indices"],
+                Y=payload["true_Y"],
+                Z=payload["true_Z"],
+                t=payload["t"],
+                indices=payload["source_indices"],
             )
             selected_ids = identity["selected_ids"]
             metadata = dict(
-                session=member["session"], fold=fold, fit_id=run.name,
-                configuration=case["name"], case_name=case["name"],
+                session=member["session"],
+                fold=fold,
+                fit_id=run.name,
+                configuration=case["name"],
+                case_name=case["name"],
                 hyper_parameters=case["dimensions"],
                 **case["summary_parameters"],
                 population_scale=case["population_scale"],
@@ -178,12 +246,18 @@ def score_member(
             destination = prepare_metrics(analysis_root, key)
             common = scoring_indices(selected_ids, member["common_ids"])
             evaluate_forecasts(
-                payload, truth, horizons, common, metadata, destination,
+                payload,
+                truth,
+                horizons,
+                common,
+                metadata,
+                destination,
                 dict(Y=payload["baseline_Y"], Z=payload["baseline_Z"]),
             )
             metrics = destination / "metrics.json"
             update_member(
-                analysis_root, key,
+                analysis_root,
+                key,
                 dict(
                     state="complete",
                     metrics=str(metrics.relative_to(analysis_root)),
@@ -194,36 +268,12 @@ def score_member(
             )
         except BaseException as error:
             update_member(
-                analysis_root, key,
+                analysis_root,
+                key,
                 dict(state="failed", error=f"{type(error).__name__}: {error}"),
             )
             raise
     return True
-
-
-def render_case(
-    session: FeatureSet, features: FeatureSet, previews: dict, run: Path,
-    columns: np.ndarray, snapshots: dict, arguments: argparse.Namespace,
-    analysis_root: Path, key: str,
-) -> None:
-    """Render analysis-owned figures without modifying shared fit payloads."""
-    if previews["enabled"]:
-        from .previews import fitted_previews
-
-        preprocessing_previews(
-            session, features, previews, analysis_root / "previews" / key
-        )
-        fitted_previews(
-            session, features, previews, run,
-            snapshots["experiment"]["preview_model_plugin"], columns,
-            analysis_root / "previews" / key,
-        )
-    if not arguments.no_plots:
-        from .history import summarize_histories
-
-        destination = analysis_root / "plots" / "training" / key
-        if not (destination / "stage_loss_summary.json").exists():
-            summarize_histories(run, destination, plots=True)
 
 
 def main() -> None:
@@ -251,24 +301,10 @@ def main() -> None:
     data = snapshots["data"]
     evaluation = snapshots["evaluation"]
     plotting = snapshots["plotting"]
-    from .implementation import implementation_signatures
+    from .implementation import implementation_signatures, scientific_versions
 
     snapshots.update(implementation_signatures())
-    snapshots["versions"] = dict(
-        python=platform.python_version(),
-        packages={
-            name: version(name)
-            for name in (
-                "tensorflow",
-                "tf-keras",
-                "numpy",
-                "scipy",
-                "h5py",
-                "scikit-learn",
-                "PyYAML",
-            )
-        },
-    )
+    snapshots["versions"] = scientific_versions()
     root = Path(snapshots["paths"]["artifact_root"]).resolve()
     root.mkdir(parents=True, exist_ok=True)
     if arguments.stage == "plot":
@@ -300,11 +336,7 @@ def main() -> None:
             runtime["cpu_threads"],
             runtime["cpu_interop_threads"],
         )
-    cases = (
-        []
-        if arguments.stage == "preprocess"
-        else plugin(experiment["suite_plugin"], settings=experiment["suite"])
-    )
+    cases = plugin(experiment["suite_plugin"], settings=experiment["suite"])
     settings = dict(
         evaluation,
         seed=experiment["seed"],
@@ -318,7 +350,11 @@ def main() -> None:
         or list(range(data["cv"]["folds"]))
     )
     analysis_root = None
-    if cases:
+    from .diagnostics import render_safely
+    from .presentation import presentation
+
+    rendering_errors = []
+    if arguments.stage != "preprocess":
         analysis_root = plan_analysis(
             dataset, selected, folds, cases, snapshots, shared, root
         )
@@ -342,12 +378,31 @@ def main() -> None:
                                 fold,
                                 data["infer_velocity"],
                             )
-                            preprocessing_previews(
-                                source,
-                                features,
-                                data["previews"],
-                                root / "analysis" / experiment["name"],
-                            )
+                            for case in cases:
+                                identity, columns = case_identity(
+                                    features, fold, case, snapshots, shared
+                                )
+                                run = fit_directory(root, identity)
+                                prepare_model_settings(run.parents[2], identity)
+                                previews = dict(
+                                    data["previews"],
+                                    presentation=presentation(
+                                        plotting.get("presentation")
+                                    ),
+                                    context_samples=identity["resolved_fit"][
+                                        "args_base"
+                                    ]["sequence_length"],
+                                )
+                                render_safely(
+                                    rendering_errors,
+                                    str(run.resolve()),
+                                    preprocessing_previews,
+                                    source,
+                                    features,
+                                    previews,
+                                    run,
+                                    columns,
+                                )
                             LOGGER.info(
                                 "Cached fold %s at %s", fold, features.path
                             )
@@ -357,23 +412,35 @@ def main() -> None:
                             try:
                                 changed.append(
                                     run_case(
-                                        dataset, source, fold, case, settings,
-                                        arguments, shared, snapshots, gpu,
-                                        root, analysis_root,
+                                        dataset,
+                                        source,
+                                        fold,
+                                        case,
+                                        settings,
+                                        arguments,
+                                        shared,
+                                        snapshots,
+                                        gpu,
+                                        root,
+                                        analysis_root,
+                                        rendering_errors,
                                     )
                                 )
                             except BaseException as error:
                                 from .analysis import (
-                                    member_key, read_manifest, update_member,
+                                    member_key,
+                                    read_manifest,
+                                    update_member,
                                 )
 
                                 key = member_key(case, session, fold)
-                                member = read_manifest(
-                                    analysis_root
-                                )["members"][key]
+                                member = read_manifest(analysis_root)[
+                                    "members"
+                                ][key]
                                 if member["state"] != "complete":
                                     update_member(
-                                        analysis_root, key,
+                                        analysis_root,
+                                        key,
                                         dict(
                                             state="failed",
                                             error=str(error),
@@ -382,13 +449,20 @@ def main() -> None:
                                 raise
                             finally:
                                 write_model_summary(analysis_root)
+                                render_safely(
+                                    rendering_errors,
+                                    "Analysis report",
+                                    plugin,
+                                    experiment["report_plugin"],
+                                    root=analysis_root,
+                                    settings=plotting,
+                                    sample_rate=data["sampling_rate_hz"],
+                                )
                         fold_state["skipped"] = not any(changed)
-    if arguments.stage != "preprocess":
-        plugin(
-            experiment["report_plugin"],
-            root=analysis_root,
-            settings=plotting,
-            sample_rate=data["sampling_rate_hz"],
+    if rendering_errors:
+        raise RuntimeError(
+            "Scientific results remain saved; rendering failed:\n"
+            + "\n".join(rendering_errors)
         )
 
 

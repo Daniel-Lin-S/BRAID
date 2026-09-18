@@ -1,4 +1,6 @@
+extends: style.yaml
 enabled: true
+metrics: [cc, r2, mse]
 curves:
 - name: neural_population
   parameter: population_scale

@@ -8,16 +8,21 @@ configured figure suite. Incomplete folds are reported, never filled in.
 import csv
 from pathlib import Path
 
-from .analysis import read_manifest
+from .analysis import read_manifest, record_plotting
 from .evaluation import aggregate, collect_results
-from .plots import forecast_example, plot_suite
+from .plots import plot_suite
 
 
 def braid_report(root: Path, settings: dict, sample_rate: float) -> None:
     """Produce the required BRAID tables and optional figures from artifacts."""
     from .model_summary import write_model_summary
 
+    record_plotting(root, settings)
     write_model_summary(root)
+    manifest = read_manifest(root)
+    members = list(manifest["members"].values())
+    if not any(member.get("state") == "complete" for member in members):
+        return
     destination = root / "summaries"
     summaries = aggregate(collect_results(root), destination)
     table = {}
@@ -44,19 +49,34 @@ def braid_report(root: Path, settings: dict, sample_rate: float) -> None:
             )
             writer.writeheader()
             writer.writerows(table.values())
-    plot_suite(summaries, root / "plots", settings)
-    if not settings["enabled"]:
-        return
-    manifest = read_manifest(root)
     horizons = manifest["specification"]["settings"]["evaluation"]["horizons"]
-    for member in manifest["members"].values():
-        if member.get("state") != "complete":
-            continue
-        if member["case"]["dimensions"]["nx"] == 64 and 4 in horizons:
-            (root / "plots").mkdir(exist_ok=True)
-            forecast_example(
-                root.parents[2] / member["predictions"],
-                root / "plots" / "behavior_example.png",
-                5, sample_rate, 4,
-            )
-            break
+    expected = []
+    for member in members:
+        case = member["case"]
+        scoring = ["full", "common"] if member["common_ids"] else ["full"]
+        for horizon in horizons:
+            for evaluation_set in scoring:
+                for target in ("neural", "behavior"):
+                    for metric in ("cc", "r2", "mse"):
+                        candidate = dict(
+                            configuration=case["name"],
+                            nx=case["dimensions"]["nx"],
+                            population_scale=case["population_scale"],
+                            horizon=horizon, evaluation_set=evaluation_set,
+                            target=target, metric=metric,
+                        )
+                        existing = next((
+                            row for row in expected if all(
+                                row[key] == value
+                                for key, value in candidate.items()
+                            )
+                        ), None)
+                        incomplete = member.get("state") != "complete"
+                        if existing is None:
+                            expected.append(dict(candidate, pending=incomplete))
+                        else:
+                            existing["pending"] |= incomplete
+    plot_suite(
+        summaries, root / "plots", settings, expected,
+        pending=any(m.get("state") != "complete" for m in members),
+    )

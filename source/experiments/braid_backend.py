@@ -20,7 +20,7 @@ from BRAID.sequence import window_shift
 from BRAID.tools.tensorboard import event_scope
 
 from .artifacts import artifact_path
-from .cache import atomic_json, file_digest, cached, load_entry
+from .cache import atomic_json, file_digest, cached
 from .contracts import FeatureSet
 from .nhp import TRAIN, VALIDATION
 from .previews import preview_windows
@@ -313,112 +313,78 @@ def build_cases(settings: dict) -> list[dict]:
 
 
 def checkpoint_preview_arrays(
-    source_run: Path, features: FeatureSet, windows: list[np.ndarray]
+    source_run: Path, features: FeatureSet, windows: list[np.ndarray],
 ) -> list[dict[str, np.ndarray]]:
-    """Read saved excerpts and apply existing BRAID normalization maps.
+    """Infer fitted stages from a completed checkpoint without any fitting.
 
     Parameters
     ----------
     source_run : Path
-        Trusted run with model.p, selection.npz and fitted excerpt NPZ files.
+        Completed fit containing checkpoint, arguments and selected channels.
     features : FeatureSet
-        Validated cached fold arrays in time-first orientation.
-    windows : list of ndarray, each shape (T,)
-        Exact fold indices selected for each saved preview window.
+        Cached fold arrays with shapes (T, C), (T, D), and split metadata.
+    windows : list of ndarray
+        Split-local indices, each shape (window_samples,).
 
     Returns
     -------
     list of dict of ndarray
-        Pre/main normalized Y, Z, U and saved learned Z for each window.
-        Y columns follow channel_ids; no model is reconstructed or fitted.
+        Learned Z and pre/main normalized Y/Z/U for each requested window.
     """
-    from BRAID.tools.file_tools import pickle_load
+    from .artifacts import validate_completion
 
-    model = pickle_load(str(artifact_path(source_run, "model.p")))["model"]
+    validate_completion(source_run)
+    model = BRAIDModel.loadFromFile(str(artifact_path(source_run, "model.p")))
+    arguments = json.loads(
+        artifact_path(source_run, "fit_arguments.json").read_text()
+    )
+    length = arguments["args_base"]["sequence_length"]
     with np.load(
-        artifact_path(source_run, "selection.npz"), allow_pickle=False
+        artifact_path(source_run, "selection.npz"), allow_pickle=False,
     ) as saved:
         columns = saved["selected_columns"]
         ids = saved["channel_ids"]
         units = saved["unit_dimensions"]
-    np.testing.assert_array_equal(features.arrays["ids"][columns], ids)
-    np.testing.assert_array_equal(features.arrays["units"][columns], units)
-    reference = artifact_path(source_run, "fitted_excerpts.json")
-    excerpts = []
-    if reference.exists():
-        info = json.loads(reference.read_text())
-        directory = Path(info["directory"])
-        if file_digest(directory / "manifest.json") != info["manifest_sha256"]:
-            raise ValueError(f"Fitted excerpt manifest changed: {directory}")
-        if (
-            file_digest(artifact_path(source_run, "model.p"))
-            != info["identity"]["checkpoint_sha256"]
-        ):
-            raise ValueError(
-                f"Fitted excerpts belong to another checkpoint: {source_run}"
-            )
-        entry = load_entry(directory, info["identity"])
-        for number in range(entry.metadata["windows"]):
-            prefix = f"window_{number}_"
-            excerpts.append(
-                {
-                    key[len(prefix) :]: value
-                    for key, value in entry.arrays.items()
-                    if key.startswith(prefix)
-                }
-            )
-    else:
-        raise ValueError(f"Missing fitted excerpt reference: {reference}")
+    arrays = features.arrays
+    np.testing.assert_array_equal(arrays["ids"][columns], ids)
+    np.testing.assert_array_equal(arrays["units"][columns], units)
     output = []
     for indices in windows:
-        time = features.arrays["t"][indices]
-        matches = [
-            entry
-            for entry in excerpts
-            if entry["t"].shape == time.shape
-            and np.allclose(entry["t"], time, rtol=0, atol=1e-8)
-        ]
-        if len(matches) != 1:
-            raise ValueError(
-                "Expected exactly one saved fitted excerpt "
-                f"for window starting at {time[0]}."
-            )
-        saved = matches[0]
-        np.testing.assert_array_equal(saved["channel_ids"], ids)
-        np.testing.assert_array_equal(
-            saved["source_indices"], features.arrays["indices"][indices]
+        segment = np.flatnonzero(
+            arrays["segment"] == arrays["segment"][indices[0]]
         )
+        start = min(indices[0], segment[-1] + 1 - length)
+        if (
+            start < segment[0] or indices[-1] >= start + length
+            or np.unique(arrays["segment"][indices]).size != 1
+        ):
+            raise ValueError("Preview must fit inside one model context.")
+        context = np.arange(start, start + length)
+        learned = model.sId_pre.predict(
+            arrays["Y"][context][:, columns], arrays["U"][context],
+        )[0][indices - start]
         raw = dict(
-            Y=features.arrays["Y"][indices][:, columns],
-            Z=features.arrays["Z"][indices],
-            U=features.arrays["U"][indices],
+            Y=arrays["Y"][indices][:, columns],
+            Z=arrays["Z"][indices], U=arrays["U"][indices],
         )
-        np.testing.assert_allclose(raw["Z"], saved["raw_Z"], rtol=0, atol=1e-8)
-        result = dict(channel_ids=ids, learned_Z=saved["learned_Z"])
+        result = dict(channel_ids=ids, learned_Z=learned)
         for component, fitted in (("pre", model.sId_pre), ("main", model.sId)):
             for name in ("Y", "Z", "U"):
                 values = (
-                    saved["learned_Z"]
-                    if component == "main" and name == "Z"
+                    learned if component == "main" and name == "Z"
                     else raw[name]
                 )
-                mapping = getattr(fitted, f"{name}PrepMap")
-                normalized = mapping.apply(values.T.copy()).T
+                normalized = getattr(fitted, f"{name}PrepMap").apply(
+                    values.T.copy()
+                ).T
                 if normalized.shape != values.shape:
                     raise ValueError(
-                        f"{component} {name} normalization changed dimensions: "
-                        f"expected {values.shape}, got {normalized.shape}."
+                        f"Expected {component} {name} shape {values.shape}, "
+                        f"got {normalized.shape}."
                     )
-                if not np.isfinite(normalized).all():
-                    raise ValueError(f"Nonfinite {component} {name} preview.")
                 result[f"{component}_{name}"] = normalized
-                if component == "pre":
-                    np.testing.assert_allclose(
-                        normalized, saved[name], rtol=1e-7, atol=1e-8
-                    )
-        if not np.isfinite(result["learned_Z"]).all():
-            raise ValueError(
-                "Saved learned behavior contains nonfinite values."
-            )
+        for name, values in result.items():
+            if name != "channel_ids" and not np.isfinite(values).all():
+                raise ValueError(f"Nonfinite fitted preview values: {name}.")
         output.append(result)
     return output

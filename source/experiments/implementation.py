@@ -6,12 +6,28 @@ versions still participate in fit identity.
 """
 
 import ast
+from importlib.metadata import version
 from pathlib import Path
+import platform
 
 from .cache import file_digest, fingerprint
 
 SOURCE = Path(__file__).resolve().parents[1]
 FIT_ADAPTER_METHODS = {"resolve_fit_configuration", "fit", "save"}
+
+
+def scientific_versions() -> dict:
+    """Read numerical dependency versions without initializing a model."""
+    return dict(
+        python=platform.python_version(),
+        packages={
+            name: version(name)
+            for name in (
+                "tensorflow", "tf-keras", "numpy", "scipy", "h5py",
+                "scikit-learn", "PyYAML",
+            )
+        },
+    )
 
 
 def implementation_signatures() -> dict[str, str]:
@@ -52,7 +68,7 @@ def implementation_signatures() -> dict[str, str]:
     analysis = {
         name: file_digest(SOURCE / "experiments" / name)
         for name in (
-            "evaluation.py", "populations.py", "reporting.py", "plots.py",
+            "evaluation.py", "populations.py",
         )
     }
     return dict(

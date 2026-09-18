@@ -1,105 +1,108 @@
-"""Plot cached preprocessing stages on shared real-data time windows.
+"""Select split-local excerpts and publish fit-owned data previews.
 
-PNG panels and numeric excerpts are published under analysis previews.
-Preview settings do not contribute to the numerical feature identity.
+Inputs are cached session/fold arrays and shared presentation settings.
+Outputs belong to data_preview/preprocessing or data_preview/fitted.
+Selection and rendering never contribute to numerical fitting identity.
 """
 
 from pathlib import Path
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 
 from .artifacts import artifact_path
-from .cache import file_digest, fingerprint
 from .contracts import FeatureSet, plugin
 
-
-def trace_plot(
-    path: Path,
-    time: np.ndarray,
-    panels: dict[str, np.ndarray],
-    title: str,
-    xlabel: str = "Time (s)",
-) -> None:
-    """Save stacked time-series panels with matching time axes."""
-    if not len(time) or not panels:
-        raise ValueError("Cannot plot empty preprocessing excerpts.")
-    figure, axes = plt.subplots(
-        len(panels),
-        1,
-        sharex=True,
-        figsize=(10, 2.2 * len(panels)),
-        squeeze=False,
-    )
-    for axis, (label, values) in zip(axes[:, 0], panels.items()):
-        axis.plot(time, values, linewidth=0.8)
-        axis.set_ylabel(label)
-    axes[-1, 0].set_xlabel(xlabel)
-    figure.suptitle(title)
-    figure.tight_layout()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(path, dpi=130)
-    plt.close(figure)
+SPLIT_NAMES = ("train", "validation", "test")
+TIME_TOLERANCE = 1e-8
 
 
 def preview_windows(features: FeatureSet, settings: dict) -> list[np.ndarray]:
-    """Select deterministic excerpts confined to valid segment interiors.
+    """Select one seeded contiguous window per split, in split-name order.
 
     Parameters
     ----------
     features : FeatureSet
-        Fold arrays including t and segment, each shape (T,).
+        Fold arrays t, segment and role, each shape (T,).
     settings : dict
-        Seed, window count, and duration in seconds.
+        Seed, seconds, windows=3, and optional context_samples/window_ranges.
 
     Returns
     -------
     list of ndarray
-        Per-window sample indices, each shape (duration * sample_rate,).
+        Three index arrays, each shape (seconds * sampling_rate,).
     """
     arrays = features.arrays
-    rng = np.random.default_rng(settings["seed"])
-    duration = settings["seconds"]
-    candidates = []
-    for segment in np.unique(arrays["segment"]):
-        indices = np.flatnonzero(arrays["segment"] == segment)
-        time = arrays["t"][indices]
-        safe = indices[(time > time[0]) & (time < time[-1] - duration)]
-        if len(safe):
-            candidates.append(safe)
-    if not candidates:
-        raise ValueError("No segment has a valid preview interior.")
-    windows = []
-    for number in range(settings["windows"]):
-        start = arrays["t"][rng.choice(candidates[number % len(candidates)])]
-        windows.append(
-            np.flatnonzero(
-                (arrays["t"] >= start) & (arrays["t"] < start + duration)
-            )
+    if settings["windows"] != len(SPLIT_NAMES):
+        raise ValueError(
+            "Expected three preview windows: train/validation/test."
         )
+    time = arrays["t"]
+    delta = np.diff(time)
+    interval = float(np.min(delta))
+    count = int(round(settings["seconds"] / interval))
+    if count < 1 or not np.isclose(count * interval, settings["seconds"]):
+        raise ValueError(
+            "Preview duration must contain whole sample intervals."
+        )
+    context = max(count, settings.get("context_samples", count))
+    requested = settings.get("window_ranges")
+    if requested is not None and len(requested) != len(SPLIT_NAMES):
+        raise ValueError("Expected one explicit window range per split.")
+    rng = np.random.default_rng(settings["seed"])
+    windows = []
+    for role, split in enumerate(SPLIT_NAMES):
+        candidates = []
+        for segment in np.unique(arrays["segment"]):
+            indices = np.flatnonzero(
+                (arrays["segment"] == segment) & (arrays["role"] == role)
+            )
+            if len(indices) < context:
+                continue
+            if not np.allclose(np.diff(time[indices]), interval):
+                raise ValueError(f"Non-contiguous time grid in {split}.")
+            candidates.extend(indices[: len(indices) - count + 1])
+        if not candidates:
+            raise ValueError(
+                f"No {settings['seconds']}-second {split} preview supports "
+                f"the required {context}-sample context."
+            )
+        if requested is None:
+            start = int(rng.choice(candidates))
+        else:
+            left, right = requested[role]
+            matches = [
+                i
+                for i in candidates
+                if np.isclose(time[i], left, rtol=0, atol=TIME_TOLERANCE)
+            ]
+            if len(matches) != 1 or not np.isclose(
+                right - left, settings["seconds"]
+            ):
+                raise ValueError(f"Invalid explicit {split} preview range.")
+            start = matches[0]
+        windows.append(np.arange(start, start + count))
     return windows
 
 
 def preprocessing_previews(
-    session: FeatureSet, fold: FeatureSet, settings: dict, fallback: Path
+    session: FeatureSet,
+    fold: FeatureSet,
+    settings: dict,
+    run: Path,
+    columns: np.ndarray,
 ) -> Path | None:
-    """Persist raw and transformed excerpts for deterministic valid windows."""
+    """Publish preprocessing panels for the owning fit's ordered population."""
     if not settings["enabled"]:
-        return
-    base = fallback / fingerprint(
-        dict(stage="preprocess", source=fold.metadata, previews=settings)
-    )
+        return None
     from .preview_publication import publish_previews
 
     return publish_previews(
         session,
         fold,
         settings,
-        base / "previews",
+        run / "data_preview" / "preprocessing",
         preview_windows(fold, settings),
+        columns,
     )
 
 
@@ -110,30 +113,8 @@ def fitted_previews(
     run: Path,
     model_plugin: str,
     columns: np.ndarray,
-    destination: Path,
 ) -> Path | None:
-    """Publish checkpoint-derived previews inside the analysis.
-
-    Parameters
-    ----------
-    session, fold : FeatureSet
-        Native and split-dependent cached arrays, time-first.
-    settings : dict
-        Enabled flag, window selection and presentation settings.
-    run : Path
-        Saved model and fitted excerpts; used as fallback without caching.
-    model_plugin : str
-        Adapter function extracting fitted arrays without refitting.
-    columns : ndarray, shape (C,)
-        Neural columns belonging to this fitted model's population.
-    destination : Path
-        Analysis-owned preview destination.
-
-    Returns
-    -------
-    Path or None
-        Absolute immutable revision directory, or None when disabled.
-    """
+    """Infer checkpoint-derived stages and publish fitted-only panels."""
     if not settings["enabled"]:
         return None
     from .preview_publication import publish_previews
@@ -145,15 +126,13 @@ def fitted_previews(
         features=fold,
         windows=windows,
     )
-    checkpoint = artifact_path(run, "model.p")
-    base = destination
     return publish_previews(
         session,
         fold,
         settings,
-        base / "fitted_previews" / file_digest(checkpoint),
+        run / "data_preview" / "fitted",
         windows,
         columns,
         fitted,
-        checkpoint,
+        artifact_path(run, "model.p"),
     )

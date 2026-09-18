@@ -39,7 +39,7 @@ bash scripts/train_nhp.sh --experiment assets/config/nhp/experiments/latent_dime
 bash scripts/train_nhp.sh --experiment assets/config/nhp/experiments/latent_dimension_sweep.local.yaml --stage plot
 ```
 
-`--session` and `--fold` restrict execution scope. `--log-level` changes verbosity; `--no-plots` and `--no-previews` independently disable experiment and preprocessing figures.
+`--session` and `--fold` restrict execution scope. `--log-level` changes verbosity; `--no-plots` disables training/comparison figures and `--no-previews` disables both types of data preview.
 
 Dry runs resolve configuration without creating logs, extracting data or starting training.
 
@@ -57,7 +57,7 @@ Text logs use this structure beneath the configured log root:
 
 Every invocation has a unique directory. `experiment.log` contains session/fold lifecycle notifications and absolute detail-log paths. `console.log` contains launch-level diagnostics. All Python logs, progress output and native library output within a session go only to its session log, including all folds and model settings. Detached launches print the worker PID and absolute log location.
 
-Fitting artifacts are shared across experiment definitions. Analysis and figures remain experiment-specific:
+Fitting artifacts and their diagnostic figures are shared across experiment definitions. Analyses collect evaluation results and cross-setting comparisons:
 
 ```text
 <artifact_root>/
@@ -68,6 +68,17 @@ Fitting artifacts are shared across experiment definitions. Analysis and figures
       provenance/     # Identity, seed, runtime, fit completion and references
       data/           # Ordered channels and fitting indices
       checkpoints/    # Native fitted model
+      data_preview/
+        preprocessing/
+          manifest.json
+          train/       # Also validation/ and test/
+            neural_<channel>_unit_<unit>_preprocessing.png
+            behavior_position_preprocessing.png
+            behavior_velocity_preprocessing.png
+            input_target_preprocessing.png
+            excerpts.npz
+        fitted/        # Same split layout, with *_fitted.png names
+          manifest.json
       components/
         behaviour_preprocess/
           01_neural_dynamics/
@@ -84,7 +95,6 @@ Fitting artifacts are shared across experiment definitions. Analysis and figures
     metrics/<case>/<session>/fold_<number>/metrics.json
     summaries/
     plots/
-    previews/
 ```
 
 The adapter declares its public `model_name` (`BRAID`) independently of its Python class name. The settings directory combines that name with the full SHA-256 of the complete fitting recipe, serialized as canonical JSON with sorted keys and nonfinite values rejected. Recipe resolution includes YAML inheritance, defaults, dimensions and fitting overrides.
@@ -97,7 +107,7 @@ The fit ID references the settings hash and additionally identifies effective nu
 
 For the same session/fold, `neural_population_sweep` at `nx=16` or `nx=64` and population scale `1.0` references the same fits as `latent_dimension_sweep` at the corresponding latent sizes. Computing `common` scores reads those fits' saved full-output predictions; it does not retrain or rerun inference.
 
-The analysis manifest records all requested fits and their common-channel IDs before training. Completed entries reference checksummed metric files and shared prediction bundles. Reports consume only that membership. Analysis IDs distinguish specifications and participating fits; session/fold invocation subsets produce their own analysis views while still sharing fits. The `plot` stage reads saved results without loading a dataset; use `--analysis-id` when multiple saved revisions match.
+The analysis manifest records all requested fits and their common-channel IDs before training. Completed entries reference checksummed metric files and shared prediction bundles. Reports consume only that membership. Analysis IDs distinguish scientific specifications, evaluation/aggregation implementations and participating fits. Rendering settings and preview choices do not enter the analysis ID; the manifest records rendering settings separately. Session/fold invocation subsets produce their own analysis views while sharing fits. The `plot` stage reads saved results without loading a dataset; use `--analysis-id` when multiple saved analyses match.
 
 Prediction bundles belong to their fit and have no independent model ID. Their readable horizon directory records checkpoint and test provenance, inference implementation signature and payload checksum. A different horizon request can add a bundle without fitting. Provenance or checksum conflicts raise an error; completed payloads are never silently replaced.
 
@@ -105,7 +115,9 @@ Component numbers follow fitting order within their group. Optional components a
 
 Completed fits and components are checksum-validated and restored without retraining. Fit completion is published immediately after saving the checkpoint, independently of prediction, scoring or rendering. An evaluation failure cannot invalidate a completed fit. The `evaluate` stage requires an existing completed fit and never trains. Only the documented artifact schema is read.
 
-Fit indices have one canonical copy in the fit. Fitted preview excerpts have one canonical payload under the checkpoint-specific fold cache (or fit data when caching is disabled), referenced with checksums from provenance. Figures belong to analysis directories. Completed components are validated and reused after interruption; recognized incomplete component outputs are removed before fresh fitting under an exclusive fit lock. Incomplete prediction bundles are quarantined before regeneration.
+Fit indices have one canonical copy in the fit. Data previews and their plotted excerpts belong to that fit. Training figures live beside each component under `plots/attempt_<n>/`; histories and TensorBoard logs are not copied into analysis. Completed components are validated and reused after interruption; recognized incomplete component outputs are removed before fresh fitting under an exclusive fit lock. Incomplete prediction bundles are quarantined before regeneration.
+
+Preprocessing previews are generated before fitting, component figures after component completion, and fitted previews after checkpoint completion. A separate renderer observes component completion without adding batch callbacks. Evaluation follows prediction, with summaries and available cross-setting plots refreshed incrementally. Rendering failures are reported without invalidating scientific completion; other cases continue, and the invocation exits unsuccessfully after reporting its rendering errors. Subsequent invocations reuse completed fits and may refresh only rendering outputs in place.
 
 The cache root contains reusable `session` and split-specific `fold` entries. Manifests and payload checksums validate reuse. Choose `--cache-mode reuse`, `rebuild` or `off` explicitly. Inspection figures and numeric excerpts remain separate from numerical feature identity. Normalization and learned behavior previews belong to their fitted checkpoint.
 
@@ -117,36 +129,73 @@ Five temporal folds use test block f, validation block f+1 modulo five and the o
 
 Batch size is selected separately for each session and fold as `min(32, complete training windows, complete validation windows)`. The model configuration sets the maximum of 32; the effective value is recorded in `training_deviations.json`. This uses batch 32 whenever sufficient windows are available and smaller batches for shorter recordings. Model dimensions do not change the cached neural features.
 
-Scoring preserves channelwise and aggregate CC, R² and MSE, with explicit undefined values. Fold means are computed within sessions before the cross-session mean and sample SEM. Saved artifacts drive plots and stage loss summaries; partial studies retain their actual fold/session counts. Successful startup does not establish convergence.
+Scoring preserves channelwise and aggregate CC, R² and MSE, with explicit undefined values. Fold means are computed within sessions before the cross-session mean and sample SEM. Saved artifacts drive plots; partial studies retain their actual fold/session counts. Successful startup does not establish convergence.
 
 
 Each horizon has a `full` neural score using every channel fitted by that population. Experiments with multiple population scales also have a `common` score: the largest channel-ID intersection across all configured population groups, mapped into each fit's output-column order. Membership includes unfinished groups and is independent of execution order. Training populations retain their seeded ordering. Empty intersections, duplicate IDs and missing mappings are errors. Single-population experiments, including the latent-dimension sweep, emit only `full`.
 
 Behaviour metrics are identical in `full` and `common` rows because behaviour dimensions do not change with neural scoring channels. `valid_<metric>_channels` counts channels with finite scores (or behaviour dimensions for behaviour metrics). Flat targets invalidate CC and R²; MSE normally remains defined. An aggregate metric is undefined if any included channel has an undefined score; no undefined channels are silently dropped.
 
+`baseline_mse` is a constant-predictor reference, not a BRAID forecast
+metric. For each neural channel or behaviour dimension, its baseline
+prediction is the mean of that dimension over the fit's training windows.
+Its held-out MSE is then calculated on the valid samples for the reported
+forecast horizon. The raw metrics row stores these per-dimension values as
+`Y_baseline_mse` and `Z_baseline_mse`; `model_summary.csv` reports their
+mean as `baseline_mse`. Since each horizon has a different valid forecast
+mask, baseline MSE can differ by horizon. Neural baseline MSE follows the
+same `full` or `common` channel selection as the corresponding neural row.
+
 ### Saved-data previews
 
 Use the public `preview` stage with the same `--experiment` YAML interface.
-In an ignored `*.local.yaml`, configure `previews.source_run` with the absolute
-path to a trusted saved run, `channel_ids`, and `window_ranges` in the data
-module. The source must retain its checkpoint, fitted excerpts and validated
-session/fold caches. This stage applies saved normalization maps without
-refitting or training.
+In an ignored `*.local.yaml`, configure `previews.source_run` in the data module
+with the absolute path to a trusted completed fit. The source must retain its
+checkpoint and validated session/fold caches. Missing learned-behavior excerpts
+are computed through checkpoint inference, never training. Optional explicit
+`channel_ids` and `window_ranges` select alternatives; ranges must be ordered
+training, validation, test and obey the configured duration and split bounds.
 
-Shared data configuration controls presentation for all experiments: three
-neural channels, 22-point titles, 18-point labels, and 16-point ticks and
-outside legends. Each window has separate `neural`, `behavior`, and `input`
-folders, one PNG per neural channel and paired x/y behavior or input panels,
-ordered processing panels, and numerical excerpts. Coordinates use blue solid
-x traces and orange dashed y traces with outside legends.
-Fitted previews include both model normalization stages and explicitly label
-learned behavior as a checkpoint-derived estimate. Revisions are published
-atomically under the analysis's `previews/` directory. Independent
-`preview` and preprocessing-only stages use their own source/presentation-
-addressed analysis directories. Each revision
-has an index and checksum
-manifest; source artifacts are preserved. Keep regeneration settings and
-outputs outside version control.
+Defaults select one seeded five-second window per split and the first three
+channels of the existing population ordering. Windows and channels agree
+between preprocessing/fitted previews and across model settings. Missing
+channels or unsupported windows are errors, not silent substitutions.
+Standalone `preprocess` prepares each configured fit's preprocessing figures
+without fitting or publishing a fit-completion record.
+
+Preprocessing panels show spike events/counts/smoothing, native/aligned
+position, derived velocity, and native/aligned targets. Fitted panels show
+only the preprocessing-model and main-model normalizations, with learned
+neural-related behavior between them for position/velocity. Stages stack
+vertically; x/y coordinates share panels and use blue-solid/orange-dashed
+traces. Every preview type has a checksum manifest describing its windows,
+channels, units, stages, sources and presentation; each split has its plotted
+arrays in `excerpts.npz`. Keep local regeneration settings outside Git.
+
+### Metric figures and presentation
+
+Both plotting modules inherit `plotting/style.yaml`; `plotting.presentation`
+controls all figure styling. PNG output uses 200 dpi, 32-point figure titles,
+28-point panel titles/axis labels, and 24-point ticks/legends. Single-panel
+figures are 12×7 inches; horizon comparisons 20×7; previews are 16 inches wide
+and four inches per stage. Legends sit outside the plotting area.
+
+Each component has `total_loss.png` and available non-step `mse.png`, `r2.png`,
+`cc.png`, with train/validation overlaid. Step-wise quantities produce
+`loss_by_horizon.png`, `mse_by_horizon.png`, `r2_by_horizon.png`, and
+`cc_by_horizon.png`: train left, validation right, shared axis limits and
+consistent horizon colors. All logged horizons appear, including steps 1–8
+in the main RNN. Curves use recorded epochs without smoothing.
+
+Analysis generates 18 comparison figures: CC/R²/MSE for neural and behavior
+targets versus horizon at nx=16, versus nx at horizon=4, and versus population
+percentage at horizon=4 with nx=16/64 curves. Latent-sweep figures use full
+scoring; population comparisons use common scoring. Dimensions use log₂
+spacing; horizon/population axes are linear. Points show accepted summary
+means and session-level SEM. Undefined/missing values leave gaps, unavailable
+SEM is omitted, and incomplete comparisons are marked partial. Filenames
+identify target, metric, comparison and scoring set, such as
+`neural_cc_vs_horizon_nx16_full.png`.
 
 
 ### Execution device

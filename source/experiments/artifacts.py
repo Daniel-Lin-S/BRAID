@@ -333,3 +333,27 @@ def validate_completion(run: Path) -> dict:
     ):
         raise ValueError(f"Invalid completed fit identity: {run}")
     return record
+
+
+def completed_fit(run: Path, identity: dict) -> bool:
+    """Identify a reusable fit without creating directories or lock files.
+
+    Parameters
+    ----------
+    run : Path
+        Exact configuration-resolved fit directory; no fallback lookup.
+    identity : dict
+        Currently resolved scientific configuration and fold provenance.
+
+    Returns
+    -------
+    bool
+        False if incomplete; True only after identity and checksum checks.
+    """
+    if not artifact_path(run, "fit_complete.json").exists():
+        return False
+    validate_completion(run)
+    recorded = json.loads(artifact_path(run, "identity.json").read_text())
+    if recorded["identity"] != fit_identity(identity):
+        raise ValueError(f"Completed fit identity mismatch: {run.resolve()}")
+    return True

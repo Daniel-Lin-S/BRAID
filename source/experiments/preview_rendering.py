@@ -1,7 +1,7 @@
 """Render ordered stages for a neural channel or a labeled coordinate pair.
 
-Inputs are labeled single-channel or paired-coordinate traces, their native timestamps, and
-presentation settings. Outputs are PNG figures with outside legends and
+Inputs are labeled single-channel or paired-coordinate traces, native
+timestamps, and presentation settings. PNG figures have outside legends and
 shared time limits. This module never reads data or fits a model.
 """
 
@@ -15,9 +15,9 @@ import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 import numpy as np
 
+from .presentation import save_figure
+
 SUPPORTED_KINDS = {"line", "held", "counts", "spikes"}
-LINE_COLOR = "#1764a0"
-COORDINATE_COLORS = (LINE_COLOR, "#d55e00")
 COORDINATE_STYLES = ("-", "--")
 MINIMUM_FONT = 16
 
@@ -107,7 +107,8 @@ def signal_figure(
     for number, (axis, stage) in enumerate(zip(axes[:, 0], stages)):
         if stage.kind == "spikes":
             axis.vlines(
-                stage.time, 0, 1, color=LINE_COLOR, linewidth=1.4, label=signal
+                stage.time, 0, 1, color=style["pair_colors"][0],
+                linewidth=1.4, label=signal
             )
             axis.set_ylim(-0.1, 1.1)
             axis.set_yticks([0, 1], labels=["", "Events"])
@@ -118,7 +119,7 @@ def signal_figure(
             )
             for column, label in enumerate(labels):
                 options = dict(
-                    color=COORDINATE_COLORS[column],
+                    color=style["pair_colors"][column],
                     linestyle=COORDINATE_STYLES[column],
                     linewidth=1.8,
                     label=label,
@@ -167,14 +168,4 @@ def save_signal(
 ) -> None:
     """Save and close one PNG, keeping the renderer free of dataset logic."""
     figure = signal_figure(stages, signal, title, bounds, style)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        figure.savefig(
-            path,
-            dpi=style["dpi"],
-            facecolor="white",
-            bbox_inches="tight",
-            pad_inches=0.2,
-        )
-    finally:
-        plt.close(figure)
+    save_figure(figure, path, style)

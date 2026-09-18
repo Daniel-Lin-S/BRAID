@@ -1,10 +1,12 @@
-"""Publish reusable per-signal previews as validated immutable revisions.
+"""Publish fit-owned previews at stable preprocessing/fitted destinations.
 
-Each revision contains index.md, manifest.json and named window folders.
-The manifest records source identities, stage labels, numerical/PNG checksums
-and rendering settings. Publication is atomic and guarded by a writer lock.
+Each destination holds manifest.json and train/validation/test folders with
+PNG figures and excerpts.npz. Manifests describe sources, selections, stages,
+style and checksums. Only rendering payloads are replaced under a writer lock;
+scientific artifacts and old-layout directories are never modified.
 """
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,9 +17,10 @@ import numpy as np
 
 from .cache import atomic_json, file_digest, fingerprint, writer_lock
 from .contracts import FeatureSet
+from .previews import SPLIT_NAMES
 from .signal_previews import preview_columns, render_window, window_excerpts
 
-PREVIEW_VERSION = 4
+PREVIEW_VERSION = 5
 
 
 def publish_previews(
@@ -31,80 +34,106 @@ def publish_previews(
     checkpoint: Path | None = None,
     source_checksums: dict[str, str] | None = None,
 ) -> Path:
-    """Publish one complete data-only or checkpoint-specific preview revision.
+    """Stage all figures before replacing owned files and publishing manifest.
 
     Parameters
     ----------
     session, fold : FeatureSet
-        Validated native-session and processed-fold arrays.
+        Cached native and split-local arrays.
     settings : dict
-        Selection and presentation configuration.
+        Preview selection and resolved presentation settings.
     root : Path
-        Parent directory for immutable revisions.
-    windows : list of ndarray, each shape (T,)
-        Fold indices for selected time windows.
+        Exact preprocessing or fitted destination.
+    windows : list of ndarray
+        Train, validation, test indices, each shape (N,).
     available : ndarray, optional
-        Model population columns; default is all channels.
+        Ordered fitted population, shape (C,); default is every channel.
     fitted : list of dict, optional
-        Per-window fitted arrays from the model adapter; default is absent.
+        Fitted stages per window; default is preprocessing-only.
     checkpoint : Path, optional
-        Source checkpoint for fitted stages; default is absent.
-
+        Fitted source checkpoint; default is absent.
     source_checksums : dict, optional
-        Source file hashes to verify before publication; default is absent.
+        Additional protected file digests; default is absent.
 
     Returns
     -------
     Path
-        Absolute directory of a completed, checksum-verified revision.
+        Absolute completed rendering destination.
     """
-    if not windows or (fitted is not None and len(fitted) != len(windows)):
-        raise ValueError(
-            "Expected nonempty windows and matching fitted arrays."
-        )
+    if len(windows) != len(SPLIT_NAMES) or (
+        fitted is not None and len(fitted) != len(windows)
+    ):
+        raise ValueError("Expected three split windows and matching stages.")
+    for role, indices in enumerate(windows):
+        if not len(indices) or not np.all(fold.arrays["role"][indices] == role):
+            raise ValueError(f"Invalid {SPLIT_NAMES[role]} preview indices.")
     columns = preview_columns(fold, settings, available)
+    protected = dict(source_checksums or {})
+    for features in (session, fold):
+        if features.path is not None:
+            for name in ("manifest.json", "arrays.npz"):
+                path = (features.path / name).resolve()
+                protected[str(path)] = file_digest(path)
+    if checkpoint is not None:
+        protected[str(checkpoint.resolve())] = file_digest(checkpoint)
     identity = dict(
         version=PREVIEW_VERSION,
         settings=settings,
         fold=fold.metadata,
-        source_checksums=source_checksums or {},
+        source_checksums=protected,
         channels=fold.arrays["ids"][columns].tolist(),
         indices=[fold.arrays["indices"][w].tolist() for w in windows],
         checkpoint_sha256=file_digest(checkpoint) if checkpoint else None,
+        fitted_arrays=[
+            {
+                key: dict(
+                    shape=list(value.shape),
+                    dtype=str(value.dtype),
+                    sha256=hashlib.sha256(value.tobytes()).hexdigest(),
+                )
+                for key, value in window.items()
+            }
+            for window in fitted or []
+        ],
         implementation={
             name: file_digest(Path(__file__).with_name(name))
             for name in (
                 "preview_publication.py",
                 "signal_previews.py",
                 "preview_rendering.py",
+                "presentation.py",
             )
         },
     )
-    destination = (
-        root.resolve()
-        / f"presentation_v{PREVIEW_VERSION}_{fingerprint(identity)[:16]}"
-    )
-    with writer_lock(destination.with_suffix(".lock")):
-        if destination.exists():
-            manifest = json.loads((destination / "manifest.json").read_text())
-            if not manifest["complete"] or manifest["identity"] != identity:
-                raise ValueError(
-                    f"Incomplete/incompatible previews: {destination}"
-                )
-            for name, digest in manifest["checksums"].items():
-                if file_digest(destination / name) != digest:
-                    raise ValueError(
-                        f"Corrupt preview artifact: {destination / name}"
-                    )
-            return destination
-        root.mkdir(parents=True, exist_ok=True)
-        staging = Path(tempfile.mkdtemp(prefix=".rendering-", dir=root))
+    destination = root.resolve()
+    with writer_lock(destination.parent / f".{destination.name}.lock"):
+        manifest_path = destination / "manifest.json"
+        previous = (
+            json.loads(manifest_path.read_text())
+            if manifest_path.exists()
+            else {}
+        )
+        if previous.get("identity") == identity and previous.get("complete"):
+            if all(
+                (destination / name).is_file()
+                and file_digest(destination / name) == digest
+                for name, digest in previous["checksums"].items()
+            ):
+                return destination
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        staging = Path(
+            tempfile.mkdtemp(
+                prefix=".rendering-",
+                dir=destination.parent,
+            )
+        )
         try:
             records = []
-            for number, indices in enumerate(windows):
+            for number, (split, indices) in enumerate(
+                zip(SPLIT_NAMES, windows)
+            ):
                 start = float(fold.arrays["t"][indices[0]])
                 stop = start + settings["seconds"]
-                name = f"window_{number + 1:02d}_{start:.3f}s-{stop:.3f}s"
                 excerpts = window_excerpts(
                     session,
                     fold,
@@ -114,7 +143,7 @@ def publish_previews(
                     None if fitted is None else fitted[number],
                 )
                 figures = render_window(
-                    staging / name,
+                    staging / split,
                     excerpts,
                     fold.metadata["session"],
                     (start, stop),
@@ -122,7 +151,7 @@ def publish_previews(
                 )
                 records.append(
                     dict(
-                        directory=name,
+                        directory=split,
                         start=start,
                         stop=stop,
                         source_indices=excerpts["source_indices"].tolist(),
@@ -131,44 +160,39 @@ def publish_previews(
                         figures=figures,
                     )
                 )
-            lines = [
-                f"# {fold.metadata['session']} data previews",
-                "",
-                "Neural channels are separate; x/y coordinates share panels.",
-                "",
-            ]
-            for record in records:
-                lines.extend([f"## {record['directory']}", ""])
-                for figure in record["figures"]:
-                    link = f"{record['directory']}/{figure['file']}"
-                    lines.append(f"- [{figure['signal']}]({link})")
-                lines.append("")
-            (staging / "index.md").write_text("\n".join(lines))
             checksums = {
-                str(p.relative_to(staging)): file_digest(p)
-                for p in sorted(staging.rglob("*"))
-                if p.is_file()
+                str(path.relative_to(staging)): file_digest(path)
+                for path in sorted(staging.rglob("*"))
+                if path.is_file()
             }
-            for name, digest in (source_checksums or {}).items():
+            for name, digest in protected.items():
                 if file_digest(Path(name)) != digest:
                     raise ValueError(f"Source changed during rendering: {name}")
-            atomic_json(
-                staging / "manifest.json",
-                dict(
-                    complete=True,
-                    identity=identity,
-                    windows=records,
-                    source_files_unchanged=True,
-                    session_cache=str(session.path) if session.path else None,
-                    fold_cache=str(fold.path) if fold.path else None,
-                    checkpoint=str(checkpoint.resolve())
-                    if checkpoint
-                    else None,
-                    checksums=checksums,
-                ),
+            manifest = dict(
+                complete=True,
+                identity=identity,
+                rendering_id=fingerprint(identity),
+                windows=records,
+                source_files_unchanged=True,
+                session_cache=str(session.path) if session.path else None,
+                fold_cache=str(fold.path) if fold.path else None,
+                checkpoint=str(checkpoint.resolve()) if checkpoint else None,
+                checksums=checksums,
             )
-            os.replace(staging, destination)
+            for name in checksums:
+                target = destination / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.is_symlink():
+                    raise ValueError(f"Refusing symlink output: {target}")
+                os.replace(staging / name, target)
+            for name in previous.get("checksums", {}).keys() - checksums.keys():
+                target = (destination / name).resolve()
+                if not target.is_relative_to(destination):
+                    raise ValueError(f"Invalid rendering output: {target}")
+                if target.suffix not in (".png", ".npz"):
+                    raise ValueError(f"Unexpected rendering payload: {target}")
+                target.unlink(missing_ok=True)
+            atomic_json(manifest_path, manifest)
         finally:
-            if staging.exists():
-                shutil.rmtree(staging)
+            shutil.rmtree(staging)
     return destination

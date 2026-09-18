@@ -215,6 +215,49 @@ def test_population_common_reuses_latent_fit_and_predictions(workflow, nx):
     assert all(file_digest(path) == digest for path, digest in before.items())
 
 
+def test_rendering_changes_reuse_analysis_and_fit(workflow):
+    """Presentation changes neither evaluation ownership nor model identity."""
+    config = sweep("latent_dimension_sweep")
+    cases, analysis = workflow.prepare(config)
+    workflow.run(config, cases[0], analysis)
+    counts = dict(workflow.calls)
+    scientific = hashes(workflow.root / "experiments")
+    changed = copy.deepcopy(config)
+    changed["plotting"]["presentation"]["title_font"] = 40
+    changed["plotting"]["metrics"] = ["mse"]
+    changed["data"]["previews"]["seed"] = 99
+    _, refreshed = workflow.prepare(changed)
+    assert refreshed == analysis
+    workflow.run(changed, cases[0], refreshed)
+    assert workflow.calls == counts
+    assert scientific == hashes(workflow.root / "experiments")
+    assert read_manifest(analysis)["rendering"]["plotting"] == changed["plotting"]
+
+
+def test_rendering_failure_preserves_fit_and_evaluation(workflow, monkeypatch):
+    """A failed preview cannot invalidate a successfully completed fit."""
+    from experiments import runner
+
+    config = sweep("latent_dimension_sweep")
+    cases, analysis = workflow.prepare(config)
+
+    def fail(*args, **kwargs):
+        raise ValueError("injected renderer failure")
+
+    monkeypatch.setattr(runner, "preprocessing_previews", fail)
+    with pytest.raises(RuntimeError, match="Rendering failed"):
+        workflow.run(config, cases[0], analysis)
+    assert workflow.calls["fit"] == 1
+    assert any(
+        member["state"] == "complete"
+        for member in read_manifest(analysis)["members"].values()
+    )
+    counts = dict(workflow.calls)
+    monkeypatch.setattr(runner, "preprocessing_previews", lambda *args: None)
+    assert not workflow.run(config, cases[0], analysis)
+    assert workflow.calls == counts
+
+
 def test_new_horizons_reuse_fit(workflow):
     config = sweep("latent_dimension_sweep")
     cases, directory = workflow.prepare(config)

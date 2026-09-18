@@ -1,113 +1,191 @@
-"""Reusable plots consuming completed numeric evaluation artifacts.
+"""Render analysis comparisons from accepted per-session summary statistics.
 
-Input summary rows identify x parameter, output target, metric, and curve.
-Output PNG curves and forecast panels never require refitting a model.
+Outputs are named target_metric_vs_parameter_selection.png figures. Missing
+observations remain gaps; SEM is never manufactured. This module does not
+load a checkpoint, fit a model, or produce individual-fold plots.
 """
 
-from pathlib import Path
 import logging
+from pathlib import Path
 
-import matplotlib
-
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+from .presentation import METRIC_LABELS, presentation, save_figure, style_axis
 
 LOGGER = logging.getLogger(__name__)
+PARAMETER_LABELS = {
+    "horizon": "Forecast horizon (steps)",
+    "nx": "Latent dimension (nx)",
+    "population_scale": "Neural population (%)",
+}
+
+
+def curve_specs(settings: dict) -> list[dict]:
+    """Expand configured comparison designs into separate metric figures."""
+    result = []
+    for curve in settings.get("curves", []):
+        for metric in settings.get("metrics", [curve["where"]["metric"]]):
+            if metric not in ("cc", "r2", "mse"):
+                raise ValueError(f"Unsupported comparison metric: {metric}")
+            where = dict(curve["where"], metric=metric)
+            parameter = curve["parameter"]
+            selection = (
+                f"nx{where['nx']}"
+                if parameter == "horizon"
+                else f"horizon{where['horizon']}"
+            )
+            axis = (
+                "population" if parameter == "population_scale" else parameter
+            )
+            name = (
+                f"{where['target']}_{metric}_vs_{axis}_{selection}_"
+                f"{where['evaluation_set']}"
+            )
+            result.append(dict(curve, where=where, name=name))
+    return result
+
+
+def matches(row: dict, where: dict) -> bool:
+    """Match scalar and multi-value selections without dropping missing rows."""
+    return all(
+        row[key] in value if isinstance(value, list) else row[key] == value
+        for key, value in where.items()
+    )
 
 
 def metric_curve(
     rows: list[dict],
-    parameter: str,
-    target: str,
-    destination: Path,
-    group: str | None = None,
-) -> None:
-    """Draw a metric-versus-parameter graph with available SEM error bars."""
-    if not rows:
-        raise ValueError(f"No data for plot {destination.resolve()}")
-    if not any(row["mean"] is not None for row in rows):
-        LOGGER.warning("All metrics undefined; skipped %s", destination)
-        return
-    fig, axis = plt.subplots(figsize=(6, 4))
-    groups = sorted({row[group] for row in rows}) if group else [None]
-    for label in groups:
-        selected = [r for r in rows if not group or r[group] == label]
-        selected = sorted(selected, key=lambda r: r[parameter])
-        selected = [r for r in selected if r["mean"] is not None]
-        if not selected:
-            continue
-        x = [r[parameter] for r in selected]
-        y = [r["mean"] for r in selected]
-        axis.plot(x, y, "o-", label=f"{group}={label}" if group else "BRAID")
-        with_sem = [r for r in selected if r["sem"] is not None]
-        if with_sem:
+    spec: dict,
+    style: dict,
+    partial: bool = False,
+) -> object:
+    """Build one metric figure from summary rows with mean/SEM and x values."""
+    if not rows or not any(
+        row["mean"] is not None and np.isfinite(row["mean"]) for row in rows
+    ):
+        raise ValueError(f"No finite results for {spec['name']}.")
+    parameter, group = spec["parameter"], spec.get("group")
+    metric, target = spec["where"]["metric"], spec["where"]["target"]
+    figure, axis = plt.subplots(figsize=style["single_size"])
+    groups = sorted({r[group] for r in rows}) if group else [None]
+    for number, value in enumerate(groups):
+        selected = sorted(
+            [r for r in rows if not group or r[group] == value],
+            key=lambda row: row[parameter],
+        )
+        x = np.array([row[parameter] for row in selected], dtype=float)
+        if parameter == "population_scale":
+            x *= 100
+        y = np.array(
+            [
+                np.nan if row["mean"] is None else row["mean"]
+                for row in selected
+            ],
+            dtype=float,
+        )
+        if not np.isfinite(y).all():
+            LOGGER.warning("Missing/undefined points in %s.", spec["name"])
+            y[~np.isfinite(y)] = np.nan
+        color_index = {16: 0, 64: 1}.get(value, number)
+        color = style["pair_colors"][color_index % len(style["pair_colors"])]
+        axis.plot(
+            x,
+            y,
+            "o-",
+            label=f"{group}={value}" if group else "BRAID",
+            color=color,
+        )
+        valid_sem = [
+            i
+            for i, row in enumerate(selected)
+            if np.isfinite(y[i])
+            and row["sem"] is not None
+            and np.isfinite(row["sem"])
+        ]
+        if valid_sem:
             axis.errorbar(
-                [r[parameter] for r in with_sem],
-                [r["mean"] for r in with_sem],
-                yerr=[r["sem"] for r in with_sem],
+                x[valid_sem],
+                y[valid_sem],
+                yerr=[selected[i]["sem"] for i in valid_sem],
                 fmt="none",
+                color=color,
+                capsize=4,
             )
-    axis.set(xlabel=parameter, ylabel=f"{target} Pearson CC")
-    axis.legend()
-    fig.tight_layout()
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(destination, dpi=150)
-    plt.close(fig)
+    ticks = sorted({row[parameter] for row in rows})
+    if parameter == "nx":
+        axis.set_xscale("log", base=2)
+    elif parameter == "population_scale":
+        ticks = [100 * value for value in ticks]
+    axis.set_xticks(ticks, labels=[f"{value:g}" for value in ticks])
+    axis.set(
+        xlabel=PARAMETER_LABELS[parameter],
+        ylabel=f"{target.capitalize()} {METRIC_LABELS[metric]}",
+    )
+    style_axis(axis, style)
+    fixed = (
+        f"nx={spec['where']['nx']}"
+        if parameter == "horizon"
+        else f"horizon={spec['where']['horizon']}"
+    )
+    title = (
+        f"{target.capitalize()} {METRIC_LABELS[metric]}\n"
+        f"{fixed}; {spec['where']['evaluation_set']} scoring"
+    )
+    figure.suptitle(
+        title + ("\n(partial)" if partial else ""),
+        fontsize=style["title_font"],
+        wrap=True,
+    )
+    axis.legend(
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1),
+        frameon=False,
+        fontsize=style["legend_font"],
+    )
+    figure.tight_layout()
+    return figure
 
 
-def plot_suite(summaries: list[dict], root: Path, settings: dict) -> None:
-    """Render configured metric curves using one shared plotting function."""
+def plot_suite(
+    summaries: list[dict],
+    root: Path,
+    settings: dict,
+    expected: list[dict] | None = None,
+    pending: bool = False,
+) -> None:
+    """Publish available comparisons, retaining gaps for unfinished settings."""
     if not settings["enabled"]:
         return
-    for spec in settings["curves"]:
-        chosen = [
-            row
-            for row in summaries
-            if all(
-                (
-                    row[k] in value
-                    if isinstance(value, list)
-                    else row[k] == value
-                )
-                for k, value in spec["where"].items()
+    style = presentation(settings.get("presentation"))
+    errors = []
+    for spec in curve_specs(settings):
+        chosen = [row for row in summaries if matches(row, spec["where"])]
+        missing = []
+        partial = False
+        for candidate in expected or []:
+            if not matches(candidate, spec["where"]):
+                continue
+            partial |= candidate.get("pending", False)
+            criteria = {k: v for k, v in candidate.items() if k != "pending"}
+            if not any(
+                all(row[key] == criteria[key] for key in criteria)
+                for row in chosen
+            ):
+                missing.append(dict(criteria, mean=None, sem=None))
+        if not chosen and (partial or pending and expected is None):
+            LOGGER.warning("Comparison pending: %s", spec["name"])
+            continue
+        try:
+            figure = metric_curve(
+                chosen + missing,
+                spec,
+                style,
+                partial=partial or bool(missing),
             )
-        ]
-        if chosen:
-            metric_curve(
-                chosen,
-                spec["parameter"],
-                spec["where"]["target"],
-                root / (spec["name"] + ".png"),
-                spec.get("group"),
-            )
-
-
-def forecast_example(
-    path: Path,
-    destination: Path,
-    seconds: float,
-    sample_rate: float,
-    horizon: int,
-) -> None:
-    """Plot all behavior dimensions on one shared uncluttered time interval."""
-    with np.load(path) as data:
-        index = list(data["horizons"]).index(horizon)
-        available = np.flatnonzero(data["valid"][index])
-        # The excerpt stays inside one independent 128-sample window.
-        count = min(int(seconds * sample_rate), len(available))
-        chosen = available[:count]
-        t, truth = data["t"][chosen], data["true_Z"][chosen]
-        prediction = data["Z"][index, chosen]
-    labels = ["Position x", "Position y", "Velocity x", "Velocity y"]
-    fig, axes = plt.subplots(truth.shape[1], 1, sharex=True, figsize=(10, 8))
-    for dim, axis in enumerate(np.atleast_1d(axes)):
-        axis.plot(t, truth[:, dim], label="Observed")
-        axis.plot(t, prediction[:, dim], label="BRAID forecast")
-        axis.set_ylabel(labels[dim])
-    np.atleast_1d(axes)[0].legend()
-    np.atleast_1d(axes)[-1].set_xlabel("Time (s)")
-    fig.tight_layout()
-    fig.savefig(destination, dpi=150)
-    plt.close(fig)
+            save_figure(figure, root / f"{spec['name']}.png", style)
+        except Exception as error:
+            LOGGER.exception("Comparison failed: %s", spec["name"])
+            errors.append(str(error))
+    if errors:
+        raise RuntimeError("Comparison rendering failed: " + "; ".join(errors))

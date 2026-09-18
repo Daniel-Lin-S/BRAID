@@ -25,8 +25,6 @@ def analysis_settings(snapshots: dict) -> dict:
     return dict(
         schema=ANALYSIS_SCHEMA, name=experiment["name"],
         suite=experiment["suite"], evaluation=snapshots["evaluation"],
-        plotting=snapshots["plotting"],
-        previews=snapshots["data"].get("previews"),
         data=scientific_source(snapshots["data"]),
         model=snapshots["model"], seed=experiment["seed"],
         model_plugin=experiment["model_plugin"],
@@ -61,10 +59,19 @@ def initialize_analysis(
         if path.exists():
             if json.loads(path.read_text())["specification"] != spec:
                 raise ValueError(f"Analysis specification mismatch: {path}")
+            manifest = json.loads(path.read_text())
         else:
+            manifest = dict(
+                specification=spec, members=copy.deepcopy(members),
+            )
+        rendering = dict(
+            plotting=snapshots["plotting"],
+            previews=snapshots["data"].get("previews"),
+        )
+        if manifest.get("rendering") != rendering:
+            manifest["rendering"] = rendering
             atomic_json(
-                path,
-                dict(specification=spec, members=copy.deepcopy(members)),
+                path, manifest,
             )
     return directory
 
@@ -88,6 +95,16 @@ def read_manifest(directory: Path) -> dict:
         ):
             raise ValueError(f"Analysis member provenance changed: {key}")
     return manifest
+
+
+def record_plotting(directory: Path, settings: dict) -> None:
+    """Record current plot settings without changing scientific membership."""
+    with writer_lock(directory / "manifest.lock"):
+        manifest = read_manifest(directory)
+        rendering = manifest.setdefault("rendering", {})
+        if rendering.get("plotting") != settings:
+            rendering["plotting"] = copy.deepcopy(settings)
+            atomic_json(directory / "manifest.json", manifest)
 
 
 def prepare_metrics(directory: Path, key: str) -> Path:
