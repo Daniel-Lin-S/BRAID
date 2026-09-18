@@ -20,6 +20,7 @@ import tensorflow as tf
 
 from .tools.abstract_classes import PredictorModel
 from .tools.model_base_classes import ModelWithFitWithRetry, Reconstructable
+from .tools.tensorboard import event_scope
 from .tools.tf_losses import (
     masked_CategoricalCrossentropy,
     masked_CC,
@@ -292,6 +293,7 @@ class RegressionModel(tf.keras.layers.Layer, ModelWithFitWithRetry, Reconstructa
         self.trainable = trainable
         self.compile() # "make sure to call compile() again on your model for your changes to be taken into account."
 
+    @event_scope()
     def fit(
         self,
         X_in,
@@ -479,6 +481,7 @@ class DRModel(PredictorModel):
         return Dy_args, Dz_args
 
 
+    @event_scope()
     def fit(self, Y, Z=None, U=None, 
             batch_size=32,       # Each batch consists of this many blocks with block_samples time steps
             epochs=250,          # Max number of epochs to go over the whole training data

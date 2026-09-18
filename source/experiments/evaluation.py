@@ -15,12 +15,7 @@ import numpy as np
 
 from BRAID.tools.evaluation import evalPrediction
 
-from .artifacts import (
-    artifact_path,
-    discover_runs,
-    model_directory,
-    validate_completion,
-)
+from .analysis import read_manifest, validate_member
 from .cache import atomic_json
 
 LOGGER = logging.getLogger(__name__)
@@ -29,7 +24,10 @@ METRICS = {"cc": "CC", "r2": "R2", "mse": "MSE"}
 
 def score_channels(truth: np.ndarray, predicted: np.ndarray) -> dict:
     """Reuse BRAID metrics while marking undefined channel scores explicitly."""
-    if truth.shape != predicted.shape or len(truth) < 2:
+    if (
+        truth.ndim != 2 or truth.shape != predicted.shape
+        or len(truth) < 2 or truth.shape[1] < 1
+    ):
         raise ValueError(
             f"Expected matching nonempty forecasts: "
             f"{truth.shape}, {predicted.shape}."
@@ -63,22 +61,26 @@ def evaluate_forecasts(
     predictions: dict,
     truth: dict,
     horizons: list[int],
-    common: np.ndarray,
+    common: np.ndarray | None,
     metadata: dict,
     directory: Path,
     baseline: dict,
 ) -> list[dict]:
-    """Score both full-output and fixed-smallest-population neural forecasts."""
+    """Score full outputs and optionally the experiment's common channels."""
+    groups = [("full", np.arange(truth["Y"].shape[1]))]
+    if common is not None:
+        if not len(common) or len(np.unique(common)) != len(common):
+            raise ValueError("Expected nonempty unique common-channel indices.")
+        if np.any(common < 0) or np.any(common >= truth["Y"].shape[1]):
+            raise ValueError("Common indices are outside the fitted outputs.")
+        groups.append(("common", common))
     rows = []
     for number, horizon in enumerate(horizons):
         valid = predictions["valid"][number]
         behavior = score_channels(
             truth["Z"][valid], predictions["Z"][number, valid]
         )
-        for name, selected in (
-            ("full", np.arange(truth["Y"].shape[1])),
-            ("smallest", common),
-        ):
+        for name, selected in groups:
             neural = score_channels(
                 truth["Y"][valid][:, selected],
                 predictions["Y"][number, valid][:, selected],
@@ -90,6 +92,9 @@ def evaluate_forecasts(
                 behavior=behavior,
                 neural=neural,
                 samples=int(valid.sum()),
+                scored_channel_ids=[
+                    metadata["selected_channel_ids"][i] for i in selected
+                ],
             )
             for target, columns in (
                 ("Y", selected),
@@ -99,70 +104,44 @@ def evaluate_forecasts(
                 mse = np.mean(
                     (observed - baseline[target][columns]) ** 2, axis=0
                 )
+                if not np.isfinite(mse).all():
+                    raise ValueError(f"Nonfinite {target} baseline error.")
                 row[f"{target}_baseline_mse"] = mse.tolist()
             rows.append(row)
-    atomic_json(artifact_path(directory, "metrics.json"), rows)
-    np.savez_compressed(
-        artifact_path(directory, "predictions.npz"),
-        **predictions,
-        true_Y=truth["Y"],
-        true_Z=truth["Z"],
-        t=truth["t"],
-        source_indices=truth["indices"],
-        horizons=horizons,
-    )
+    atomic_json(directory / "metrics.json", rows)
     return rows
 
 
 def collect_results(root: Path) -> list[dict]:
-    """Read only completed evaluation artifacts, excluding unfinished runs."""
+    """Read completed metrics only from this analysis's explicit membership."""
     rows = []
-    completed = set()
-    for run in discover_runs(root):
-        path = artifact_path(run, "metrics.json")
-        status = artifact_path(run, "status.json")
-        if (
-            status.exists()
-            and json.loads(status.read_text())["state"] == "complete"
+    for member in read_manifest(root)["members"].values():
+        if member.get("state") != "complete":
+            continue
+        path = validate_member(root, member)
+        result = json.loads(path.read_text())
+        if not result:
+            raise ValueError(f"Empty completed metrics: {path}")
+        if any(
+            row["fit_id"] != member["fit_id"]
+            or row["session"] != member["session"]
+            or row["fold"] != member["fold"]
+            or row["configuration"] != member["case"]["name"]
+            for row in result
         ):
-            validate_completion(run, json.loads(status.read_text()))
-            identity = json.loads(
-                artifact_path(run, "identity.json").read_text()
+            raise ValueError(
+                f"Metrics do not match analysis membership: {path}"
             )
-            label = model_directory(
-                root, identity["configurations"], identity["case"]
-            ).name
-            result = [
-                dict(row, configuration=label)
-                for row in json.loads(path.read_text())
-            ]
-            if not result:
-                raise ValueError(f"Empty completed metrics: {path.resolve()}")
-            key = tuple(
-                result[0][name]
-                for name in (
-                    "session",
-                    "fold",
-                    "configuration",
-                )
-            )
-            if key in completed:
-                raise ValueError(
-                    "Multiple completed configurations for the same "
-                    "session/fold/case; use a separate artifact root: "
-                    f"{path.parent.resolve()}"
-                )
-            completed.add(key)
-            rows.extend(result)
+        rows.extend(result)
     if not rows:
-        raise ValueError(
-            f"No completed evaluation results under {root.resolve()}"
-        )
+        raise ValueError(f"No completed evaluation results: {root.resolve()}")
     return rows
 
 
 def aggregate(rows: list[dict], destination: Path) -> list[dict]:
     """Average folds per session, then compute sample SEM across sessions."""
+    if not rows:
+        raise ValueError("Cannot aggregate empty evaluation rows.")
     groups = {}
     for row in rows:
         for target in ("behavior", "neural"):

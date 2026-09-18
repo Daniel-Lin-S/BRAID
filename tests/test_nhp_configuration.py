@@ -70,7 +70,6 @@ def test_sweeps_have_separate_grids_and_plotting(tmp_path):
     assert latent["evaluation"] == population["evaluation"]
     assert set(latent["evaluation"]) == {
         "horizons",
-        "neural_scoring_fraction",
     }
     assert latent["data"]["infer_velocity"]
     assert latent["model"]["training"]["training_batch_size"] == 32
@@ -96,6 +95,20 @@ def test_module_inheritance_does_not_mutate_defaults(tmp_path):
     cyclic.write_text("extends: cyclic.yaml\n")
     with pytest.raises(ValueError, match="cycle"):
         read_yaml(cyclic)
+
+
+def test_obsolete_scoring_fraction_is_rejected(tmp_path):
+    """Fail before training when a private configuration uses an old field."""
+    local = local_settings(tmp_path)
+    evaluation = tmp_path / "evaluation.yaml"
+    evaluation.write_text(
+        "horizons: [1, 2]\nneural_scoring_fraction: 0.25\n"
+    )
+    settings = yaml.safe_load(local.read_text())
+    settings["modules"] = {"evaluation": str(evaluation)}
+    local.write_text(yaml.safe_dump(settings))
+    with pytest.raises(ValueError, match="neural_scoring_fraction"):
+        resolve("latent_dimension_sweep.yaml", local)
 
 
 def test_private_configuration_is_ignored():

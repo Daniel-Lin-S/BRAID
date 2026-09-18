@@ -17,6 +17,7 @@ from BRAID.BRAIDModel import BRAIDModel
 from BRAID.MainModel import shift_ms_to_1s_series
 from BRAID.config import resolve_braid_fit_arguments
 from BRAID.sequence import window_shift
+from BRAID.tools.tensorboard import event_scope
 
 from .artifacts import artifact_path
 from .cache import atomic_json, file_digest, cached, load_entry
@@ -32,6 +33,8 @@ MISSING_MARKER = -1000000.0
 
 class BRAIDBackend:
     """Preserve BRAID training internals behind a reusable experiment API."""
+
+    model_name = "BRAID"
 
     def __init__(
         self,
@@ -79,6 +82,7 @@ class BRAIDBackend:
             base["batch_size"] = min(base["batch_size"], *counts)
         return arguments
 
+    @event_scope()
     def fit(
         self,
         features: FeatureSet,
@@ -364,9 +368,7 @@ def checkpoint_preview_arrays(
                 }
             )
     else:
-        for path in sorted(source_run.glob("fitted_preprocessing*.npz")):
-            with np.load(path, allow_pickle=False) as saved:
-                excerpts.append(dict(saved))
+        raise ValueError(f"Missing fitted excerpt reference: {reference}")
     output = []
     for indices in windows:
         time = features.arrays["t"][indices]

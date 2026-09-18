@@ -1,7 +1,6 @@
 "Some base classes that RNNModel and RegressionModel inherit from"
 
-import os, io, time, copy, warnings, logging
-from datetime import datetime
+import io, time, copy, warnings, logging
 
 import tensorflow as tf
 
@@ -10,6 +9,8 @@ import matplotlib.pyplot as plt
 
 from .plot import plotTimeSeriesPrediction, plotPredictionScatter
 from .tf_tools import getModelFitHistoyStr, set_global_tf_eagerly_flag, convertHistoryToDict
+
+from .tensorboard import ComponentTensorBoard, event_scope
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +165,7 @@ class ModelWithFitWithRetry:
     """A class that adds a fit_with_retry method to classes inheriting from it. 
     Used by RNNModel and RegressionModel.
     """
+    @event_scope()
     def fit_with_retry(self, init_attempts=1, 
         early_stopping_patience=3, early_stopping_measure='loss', start_from_epoch=0, early_stopping_restore_best_weights=False, 
         tb_make_prediction_plots=False, tb_make_prediction_scatters=False, tb_plot_epoch_mod=20,
@@ -248,7 +250,7 @@ class ModelWithFitWithRetry:
         from ..MainModel import shift_ms_to_1s_series
 
         attempt = 0
-        modelsWeightsAll, historyAll, log_subdirs = [], [], []
+        modelsWeightsAll, historyAll = [], []
         while attempt < init_attempts:
             attempt += 1
             if init_attempts > 1:
@@ -271,16 +273,9 @@ class ModelWithFitWithRetry:
                     on_epoch_end=keep_latest_nonnan_weights_callback))
             # callbacks_this.append(CustomLearningRateScheduler())
             if self.log_dir != '':
-                log_subdir = datetime.now().strftime("%Y%m%d-%H%M%S")
-                log_subdirs.append(log_subdir)
-                log_dir = os.path.join(self.log_dir,log_subdir)
-                logger.info('Tensorboard log_dir: {}'.format(log_dir))
-                callbacks_this.append(
-                    tf.keras.callbacks.TensorBoard(
-                        log_dir=log_dir, 
-                        histogram_freq = 1,
-                        profile_batch = '10,20'
-                    ))
+                log_dir = self.log_dir
+                tensorboard = ComponentTensorBoard(log_dir)
+                callbacks_this.append(tensorboard)
                 # # Save regularization loss
                 # file_writer_metrics = tf.summary.create_file_writer(log_dir + '/metrics')
                 # def tensorboard_save_reg_loss(epoch, logs):
@@ -297,7 +292,8 @@ class ModelWithFitWithRetry:
                 # ))
                 # Save some data plots if requested
                 if tb_make_prediction_plots or tb_make_prediction_scatters:
-                    file_writer_plot = tf.summary.create_file_writer(log_dir + '/plots')
+                    file_writer_train = tensorboard.train_writer
+                    file_writer_validation = tensorboard.validation_writer
                     if isinstance(self, RegressionModel): # For RegressionModel
                         y_in = y
                         yAll = y_in
@@ -341,8 +337,8 @@ class ModelWithFitWithRetry:
                                 'figsize': (11,6), 'predPerfsToAdd': ['R2', 'CC', 'MSE'], 'return_fig': True}
                             fig1 = plotTimeSeriesPrediction(yAll, yHat, titleHead=titleHead, fig=fig1, **plotArgs)
                             plot_image = plot_to_image(fig1)
-                            with file_writer_plot.as_default():
-                                tf.summary.image("Training prediction", plot_image, step=epoch)
+                            with file_writer_train.as_default():
+                                tf.summary.image("Training prediction", plot_image, step=tensorboard.step)
                         if tb_make_prediction_scatters:
                             if fig2 is not None:
                                 fig2.clf()
@@ -359,8 +355,8 @@ class ModelWithFitWithRetry:
                                 [np.array([yHatStep[..., di] for yHatStep in yHat]) for di in nyIndsToPlot],
                                 titleHead=[titleHead]+['']*len(nyIndsToPlot), fig=fig2, **scatterArgs)
                             plot_image = plot_to_image(fig2)
-                            with file_writer_plot.as_default():
-                                tf.summary.image("Training prediction (scatter)", plot_image, step=epoch)
+                            with file_writer_train.as_default():
+                                tf.summary.image("Training prediction (scatter)", plot_image, step=tensorboard.step)
                         # The same for validation data
                         if validation_data is not None:
                             if isinstance(self, RegressionModel): # For RegressionModel
@@ -377,8 +373,8 @@ class ModelWithFitWithRetry:
                                     fig3.clf()
                                 fig3 = plotTimeSeriesPrediction(yAll_val, yHat_val, titleHead=titleHead, fig=fig3, **plotArgs)
                                 plot_image = plot_to_image(fig3)
-                                with file_writer_plot.as_default():
-                                    tf.summary.image("Validation prediction", plot_image, step=epoch)
+                                with file_writer_validation.as_default():
+                                    tf.summary.image("Validation prediction", plot_image, step=tensorboard.step)
                             if tb_make_prediction_scatters:
                                 if fig4 is not None:
                                     fig4.clf()
@@ -387,8 +383,8 @@ class ModelWithFitWithRetry:
                                     [np.array([yHatStep[..., di] for yHatStep in yHat_val]) for di in nyIndsToPlot],
                                     titleHead=[titleHead]+['']*len(nyIndsToPlot), fig=fig4, **scatterArgs)
                                 plot_image = plot_to_image(fig4)
-                                with file_writer_plot.as_default():
-                                    tf.summary.image("Validation prediction (scatter)", plot_image, step=epoch)
+                                with file_writer_validation.as_default():
+                                    tf.summary.image("Validation prediction (scatter)", plot_image, step=tensorboard.step)
                     callbacks_this.append(tf.keras.callbacks.LambdaCallback(
                         on_epoch_end=tensorboard_plot_signals
                     ))
@@ -472,8 +468,6 @@ class ModelWithFitWithRetry:
                     history = historyAll[bestInd]
                     history.params['history_all'] = [convertHistoryToDict(h) for h in historyAll]
                     history.params['selected_ind'] = bestInd
-                    if self.log_dir != '':
-                        self.log_subdir = log_subdirs[bestInd]
             if self.log_dir != '' and (tb_make_prediction_plots or tb_make_prediction_scatters):
                 plt.close('all')
                 del fig1, fig2, fig3, fig4

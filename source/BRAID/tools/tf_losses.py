@@ -3,6 +3,15 @@
 
 import tensorflow as tf
 
+MSE_NAME = "MSE"
+CC_NAME = "CC"
+R2_NAME = "R2"
+NEGATIVE_CC_NAME = "negCC"
+NEGATIVE_R2_NAME = "negR2"
+POISSON_LOG_LIKELIHOOD_NAME = "PoissonLL"
+CATEGORICAL_CROSS_ENTROPY_NAME = "CCE"
+SPARSE_CATEGORICAL_CROSS_ENTROPY_NAME = "SCCE"
+
 
 def masked_mse(mask_value=None):
     """Returns a tf MSE loss computation function, but with support for setting one value as a mask indicator
@@ -30,7 +39,7 @@ def masked_mse(mask_value=None):
         lossFunc = tf.keras.losses.MeanSquaredError()
         return lossFunc(y_true_masked, y_pred_masked)
 
-    f.__name__ = str("MSE_maskV_{}".format(mask_value))
+    f.__name__ = MSE_NAME
     return f
 
 
@@ -147,7 +156,7 @@ def masked_CC(mask_value=None):
         )  # Average across dimensions
         return meanCC
 
-    f.__name__ = str("CC_maskV_{}".format(mask_value))
+    f.__name__ = CC_NAME
     return f
 
 
@@ -163,7 +172,7 @@ def masked_R2(mask_value=None):
         meanR2 = tf.math.reduce_mean(allR2)  # Average across dimensions
         return meanR2
 
-    f.__name__ = str("R2_maskV_{}".format(mask_value))
+    f.__name__ = R2_NAME
     return f
 
 
@@ -180,7 +189,7 @@ def masked_negativeCC(mask_value=None):
         )  # Average across dimensions
         return -meanCC
 
-    f.__name__ = str("negCC_maskV_{}".format(mask_value))
+    f.__name__ = NEGATIVE_CC_NAME
     return f
 
 
@@ -197,7 +206,7 @@ def masked_negativeR2(mask_value=None):
         )  # Average across dimensions
         return -meanR2
 
-    f.__name__ = str("negR2_maskV_{}".format(mask_value))
+    f.__name__ = NEGATIVE_R2_NAME
     return f
 
 
@@ -228,7 +237,7 @@ def masked_PoissonLL_loss(mask_value=None):
         lossFunc = tf.keras.losses.Poisson()
         return lossFunc(y_true_masked, y_pred_masked)
 
-    f.__name__ = str("PoissonLL_maskV_{}".format(mask_value))
+    f.__name__ = POISSON_LOG_LIKELIHOOD_NAME
     return f
 
 
@@ -261,7 +270,7 @@ def masked_CategoricalCrossentropy(mask_value=None):
         )  # Later will need softmax for pred_model
         return lossFunc(y_true_masked, y_pred_masked)
 
-    f.__name__ = str("CCE_maskV_{}".format(mask_value))
+    f.__name__ = CATEGORICAL_CROSS_ENTROPY_NAME
     return f
 
 
@@ -293,5 +302,5 @@ def masked_SparseCategoricalCrossentropy(mask_value=None):
         )  # Later will need softmax for pred_model
         return lossFunc(y_true_masked, y_pred_masked)
 
-    f.__name__ = str("SCCE_maskV_{}".format(mask_value))
+    f.__name__ = SPARSE_CATEGORICAL_CROSS_ENTROPY_NAME
     return f

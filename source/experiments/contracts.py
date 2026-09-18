@@ -37,6 +37,7 @@ class Model(Protocol):
     """Contract for fitting and evaluating an experiment backend."""
 
     length: int
+    model_name: str
 
     @staticmethod
     def resolve_fit_configuration(

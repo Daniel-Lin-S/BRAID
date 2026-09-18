@@ -57,32 +57,55 @@ Text logs use this structure beneath the configured log root:
 
 Every invocation has a unique directory. `experiment.log` contains session/fold lifecycle notifications and absolute detail-log paths. `console.log` contains launch-level diagnostics. All Python logs, progress output and native library output within a session go only to its session log, including all folds and model settings. Detached launches print the worker PID and absolute log location.
 
-Model artifacts use `<artifact_root>/<experiment>/<model-settings>/<session>/fold_<number>/<run-identity>/`. Model-settings names combine the readable case name with a scientific-settings fingerprint. The run hash and completion lookup use the same scientific identity. Model adapters resolve defaults and case overrides for both hashing and fitting; run identities include the effective batch size after window-count capping. Omitted defaults and their explicit equivalents have the same identity. The model-settings directory groups the resolved model configuration before session-specific capping. Launch timestamps, output paths, CPU/GPU choices, logging, previews, configuration filenames and session/fold invocation filters do not enter that identity. Actual source contents, channel identities, fold definition, training and evaluation settings remain significant; dependency versions and preprocessing implementation identity guard compatibility. Each model-settings directory contains `model_manifest.json` and `model_summary.csv`, with session/fold scores, validity indicators and explicit missing/failed states.
-
-Each run groups files by purpose:
+Fitting artifacts are shared across experiment definitions. Analysis and figures remain experiment-specific:
 
 ```text
-configuration/  # Resolved YAML/settings and fit arguments
-provenance/     # Identity, runtime, seed, deviations, status and references
-data/           # Channel selections and fitting indices
-checkpoints/    # Native fitted model
-evaluation/     # Predictions and channelwise/aggregate metrics
-diagnostics/   # Stage loss summaries
-components/
-  behaviour_preprocess/
-    01_neural_dynamics/
-    02_behaviour_decoder/
-  main/
-    01_behaviour_relevant_neural_dynamics/
-    02_neural_decoder/
-    03_residual_neural_dynamics/
+<artifact_root>/
+  experiments/BRAID_<64-character-settings-hash>/
+    model_settings.json
+    <session>/fold_<number>/<fit-id>/
+      configuration/  # Resolved settings and fitting arguments
+      provenance/     # Identity, seed, runtime, fit completion and references
+      data/           # Ordered channels and fitting indices
+      checkpoints/    # Native fitted model
+      components/
+        behaviour_preprocess/
+          01_neural_dynamics/
+          02_behaviour_decoder/
+        main/
+          01_behaviour_relevant_neural_dynamics/
+          02_neural_decoder/
+          03_residual_neural_dynamics/
+      predictions/test/horizons_<steps>/
+        predictions.npz
+        completion.json
+  analysis/<experiment-name>/<analysis-id>/
+    manifest.json
+    metrics/<case>/<session>/fold_<number>/metrics.json
+    summaries/
+    plots/
+    previews/
 ```
 
-Component numbers follow fitting order within their group. Optional components appear only when enabled, including separate forward decoders, `residual_behaviour_decoder`, and the input-only `non_neural_behaviour_dynamics`. Each component records its role, inputs, target and original internal identifier in `component.json`. TensorBoard timestamps remain beneath component directories. The main residual behaviour decoder is disabled for NHP.
+The adapter declares its public `model_name` (`BRAID`) independently of its Python class name. The settings directory combines that name with the full SHA-256 of the complete fitting recipe, serialized as canonical JSON with sorted keys and nonfinite values rejected. Recipe resolution includes YAML inheritance, defaults, dimensions and fitting overrides.
 
-Completed compatible runs and component fits are checksum-validated and restored without retraining. CPU/GPU selection, logging, presentation and session-selection changes do not invalidate numerical results. Historical layouts are read without rewriting completed files. Epoch histories and checkpoints are published during fitting; component completion records preserve selected weights across interruptions.
+The recipe includes all architecture and numerical training settings (optimizer, stopping rules, configured batch limit, training horizons and loss weights), numerical preprocessing and split policy, this case's population scale and selection policy, configured base seed, adapter identifier, and fitting implementation/dependency versions. It excludes other cases in the sweep, session identity, fold index, source-file contents, resource allocation, paths, logging, previews, plotting and evaluation settings. A session-specific batch cap does not change the settings directory; different configured batch limits are distinct recipes even when their effective sizes coincide.
 
-Fit indices have one canonical copy in the run. Fitted preview excerpts have one canonical payload under the checkpoint-specific fold cache (or run data when caching is disabled), referenced with checksums from provenance. Complementary histories, TensorBoard events, figures and recovery/final checkpoints remain available.
+`model_settings.json` contains `settings_hash` and its complete canonical `settings` payload. Publication is atomic and locked; existing metadata is validated against the directory name and never overwritten. Missing or conflicting metadata for an occupied settings directory is an error.
+
+The fit ID references the settings hash and additionally identifies effective numerical training settings, ordered channel IDs, source content, preprocessing, fold and derived random seed. Model adapters resolve data-dependent batch size before computing these fit-specific inputs. Seeds derive from effective fitting inputs, independently of directory names and sweep labels. Experiment membership, scoring sets and inference horizons do not enter either fitting hash. Only this naming scheme is supported; artifact lookup does not use aliases, fallback searches or migration.
+
+For the same session/fold, `neural_population_sweep` at `nx=16` or `nx=64` and population scale `1.0` references the same fits as `latent_dimension_sweep` at the corresponding latent sizes. Computing `common` scores reads those fits' saved full-output predictions; it does not retrain or rerun inference.
+
+The analysis manifest records all requested fits and their common-channel IDs before training. Completed entries reference checksummed metric files and shared prediction bundles. Reports consume only that membership. Analysis IDs distinguish specifications and participating fits; session/fold invocation subsets produce their own analysis views while still sharing fits. The `plot` stage reads saved results without loading a dataset; use `--analysis-id` when multiple saved revisions match.
+
+Prediction bundles belong to their fit and have no independent model ID. Their readable horizon directory records checkpoint and test provenance, inference implementation signature and payload checksum. A different horizon request can add a bundle without fitting. Provenance or checksum conflicts raise an error; completed payloads are never silently replaced.
+
+Component numbers follow fitting order within their group. Optional components appear only when enabled, including separate forward decoders, `residual_behaviour_decoder`, and the input-only `non_neural_behaviour_dynamics`. Each component records its role, inputs, target and original internal identifier in `component.json`. Each component has TensorBoard event files in `train/` and `validation/`; matching `epoch_<metric>` tags make shared metrics overlay in one TensorBoard panel. Persisted metric names omit masking-sentinel suffixes. Internal fitting attempts use cumulative epoch indices. The main residual behaviour decoder is disabled for NHP.
+
+Completed fits and components are checksum-validated and restored without retraining. Fit completion is published immediately after saving the checkpoint, independently of prediction, scoring or rendering. An evaluation failure cannot invalidate a completed fit. The `evaluate` stage requires an existing completed fit and never trains. Only the documented artifact schema is read.
+
+Fit indices have one canonical copy in the fit. Fitted preview excerpts have one canonical payload under the checkpoint-specific fold cache (or fit data when caching is disabled), referenced with checksums from provenance. Figures belong to analysis directories. Completed components are validated and reused after interruption; recognized incomplete component outputs are removed before fresh fitting under an exclusive fit lock. Incomplete prediction bundles are quarantined before regeneration.
 
 The cache root contains reusable `session` and split-specific `fold` entries. Manifests and payload checksums validate reuse. Choose `--cache-mode reuse`, `rebuild` or `off` explicitly. Inspection figures and numeric excerpts remain separate from numerical feature identity. Normalization and learned behavior previews belong to their fitted checkpoint.
 
@@ -96,6 +119,10 @@ Batch size is selected separately for each session and fold as `min(32, complete
 
 Scoring preserves channelwise and aggregate CC, R² and MSE, with explicit undefined values. Fold means are computed within sessions before the cross-session mean and sample SEM. Saved artifacts drive plots and stage loss summaries; partial studies retain their actual fold/session counts. Successful startup does not establish convergence.
 
+
+Each horizon has a `full` neural score using every channel fitted by that population. Experiments with multiple population scales also have a `common` score: the largest channel-ID intersection across all configured population groups, mapped into each fit's output-column order. Membership includes unfinished groups and is independent of execution order. Training populations retain their seeded ordering. Empty intersections, duplicate IDs and missing mappings are errors. Single-population experiments, including the latent-dimension sweep, emit only `full`.
+
+Behaviour metrics are identical in `full` and `common` rows because behaviour dimensions do not change with neural scoring channels. `valid_<metric>_channels` counts channels with finite scores (or behaviour dimensions for behaviour metrics). Flat targets invalidate CC and R²; MSE normally remains defined. An aggregate metric is undefined if any included channel has an undefined score; no undefined channels are silently dropped.
 
 ### Saved-data previews
 
@@ -114,9 +141,9 @@ ordered processing panels, and numerical excerpts. Coordinates use blue solid
 x traces and orange dashed y traces with outside legends.
 Fitted previews include both model normalization stages and explicitly label
 learned behavior as a checkpoint-derived estimate. Revisions are published
-atomically alongside their fold cache: preprocessing uses `previews/`, and
-fitting uses `fitted_previews/<checkpoint checksum>/`. The independent
-`preview` stage uses the separate cache-root `previews/` tree. Each revision
+atomically under the analysis's `previews/` directory. Independent
+`preview` and preprocessing-only stages use their own source/presentation-
+addressed analysis directories. Each revision
 has an index and checksum
 manifest; source artifacts are preserved. Keep regeneration settings and
 outputs outside version control.

@@ -1,0 +1,263 @@
+"""Persist fit and inference completion independently of analysis.
+
+Fit artifacts use the registered configuration/provenance/data/checkpoints
+groups. Each predictions/test/horizons_<steps> bundle contains predictions.npz
+(Y/Z/X forecasts shaped (H, T, C), valid masks (H, T), truths (T, C),
+times/indices (T,), horizons (H,) and training means (C,)) and completion.json
+(input provenance and payload checksum). C varies with the predicted target.
+"""
+
+import argparse
+import json
+import logging
+import os
+from pathlib import Path
+import uuid
+
+import numpy as np
+import yaml
+
+from .artifacts import (
+    ARTIFACT_PATHS, artifact_path, fit_identity, fit_seed, prepare_run,
+    prepare_model_settings, validate_completion,
+)
+from .cache import atomic_json, file_digest, writer_lock
+from .contracts import FeatureSet, Model, plugin
+from .windows import window_indices
+
+LOGGER = logging.getLogger(__name__)
+PREDICTION_RTOL = 1e-5
+PREDICTION_ATOL = 1e-5
+
+
+def canonical_horizons(horizons: list[int]) -> list[int]:
+    """Validate and order distinct positive inference horizons."""
+    if (
+        not horizons or any(type(h) is not int or h < 1 for h in horizons)
+        or len(set(horizons)) != len(horizons)
+    ):
+        raise ValueError("Expected unique positive integer forecast horizons.")
+    return sorted(horizons)
+
+
+def make_backend(identity: dict, run: Path, previews: dict) -> Model:
+    """Construct the configured fitting adapter using its recorded seed."""
+    return plugin(
+        identity["configurations"]["experiment"]["model_plugin"],
+        configuration=str(artifact_path(run, "model_configuration.yaml")),
+        overrides=identity["model_overrides"], seed=fit_seed(identity),
+        previews=previews,
+    )
+
+
+def ensure_fit(
+    run: Path, identity: dict, features: FeatureSet, columns: np.ndarray,
+    arguments: argparse.Namespace, previews: dict, gpu: dict | None,
+) -> bool:
+    """Reuse a validated fit or complete only its unfinished training work.
+
+    Parameters
+    ----------
+    run : Path
+        Canonical fit-ID directory.
+    identity : dict
+        Resolved numerical inputs and recorded configuration.
+    features : FeatureSet
+        Time-first arrays and training/validation/test split roles.
+    columns : ndarray, shape (C,)
+        Ordered neural input/output columns.
+    arguments : Namespace
+        Invocation stage and logging preferences.
+    previews : dict
+        Fitted-excerpt capture settings.
+    gpu : dict or None
+        Diagnostic allocation record, excluded from fit identity.
+
+    Returns
+    -------
+    bool
+        True only when a fit was completed during this invocation.
+    """
+    completion = artifact_path(run, "fit_complete.json")
+    if arguments.stage == "evaluate" and not completion.exists():
+        raise ValueError(f"Evaluation requires a completed fit: {run}")
+    prepare_model_settings(run.parents[2], identity)
+    run.mkdir(parents=True, exist_ok=True)
+    with writer_lock(run / "fit.lock"):
+        if completion.exists():
+            validate_completion(run)
+            recorded = json.loads(
+                artifact_path(run, "identity.json").read_text()
+            )
+            if recorded["identity"] != fit_identity(identity):
+                raise ValueError(f"Completed fit identity mismatch: {run}")
+            LOGGER.info("Reusing completed fit %s", run)
+            return False
+        if arguments.stage == "evaluate":
+            raise ValueError(f"Evaluation requires a completed fit: {run}")
+        prepare_run(run)
+        atomic_json(
+            artifact_path(run, "identity.json"),
+            dict(fit_id=run.name, identity=fit_identity(identity)),
+        )
+        artifact_path(run, "model_configuration.yaml").write_text(
+            yaml.safe_dump(identity["configurations"]["model"])
+        )
+        atomic_json(
+            artifact_path(run, "resolved_configurations.json"),
+            identity["configurations"],
+        )
+        atomic_json(
+            artifact_path(run, "runtime.json"),
+            dict(
+                gpu=gpu, pid=os.getpid(),
+                cache=str(features.path) if features.path else None,
+                text_log=str((
+                    arguments.log_directory / "sessions"
+                    / f"{features.metadata['session']}.log"
+                ).resolve()),
+            ),
+        )
+        atomic_json(
+            artifact_path(run, "seed.json"), dict(seed=fit_seed(identity))
+        )
+        np.savez_compressed(
+            artifact_path(run, "selection.npz"),
+            selected_columns=columns,
+            channel_ids=features.arrays["ids"][columns],
+            unit_dimensions=features.arrays["units"][columns],
+            indices=features.arrays["indices"], role=features.arrays["role"],
+            segment=features.arrays["segment"],
+        )
+        status = artifact_path(run, "status.json")
+        atomic_json(status, dict(state="running", pid=os.getpid()))
+        try:
+            from .restart import prepare_components
+
+            prepare_components(run / "components")
+            backend = make_backend(identity, run, previews)
+            backend.fit(features, columns, identity["case"]["dimensions"], run)
+            backend.save(artifact_path(run, "model.p"))
+            atomic_json(status, dict(state="complete"))
+            checksums = {
+                name: file_digest(artifact_path(run, name))
+                for name in ARTIFACT_PATHS
+                if name != "fit_complete.json"
+                and artifact_path(run, name).exists()
+            }
+            atomic_json(
+                completion, dict(fit_id=run.name, checksums=checksums)
+            )
+            return True
+        except BaseException as error:
+            atomic_json(
+                status, dict(state="failed", error=f"{type(error).__name__}: "
+                             f"{error}"),
+            )
+            raise
+
+
+def prediction_directory(run: Path, horizons: list[int]) -> Path:
+    """Resolve a readable inference bundle beneath its owning fit."""
+    label = "_".join(str(h) for h in canonical_horizons(horizons))
+    return run / "predictions" / "test" / f"horizons_{label}"
+
+
+def validate_predictions(directory: Path, expected: dict) -> Path | None:
+    """Validate an existing prediction completion without invoking a model."""
+    completion = directory / "completion.json"
+    if not completion.exists():
+        return None
+    record = json.loads(completion.read_text())
+    if record["identity"] != expected:
+        raise ValueError(f"Prediction provenance mismatch: {directory}")
+    path = directory / "predictions.npz"
+    if file_digest(path) != record["sha256"]:
+        raise ValueError(f"Prediction checksum mismatch: {path}")
+    return path
+
+
+def prediction_arrays(
+    backend: Model, run: Path, identity: dict, features: FeatureSet,
+    columns: np.ndarray, horizons: list[int],
+) -> dict[str, np.ndarray]:
+    """Forecast held-out windows and verify native checkpoint reconstruction."""
+    test = window_indices(features, 2, backend.length).ravel()
+    arrays = features.arrays
+    truth_y = arrays["Y"][test][:, columns]
+    predictions = backend.predict(truth_y, arrays["U"][test], horizons)
+    restored = make_backend(identity, run, {"enabled": False})
+    restored.load(artifact_path(run, "model.p"))
+    length = backend.length
+    check = restored.predict(
+        truth_y[:length], arrays["U"][test[:length]], horizons
+    )
+    for name in ("Y", "Z"):
+        np.testing.assert_allclose(
+            check[name], predictions[name][:, :length],
+            rtol=PREDICTION_RTOL, atol=PREDICTION_ATOL,
+        )
+    with np.load(artifact_path(run, "fit_indices.npz")) as fitted:
+        source_indices = fitted["training"].ravel()
+    training = np.searchsorted(arrays["indices"], source_indices)
+    if (
+        not len(training) or np.any(training >= len(arrays["indices"]))
+        or not np.array_equal(arrays["indices"][training], source_indices)
+    ):
+        raise ValueError(f"Saved training indices do not match inputs: {run}")
+    payload = dict(
+        predictions, true_Y=truth_y, true_Z=arrays["Z"][test],
+        t=arrays["t"][test], source_indices=arrays["indices"][test],
+        horizons=np.asarray(horizons),
+        baseline_Y=arrays["Y"][training][:, columns].mean(axis=0),
+        baseline_Z=arrays["Z"][training].mean(axis=0),
+    )
+    for name, values in payload.items():
+        if not values.size or not np.isfinite(values).all():
+            raise ValueError(f"Empty or nonfinite prediction payload: {name}")
+    return payload
+
+
+def ensure_predictions(
+    run: Path, identity: dict, features: FeatureSet, columns: np.ndarray,
+    horizons: list[int],
+) -> Path:
+    """Reuse or publish inference without writing any completed fit payload."""
+    validate_completion(run)
+    horizons = canonical_horizons(horizons)
+    directory = prediction_directory(run, horizons)
+    expected = dict(
+        fit_id=run.name,
+        checkpoint_sha256=file_digest(artifact_path(run, "model.p")),
+        source=fit_identity(identity)["source"], horizons=horizons,
+        inference_implementation=identity["configurations"].get(
+            "inference_implementation"
+        ),
+    )
+    with writer_lock(directory.parent / f"{directory.name}.lock"):
+        path = validate_predictions(directory, expected)
+        if path is not None:
+            return path
+        if directory.exists():
+            quarantine = directory.parent / "quarantine"
+            quarantine.mkdir(exist_ok=True)
+            directory.rename(
+                quarantine / f"{directory.name}-{uuid.uuid4().hex}"
+            )
+            LOGGER.warning(
+                "Quarantined incomplete prediction bundle beneath %s",
+                quarantine.resolve(),
+            )
+        directory.mkdir()
+        backend = make_backend(identity, run, {"enabled": False})
+        backend.load(artifact_path(run, "model.p"))
+        arrays = prediction_arrays(
+            backend, run, identity, features, columns, horizons
+        )
+        path = directory / "predictions.npz"
+        np.savez_compressed(path, **arrays)
+        atomic_json(
+            directory / "completion.json",
+            dict(identity=expected, sha256=file_digest(path)),
+        )
+        return path

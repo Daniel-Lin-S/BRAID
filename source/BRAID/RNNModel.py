@@ -33,6 +33,7 @@ import numpy as np
 from .sequence import independent_indices
 from .RegressionModel import RegressionModel
 from .tools.model_base_classes import ModelWithFitWithRetry, Reconstructable
+from .tools.tensorboard import event_scope
 from .tools.plot import plotPredictionScatter, plotTimeSeriesPrediction
 from .tools.tf_losses import (
     masked_CategoricalCrossentropy,
@@ -986,6 +987,7 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
         return 'CSettings' in self.cell_args and 'num_classes' in self.cell_args['CSettings'] and \
             self.cell_args['CSettings']['num_classes'] is not None
 
+    @event_scope()
     def fit(self, Y_in, Y_out, FT_in=None, n1_in=None, prior_pred=None, Y_in_val=None, Y_out_val=None, FT_in_val=None, n1_in_val=None, prior_pred_val=None, epochs=100, verbose=0, 
                 prediction_batch_size=1, 
                 init_attempts=1, # Number of initialization retries for each model fitting attempt. Will keep the best outcome after each series of attempts 

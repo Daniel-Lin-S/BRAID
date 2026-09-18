@@ -2,7 +2,7 @@
 
 Inputs are a source_run reference, explicit channel/window selections, saved
 session/fold caches, checkpoint and fitted excerpts. Outputs are immutable
-preview revisions under the configured cache root. No data extraction,
+preview revisions under the configured analysis root. No data extraction,
 normalizer fitting, model reconstruction or training is performed here.
 """
 
@@ -13,8 +13,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .artifacts import artifact_path
-from .cache import file_digest, load_entry
+from .artifacts import artifact_path, validate_completion
+from .cache import file_digest, fingerprint, load_entry
 from .contracts import plugin
 from .preview_publication import publish_previews
 
@@ -44,6 +44,7 @@ def regenerate_previews(settings: dict) -> Path:
             "Set an absolute previews.source_run in configuration."
         )
     run = Path(reference).resolve()
+    validate_completion(run)
     runtime = json.loads((artifact_path(run, "runtime.json")).read_text())
     if not runtime.get("cache"):
         raise ValueError("Source run has no saved fold-cache reference.")
@@ -97,9 +98,10 @@ def regenerate_previews(settings: dict) -> Path:
     ) as saved:
         columns = saved["selected_columns"]
     destination = (
-        Path(settings["paths"]["cache_root"])
+        Path(settings["paths"]["artifact_root"])
+        / "analysis" / settings["experiment"]["name"]
+        / fingerprint(dict(stage="preview", fit_id=run.name, previews=preview))
         / "previews"
-        / settings["experiment"]["name"]
         / fold.metadata["session"]
         / f"fold_{fold.metadata['fold']}"
     )

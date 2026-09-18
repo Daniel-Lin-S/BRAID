@@ -1,41 +1,43 @@
-"""Resolve structured run artifacts and read historical flat layouts.
+"""Address immutable fits independently of experiment membership.
 
-New runs group settings in configuration/, identities and execution state in
-provenance/, selections in data/, fitted models in checkpoints/, scores and
-predictions in evaluation/, and fit summaries in diagnostics/. Readers accept
-historical flat runs without modifying them. Model directory identities omit
-machine paths, session selections and presentation preferences.
+Fits live in experiments/<model>_<settings-hash>/<session>/fold_<k>/<fit-id>/.
+model_settings.json beside the session directories contains settings_hash
+and the complete canonical fitting recipe in settings. The
+configuration, provenance, data and checkpoints groups contain settings,
+identity/completion documents, selected channels/indices and model.p.
+Predictions are completed bundles beneath each fit. Analysis never
+contributes to fit identity and no other artifact layout is read.
 """
 
 import copy
 import json
 from importlib import import_module
 from pathlib import Path
+import re
 
-from .cache import fingerprint, file_digest
-from .contracts import FeatureSet
+from .cache import atomic_json, fingerprint, file_digest, writer_lock
+from .contracts import FeatureSet, Model
+from .populations import POPULATION_SELECTION_POLICY
 
-
+FIT_SCHEMA = 1
+SEED_MODULUS = 2**31 - 1
+PRESENTATION_KEYS = ("verbose", "save_logs", "epoch_artifacts", "clear_graph")
+LOCATION_KEYS = ("root", "cache_root", "cache_mode", "previews", "path")
+MODEL_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
+SETTINGS_FILENAME = "model_settings.json"
+SETTINGS_LOCK = "model_settings.lock"
 ARTIFACT_GROUPS = {
     "configuration": (
-        "model_configuration.yaml",
-        "resolved_configurations.json",
+        "model_configuration.yaml", "resolved_configurations.json",
         "fit_arguments.json",
     ),
     "provenance": (
-        "identity.json",
-        "runtime.json",
-        "seed.json",
-        "status.json",
-        "preview_reference.json",
-        "fitted_excerpts.json",
-        "training_deviations.json",
+        "identity.json", "runtime.json", "seed.json", "status.json",
+        "fitted_excerpts.json", "training_deviations.json",
         "fit_complete.json",
     ),
     "data": ("selection.npz", "fit_indices.npz"),
     "checkpoints": ("model.p",),
-    "evaluation": ("metrics.json", "predictions.npz"),
-    "diagnostics": ("stage_loss_summary.json",),
 }
 ARTIFACT_PATHS = {
     name: Path(group) / name
@@ -44,175 +46,290 @@ ARTIFACT_PATHS = {
 }
 
 
+def model_adapter(snapshots: dict) -> type[Model]:
+    """Load an adapter and validate its explicitly declared public name.
+
+    Parameters
+    ----------
+    snapshots : dict
+        Resolved configurations containing experiment.model_plugin.
+
+    Returns
+    -------
+    type of Model
+        Adapter class with a nonempty, filesystem-safe model_name.
+    """
+    reference = snapshots["experiment"]["model_plugin"]
+    module, separator, name = reference.partition(":")
+    if not separator or not module or not name:
+        raise ValueError(
+            f"Expected module:class model plugin, got {reference!r}."
+        )
+    adapter = getattr(import_module(module), name)
+    public_name = getattr(adapter, "model_name", None)
+    if (
+        not isinstance(public_name, str)
+        or MODEL_NAME_PATTERN.fullmatch(public_name) is None
+    ):
+        raise ValueError(
+            f"Model adapter {reference!r} must declare a nonempty "
+            "filesystem-safe model_name using letters, digits, '-' or '_'."
+        )
+    return adapter
+
+
 def resolved_fit(identity: dict, features: FeatureSet | None = None) -> dict:
-    """Obtain semantic fit arguments through the configured model adapter."""
+    """Resolve effective numerical arguments, excluding presentation flags."""
     snapshots = identity["configurations"]
     arguments = copy.deepcopy(identity.get("resolved_fit"))
     if arguments is None:
-        module, name = snapshots["experiment"]["model_plugin"].split(":")
-        adapter = getattr(import_module(module), name)
+        adapter = model_adapter(snapshots)
         arguments = adapter.resolve_fit_configuration(
-            snapshots["model"],
-            identity["case"].get("dimensions", {}),
-            identity.get("model_overrides"),
-            features,
+            snapshots["model"], identity["case"].get("dimensions", {}),
+            identity.get("model_overrides"), features,
         )
-    for key in ("verbose", "save_logs", "epoch_artifacts", "clear_graph"):
+    for key in PRESENTATION_KEYS:
         arguments.get("args_base", {}).pop(key, None)
     return arguments
 
 
 def artifact_path(run: Path, name: str) -> Path:
-    """Resolve a named artifact, preferring an existing historical file.
-
-    Parameters
-    ----------
-    run : Path
-        Root of a single run, never a model-settings directory.
-    name : str
-        Registered artifact filename.
-
-    Returns
-    -------
-    Path
-        Absolute canonical path; this function never creates directories.
-    """
+    """Return the absolute path of a registered fit artifact."""
     if name not in ARTIFACT_PATHS:
-        raise ValueError(f"Unknown run artifact: {name}")
-    legacy = run / name
-    current = run / ARTIFACT_PATHS[name]
-    if legacy.exists() and current.exists():
-        raise ValueError(
-            f"Ambiguous duplicate artifact: {run.resolve()}/{name}"
-        )
-    return (legacy if legacy.exists() else current).resolve()
+        raise ValueError(f"Unknown fit artifact: {name}")
+    return (run / ARTIFACT_PATHS[name]).resolve()
 
 
 def prepare_run(run: Path) -> None:
-    """Create the named artifact groups for a new or incomplete run."""
+    """Create groups belonging to an incomplete fit."""
     for group in ARTIFACT_GROUPS:
         (run / group).mkdir(parents=True, exist_ok=True)
 
 
-def discover_runs(root: Path) -> list[Path]:
-    """Find new and historical runs through their identity documents."""
-    runs = set()
-    for path in root.rglob("identity.json"):
-        run = (
-            path.parent.parent
-            if path.parent.name == "provenance"
-            else path.parent
-        )
-        if artifact_path(run, "identity.json") == path.resolve():
-            runs.add(run.resolve())
-    return sorted(runs)
+def scientific_source(source: dict) -> dict:
+    """Remove storage locations and rendering preferences from provenance."""
+    result = copy.deepcopy(source)
+    if "sha256" in result:
+        result.pop("source", None)
+    for key in (*LOCATION_KEYS, "source", "session_cache"):
+        if key == "source" and isinstance(result.get(key), dict):
+            result[key] = scientific_source(result[key])
+        else:
+            result.pop(key, None)
+    for key in ("settings", "identity"):
+        if isinstance(result.get(key), dict):
+            result[key] = scientific_source(result[key])
+    return result
 
 
 def model_identity(snapshots: dict, case: dict) -> dict:
-    """Extract settings shared across sessions and folds for one model case."""
-    data = copy.deepcopy(snapshots["data"])
-    for key in ("root", "cache_root", "cache_mode", "previews"):
-        data.pop(key, None)
-    experiment = snapshots["experiment"]
-    model = resolved_fit(dict(configurations=snapshots, case=case))
+    """Collect numerical context shared by seed and recipe resolution."""
     return dict(
-        model=model,
-        data=data,
-        population_scale=case.get("population_scale", 1.0),
-        evaluation=snapshots["evaluation"],
-        seed=experiment["seed"],
-        model_plugin=experiment["model_plugin"],
+        model=resolved_fit(dict(configurations=snapshots, case=case)),
+        data=scientific_source(snapshots["data"]),
+        seed=snapshots["experiment"]["seed"],
+        model_plugin=snapshots["experiment"]["model_plugin"],
         versions=snapshots.get("versions"),
+        fitting_implementation=snapshots.get("fitting_implementation"),
     )
 
 
-def model_directory(root: Path, snapshots: dict, case: dict) -> Path:
-    """Return a readable model-settings directory with a stable fingerprint."""
-    return (
-        root
-        / f"{case['name']}-{fingerprint(model_identity(snapshots, case))[:16]}"
-    )
+def model_settings(
+    snapshots: dict, case: dict, overrides: dict | None = None,
+) -> dict:
+    """Resolve the complete session-independent fitting recipe.
 
+    Parameters
+    ----------
+    snapshots : dict
+        Resolved model, preprocessing, seed and implementation settings.
+    case : dict
+        One case's dimension overrides and population_scale, not its sweep.
+    overrides : dict, optional
+        Fitting overrides; default is None. Presentation flags are excluded.
 
-def compatibility_identity(identity: dict) -> dict:
-    """Compare numerical settings and source provenance across layouts.
-
-    Paths, presentation and invocation settings do not change a fit. Package
-    versions and all scientific settings remain part of compatibility.
+    Returns
+    -------
+    dict
+        Canonical recipe using the configured batch limit, without capping
+        against a particular session's available windows.
     """
-    source = copy.deepcopy(identity["source"])
-    source.pop("source", None)
-    source.pop("session_cache", None)
-    if "sha256" in source.get("identity", {}):
-        source["identity"].pop("source", None)
-    for key in ("settings", "identity"):
-        if key in source:
-            for field in (
-                "root",
-                "cache_root",
-                "cache_mode",
-                "previews",
-                "path",
-            ):
-                source[key].pop(field, None)
-    model = model_identity(identity["configurations"], identity["case"])
+    recipe = model_identity(snapshots, case)
+    recipe["model"] = resolved_fit(dict(
+        configurations=snapshots, case=case, model_overrides=overrides,
+    ))
+    recipe["data"].pop("sessions", None)
+    scale = case["population_scale"]
+    if isinstance(scale, bool) or not isinstance(scale, (int, float)):
+        raise ValueError(f"Expected numeric population_scale, got {scale!r}.")
+    if not 0 < scale <= 1:
+        raise ValueError(f"Expected population_scale in (0, 1], got {scale!r}.")
+    recipe["population"] = dict(
+        scale=float(scale), selection_policy=POPULATION_SELECTION_POLICY,
+    )
+    return recipe
+
+
+def settings_record(identity: dict) -> dict:
+    """Build the canonical recipe document referenced by one fit.
+
+    Parameters
+    ----------
+    identity : dict
+        Fit inputs with configurations, case and optional model_overrides.
+
+    Returns
+    -------
+    dict
+        settings_hash (full SHA-256) and its canonical settings payload.
+    """
+    settings = model_settings(
+        identity["configurations"], identity["case"],
+        identity.get("model_overrides"),
+    )
+    return dict(settings_hash=fingerprint(settings), settings=settings)
+
+
+def fit_inputs(identity: dict) -> dict:
+    """Collect effective fitting inputs before deriving the random seed."""
+    snapshots = identity["configurations"]
+    model = model_identity(snapshots, identity["case"])
     model["model"] = resolved_fit(identity)
     return dict(
-        model=model,
-        fold=identity["fold"],
-        source=source,
+        schema=FIT_SCHEMA, model=model, fold=identity["fold"],
+        source=scientific_source(identity["source"]),
         selected_ids=identity["selected_ids"],
-        fit_seed=fit_seed(identity),
-        # Overrides have already been applied to the resolved arguments.
     )
-
-
-def validate_completion(run: Path, status: dict) -> None:
-    """Check every registered completed payload before reusing a run."""
-    if not status.get("checksums"):
-        raise ValueError(f"Completion has no payload checksums: {run}")
-    for name, digest in status["checksums"].items():
-        path = artifact_path(run, name)
-        if file_digest(path) != digest:
-            raise ValueError(f"Completed artifact checksum mismatch: {path}")
-
-
-def compatible_run(root: Path, identity: dict) -> Path | None:
-    """Find an existing compatible completed or interrupted run, read-only."""
-    expected = compatibility_identity(identity)
-    complete, partial = [], []
-    for run in discover_runs(root):
-        existing = json.loads(artifact_path(run, "identity.json").read_text())
-        fit_path = artifact_path(run, "fit_arguments.json")
-        if "resolved_fit" not in existing and fit_path.exists():
-            existing["resolved_fit"] = json.loads(fit_path.read_text())
-        if compatibility_identity(existing) != expected:
-            continue
-        path = artifact_path(run, "status.json")
-        status = json.loads(path.read_text()) if path.exists() else {}
-        if status.get("state") == "complete":
-            validate_completion(run, status)
-            complete.append(run)
-        else:
-            partial.append(run)
-    if len(complete) > 1 or (not complete and len(partial) > 1):
-        raise ValueError(
-            "Multiple compatible runs found; "
-            "choose an unambiguous artifact root."
-        )
-    return (complete or partial or [None])[0]
 
 
 def fit_seed(identity: dict) -> int:
-    """Resolve the per-fit seed used by BRAID, including historical cases."""
-    return int(
-        fingerprint(
-            dict(
-                session=identity["source"]["session"],
-                fold=identity["fold"],
-                case=identity["case"],
-                seed=identity["configurations"]["experiment"]["seed"],
-            )
-        )[:8],
-        16,
-    ) % (2**31 - 1)
+    """Derive a seed independently of sweep labels and scoring."""
+    return int(fingerprint(fit_inputs(identity))[:8], 16) % SEED_MODULUS
+
+
+def fit_identity(identity: dict) -> dict:
+    """Return the sole canonical identity used for fit completion reuse."""
+    return dict(
+        fit_inputs(identity), fit_seed=fit_seed(identity),
+        settings_hash=settings_record(identity)["settings_hash"],
+    )
+
+
+def model_directory(
+    root: Path, snapshots: dict, case: dict, overrides: dict | None = None,
+) -> Path:
+    """Address a complete fitting recipe by public model name and SHA-256.
+
+    Parameters
+    ----------
+    root : Path
+        Shared artifact root.
+    snapshots, case : dict
+        Resolved configuration and this case's training settings.
+    overrides : dict, optional
+        Fitting overrides; default is None.
+
+    Returns
+    -------
+    Path
+        Absolute experiments/<model_name>_<full-settings-hash> directory.
+    """
+    adapter = model_adapter(snapshots)
+    digest = fingerprint(model_settings(snapshots, case, overrides))
+    return (root / "experiments" / f"{adapter.model_name}_{digest}").resolve()
+
+
+def validate_model_settings(directory: Path) -> dict:
+    """Validate immutable settings metadata against its directory name.
+
+    Parameters
+    ----------
+    directory : Path
+        Model-settings directory containing model_settings.json.
+
+    Returns
+    -------
+    dict
+        Validated settings_hash and settings document.
+    """
+    path = directory / SETTINGS_FILENAME
+    record = json.loads(path.read_text())
+    if set(record) != {"settings_hash", "settings"}:
+        raise ValueError(f"Invalid model settings document: {path.resolve()}")
+    settings = record["settings"]
+    digest = fingerprint(settings)
+    adapter = model_adapter(dict(
+        experiment=dict(model_plugin=settings["model_plugin"])
+    ))
+    if (
+        record["settings_hash"] != digest
+        or directory.name != f"{adapter.model_name}_{digest}"
+    ):
+        raise ValueError(f"Model settings hash mismatch: {path.resolve()}")
+    return record
+
+
+def prepare_model_settings(directory: Path, identity: dict) -> None:
+    """Publish a recipe once, rejecting existing missing or conflicting data.
+
+    Parameters
+    ----------
+    directory : Path
+        Canonical model-settings directory, not a fit directory.
+    identity : dict
+        Resolved fit inputs whose configured recipe must match the directory.
+    """
+    expected = settings_record(identity)
+    adapter = model_adapter(identity["configurations"])
+    if directory.name != (
+        f"{adapter.model_name}_{expected['settings_hash']}"
+    ):
+        raise ValueError(f"Unexpected model settings directory: {directory}")
+    with writer_lock(directory / SETTINGS_LOCK):
+        path = directory / SETTINGS_FILENAME
+        if path.exists():
+            if validate_model_settings(directory) != expected:
+                raise ValueError(f"Conflicting model settings: {path}")
+        else:
+            if any(item.name != SETTINGS_LOCK for item in directory.iterdir()):
+                raise ValueError(f"Missing model settings metadata: {path}")
+            atomic_json(path, expected)
+
+
+def fit_directory(root: Path, identity: dict) -> Path:
+    """Resolve a fit independently of analysis configuration and labels."""
+    return (
+        model_directory(
+            root, identity["configurations"], identity["case"],
+            identity.get("model_overrides"),
+        )
+        / identity["source"]["session"] / f"fold_{identity['fold']}"
+        / fingerprint(fit_identity(identity))
+    )
+
+
+def validate_completion(run: Path) -> dict:
+    """Validate every completed fit payload without writing to the fit."""
+    settings = validate_model_settings(run.parents[2])
+    path = artifact_path(run, "fit_complete.json")
+    record = json.loads(path.read_text())
+    required = {
+        "model.p", "identity.json", "fit_indices.npz", "selection.npz",
+        "model_configuration.yaml",
+    }
+    if (
+        record.get("fit_id") != run.name
+        or not required.issubset(record.get("checksums", {}))
+    ):
+        raise ValueError(f"Invalid fit completion record: {path}")
+    for name, digest in record["checksums"].items():
+        if file_digest(artifact_path(run, name)) != digest:
+            raise ValueError(f"Completed fit checksum mismatch: {run / name}")
+    identity = json.loads(artifact_path(run, "identity.json").read_text())
+    if (
+        identity["fit_id"] != run.name
+        or fingerprint(identity["identity"]) != run.name
+        or identity["identity"]["settings_hash"] != settings["settings_hash"]
+    ):
+        raise ValueError(f"Invalid completed fit identity: {run}")
+    return record

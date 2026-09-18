@@ -33,9 +33,9 @@ def _assert_perfect_metrics(
     """Assert that alignment padding does not contaminate logged metrics."""
     test_case.assertIn("{}-step".format(HORIZON), log_message)
     test_case.assertNotIn("nan", log_message.lower())
-    test_case.assertIn("MSE_maskV_None=0", log_message)
-    test_case.assertIn("R2_maskV_None=1", log_message)
-    test_case.assertIn("CC_maskV_None=1", log_message)
+    test_case.assertIn("MSE=0", log_message)
+    test_case.assertIn("R2=1", log_message)
+    test_case.assertIn("CC=1", log_message)
 
 
 class MultiStepMetricLoggingTest(unittest.TestCase):

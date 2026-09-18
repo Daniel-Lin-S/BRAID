@@ -109,6 +109,9 @@ def argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-plots", action="store_true")
     parser.add_argument("--no-previews", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--analysis-id", help="Saved analysis revision for the plot stage"
+    )
     return parser
 
 
@@ -148,6 +151,22 @@ def resolve_configuration(arguments: argparse.Namespace) -> dict:
     for module in MODULES:
         source = (path.parent / experiment["modules"][module]).resolve()
         resolved[module] = read_yaml(source)
+    if "neural_scoring_fraction" in resolved["evaluation"]:
+        raise ValueError(
+            "evaluation.neural_scoring_fraction is unsupported; common "
+            "channels are the intersection of configured populations."
+        )
+    from .fitting import canonical_horizons
+
+    resolved["evaluation"]["horizons"] = canonical_horizons(
+        resolved["evaluation"]["horizons"]
+    )
+    for curve in resolved["plotting"].get("curves", []):
+        scoring_set = curve.get("where", {}).get("evaluation_set")
+        if scoring_set is not None and scoring_set not in ("full", "common"):
+            raise ValueError(
+                f"Expected evaluation_set full or common, got {scoring_set!r}."
+            )
     data = resolved["data"]
     data.update(
         root=paths["dataset_root"],

@@ -6,7 +6,7 @@ curves:
     target: neural
     metric: cc
     horizon: 4
-    evaluation_set: smallest
+    evaluation_set: common
     nx:
     - 16
     - 64
@@ -17,7 +17,7 @@ curves:
     target: behavior
     metric: cc
     horizon: 4
-    evaluation_set: smallest
+    evaluation_set: common
     nx:
     - 16
     - 64

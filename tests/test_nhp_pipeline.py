@@ -175,7 +175,7 @@ def test_window_padding_is_not_a_logged_error(real_session):
         window_length=128,
         missing_marker=marker,
     )
-    assert "MSE_maskV_-1000000.0=0" in text
+    assert "MSE=0" in text
 
 
 def test_restore_best_weights_at_epoch_cap(real_session):

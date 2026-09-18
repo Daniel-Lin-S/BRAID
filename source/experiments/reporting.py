@@ -6,10 +6,9 @@ configured figure suite. Incomplete folds are reported, never filled in.
 """
 
 import csv
-import json
 from pathlib import Path
 
-from .artifacts import artifact_path, discover_runs
+from .analysis import read_manifest
 from .evaluation import aggregate, collect_results
 from .plots import forecast_example, plot_suite
 
@@ -18,16 +17,15 @@ def braid_report(root: Path, settings: dict, sample_rate: float) -> None:
     """Produce the required BRAID tables and optional figures from artifacts."""
     from .model_summary import write_model_summary
 
-    for manifest in root.glob("*/model_manifest.json"):
-        write_model_summary(manifest.parent)
-    destination = root / "summary"
+    write_model_summary(root)
+    destination = root / "summaries"
     summaries = aggregate(collect_results(root), destination)
     table = {}
     for row in summaries:
         if (
             row["nx"] not in (16, 64)
             or row["horizon"] != 4
-            or row["evaluation_set"] != "smallest"
+            or row["evaluation_set"] != "common"
             or row["metric"] != "cc"
         ):
             continue
@@ -46,25 +44,19 @@ def braid_report(root: Path, settings: dict, sample_rate: float) -> None:
             )
             writer.writeheader()
             writer.writerows(table.values())
-    plot_suite(summaries, destination, settings)
+    plot_suite(summaries, root / "plots", settings)
     if not settings["enabled"]:
         return
-    for run in discover_runs(root):
-        identity = artifact_path(run, "identity.json")
-        case = json.loads(identity.read_text())["case"]
-        predictions = artifact_path(run, "predictions.npz")
-        status = artifact_path(run, "status.json")
-        if (
-            not status.exists()
-            or json.loads(status.read_text())["state"] != "complete"
-        ):
+    manifest = read_manifest(root)
+    horizons = manifest["specification"]["settings"]["evaluation"]["horizons"]
+    for member in manifest["members"].values():
+        if member.get("state") != "complete":
             continue
-        if case["dimensions"]["nx"] == 64 and predictions.exists():
+        if member["case"]["dimensions"]["nx"] == 64 and 4 in horizons:
+            (root / "plots").mkdir(exist_ok=True)
             forecast_example(
-                predictions,
-                destination / "behavior_example.png",
-                5,
-                sample_rate,
-                4,
+                root.parents[2] / member["predictions"],
+                root / "plots" / "behavior_example.png",
+                5, sample_rate, 4,
             )
             break

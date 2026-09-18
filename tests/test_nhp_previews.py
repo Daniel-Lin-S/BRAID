@@ -219,8 +219,12 @@ def test_saved_preview_regeneration_without_training(monkeypatch):
     preprocessing = preprocessing_previews(
         session, fold, config, directory / "unused_fallback"
     )
-    assert preprocessing.is_relative_to(fold.path / "previews")
-    with np.load(Path(config["source_run"]) / "selection.npz") as saved:
+    assert preprocessing.is_relative_to(directory / "unused_fallback")
+    from experiments.artifacts import artifact_path
+
+    with np.load(
+        artifact_path(Path(config["source_run"]), "selection.npz")
+    ) as saved:
         columns = saved["selected_columns"]
     fitted = fitted_previews(
         session,
@@ -229,8 +233,9 @@ def test_saved_preview_regeneration_without_training(monkeypatch):
         Path(config["source_run"]),
         settings["experiment"]["preview_model_plugin"],
         columns,
+        directory / "fitted",
     )
-    assert fitted.is_relative_to(fold.path / "fitted_previews")
+    assert fitted.is_relative_to(directory / "fitted")
     for revision in (preprocessing, fitted):
         assert len(list(revision.rglob("*.png"))) == expected_count
     for name, digest in manifest["identity"]["source_checksums"].items():

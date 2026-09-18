@@ -1,7 +1,6 @@
 """Check exclusive text output, numbered roles and structured artifact reuse."""
 
 import copy
-import csv
 import json
 from pathlib import Path
 import subprocess
@@ -13,14 +12,11 @@ import pytest
 
 from experiments.artifacts import (
     artifact_path,
-    compatible_run,
-    compatibility_identity,
-    discover_runs,
+    fit_identity,
     model_directory,
     prepare_run,
 )
-from experiments.cache import atomic_json, file_digest, fingerprint
-from experiments.model_summary import register_model_work, write_model_summary
+from experiments.cache import file_digest, fingerprint
 from BRAID.tools.component_artifacts import component_paths
 
 LOG_SCRIPT = r"""
@@ -171,89 +167,6 @@ def settings():
     )
 
 
-def test_structured_legacy_reuse_and_model_summary(tmp_path):
-    """Keep completed data immutable and expose missing folds explicitly."""
-    snapshots = settings()
-    case = {"name": "model_small", "dimensions": {"nx": 2}}
-    root = tmp_path / "experiment"
-    register_model_work(root, snapshots, case, ["a", "b"], [0])
-    model = model_directory(root, snapshots, case)
-    run = model / "a" / "fold_0" / "run-hash"
-    prepare_run(run)
-    identity = dict(
-        configurations=snapshots,
-        case=case,
-        fold=0,
-        source={"session": "a", "checksum": "source"},
-        selected_ids=["unit"],
-        model_overrides={},
-    )
-    atomic_json(artifact_path(run, "identity.json"), identity)
-    scores = {
-        f"{prefix}_{metric}{suffix}": value
-        for metric in ("cc", "r2", "mse")
-        for prefix, suffix, value in [
-            ("mean", "", 0.5),
-            ("valid", "_channels", 1),
-        ]
-    }
-    rows = [
-        dict(
-            session="a",
-            fold=0,
-            configuration=model.name,
-            nx=2,
-            n1=2,
-            population_scale=1,
-            horizon=1,
-            evaluation_set="full",
-            neural=scores,
-            behavior=scores,
-            samples=10,
-            Y_baseline_mse=[2.0],
-            Z_baseline_mse=[3.0],
-        )
-    ]
-    atomic_json(artifact_path(run, "metrics.json"), rows)
-    atomic_json(
-        artifact_path(run, "status.json"),
-        dict(
-            state="complete",
-            checksums={
-                "metrics.json": file_digest(artifact_path(run, "metrics.json"))
-            },
-        ),
-    )
-    before = {p: file_digest(p) for p in run.rglob("*") if p.is_file()}
-    changed = copy.deepcopy(identity)
-    changed["configurations"]["implementation"] = "new-logging-code"
-    changed["configurations"]["runtime"]["cpu_threads"] = 8
-    changed["configurations"]["model"]["training"]["verbose"] = False
-    changed["configurations"]["data"]["previews"]["enabled"] = True
-    changed["configurations"]["experiment"]["selection"]["sessions"] = [
-        "a",
-        "b",
-    ]
-    assert model_directory(root, changed["configurations"], case) == model
-    assert compatible_run(root, changed) == run
-    write_model_summary(model)
-    with (model / "model_summary.csv").open() as stream:
-        summary = list(csv.DictReader(stream))
-    assert len(summary) == 3
-    assert summary[-1]["status"] == "missing"
-    assert summary[-1]["cc"] == ""
-    assert summary[0]["baseline_mse"] == "2.0"
-    assert all(file_digest(p) == digest for p, digest in before.items())
-    legacy = tmp_path / "legacy" / "a" / "fold_0" / "hash"
-    legacy.mkdir(parents=True)
-    atomic_json(legacy / "identity.json", identity)
-    assert discover_runs(tmp_path / "legacy") == [legacy]
-    assert artifact_path(legacy, "identity.json") == legacy / "identity.json"
-    artifact_path(run, "metrics.json").write_text("[]")
-    with pytest.raises(ValueError, match="checksum"):
-        compatible_run(root, identity)
-
-
 def test_component_completion_restores_without_fit(tmp_path, monkeypatch):
     """Reuse selected component weights without modifying epoch evidence."""
     import tensorflow as tf
@@ -287,110 +200,6 @@ def test_component_completion_restores_without_fit(tmp_path, monkeypatch):
     for actual, expected in zip(model.get_weights(), reference):
         np.testing.assert_array_equal(actual, expected)
     assert all(file_digest(p) == digest for p, digest in before.items())
-
-
-def test_runner_structured_fit_and_resume(tmp_path, monkeypatch):
-    """Exercise actual runner publication with a deterministic test adapter."""
-    from experiments import runner, history
-    from experiments.contracts import FeatureSet
-    from experiments.windows import window_indices
-    from experiments.evaluation import collect_results
-
-    snapshots = settings()
-    snapshots["model"] = {"test": True}
-    case = dict(
-        name="model_small",
-        dimensions={"nx": 2, "n1": 1},
-        population_scale=1.0,
-        summary_parameters={"nx": 2, "n1": 1},
-    )
-    source = {"session": "a", "fold": 0}
-    data = np.arange(96, dtype=float).reshape(48, 2)
-    arrays = dict(
-        Y=data,
-        Z=data,
-        U=data,
-        t=np.arange(48) * 0.05,
-        ids=np.array(["a", "b"]),
-        units=np.array([0, 0]),
-        indices=np.arange(48),
-        role=np.repeat([0, 1, 2], 16),
-        segment=np.repeat([0, 1, 2], 16),
-    )
-    features = FeatureSet(arrays, source)
-    dataset = SimpleNamespace(fold=lambda *a: features)
-    calls = []
-
-    class Backend:
-        length = 8
-
-        def fit(self, features, columns, dimensions, directory):
-            calls.append("fit")
-            np.savez_compressed(
-                artifact_path(directory, "fit_indices.npz"),
-                training=window_indices(features, 0, 8),
-            )
-
-        def save(self, path):
-            path.write_bytes(b"test-checkpoint")
-
-        def load(self, path):
-            assert path.read_bytes() == b"test-checkpoint"
-
-        def predict(self, y, u, horizons):
-            values = np.stack([y for h in horizons])
-            return dict(
-                Y=values,
-                Z=values,
-                X=values,
-                valid=np.ones((len(horizons), len(y)), dtype=bool),
-            )
-
-    monkeypatch.setattr(runner, "plugin", lambda *a, **k: Backend())
-    monkeypatch.setattr(history, "summarize_histories", lambda *a, **k: None)
-    arguments = SimpleNamespace(
-        no_previews=True,
-        log_level="INFO",
-        log_directory=tmp_path / "logs",
-        stage="fit",
-        no_plots=True,
-    )
-    run_settings = dict(
-        velocity=False,
-        previews={"enabled": False},
-        seed=42,
-        model_plugin="test:Model",
-        horizons=[1],
-        neural_scoring_fraction=0.5,
-    )
-    root = tmp_path / "artifacts"
-    register_model_work(root, snapshots, case, ["a"], [0])
-    args = (
-        dataset,
-        features,
-        0,
-        case,
-        run_settings,
-        arguments,
-        ["a", "b"],
-        snapshots,
-        None,
-        root,
-    )
-    assert runner.run_case(*args)
-    run = discover_runs(root)[0]
-    identity = json.loads(artifact_path(run, "identity.json").read_text())
-    assert run.name == fingerprint(compatibility_identity(identity))[:16]
-    assert artifact_path(run, "model.p").parent.name == "checkpoints"
-    assert artifact_path(run, "metrics.json").parent.name == "evaluation"
-    before = {p: file_digest(p) for p in run.rglob("*") if p.is_file()}
-    snapshots["implementation"] = "another-presentation-change"
-    snapshots["runtime"]["cpu_threads"] = 8
-    assert not runner.run_case(*args)
-    assert calls == ["fit"]
-    assert all(file_digest(p) == digest for p, digest in before.items())
-    write_model_summary(model_directory(root, snapshots, case))
-    assert collect_results(root)[0]["samples"] == 16
 
 
 def test_fitted_excerpts_have_one_canonical_payload(tmp_path):
@@ -428,7 +237,10 @@ def test_run_hash_excludes_invocation_settings():
     """Hash the same scientific identity used for completion reuse."""
     identity = dict(
         configurations=settings(),
-        case={"name": "small", "dimensions": {"nx": 2}},
+        case={
+            "name": "small", "dimensions": {"nx": 2},
+            "population_scale": 1.0,
+        },
         fold=0,
         source={
             "session": "a",
@@ -440,13 +252,16 @@ def test_run_hash_excludes_invocation_settings():
         selected_ids=["M1_008_unit_1"],
         model_overrides={"epoch_artifacts": True, "verbose": True},
     )
-    expected = fingerprint(compatibility_identity(identity))
+    expected = fingerprint(fit_identity(identity))
     changed = copy.deepcopy(identity)
     snapshots = changed["configurations"]
     snapshots["run_time"] = "a different launch time"
     snapshots["paths"] = {"log_root": "new-log", "cache_root": "new-cache"}
     snapshots["runtime"] = {"device": "cpu", "cpu_threads": 8}
     snapshots["plotting"] = {"enabled": True}
+    snapshots["evaluation"] = {"horizons": [2, 4]}
+    snapshots["experiment"]["name"] = "different-sweep"
+    snapshots["experiment"]["suite"] = {"population_scales": [0.25, 1.0]}
     snapshots["experiment"].update(
         modules={"model": "renamed.local.yaml"},
         selection={"sessions": ["a", "b"], "folds": [0, 1]},
@@ -466,7 +281,7 @@ def test_run_hash_excludes_invocation_settings():
     changed["source"]["identity"]["source"] = "new-path"
     changed["source"]["settings"]["root"] = "new-root"
     changed["model_overrides"] = {"verbose": False, "epoch_artifacts": False}
-    assert fingerprint(compatibility_identity(changed)) == expected
+    assert fingerprint(fit_identity(changed)) == expected
     assert model_directory(Path("models"), snapshots, changed["case"]) == (
         model_directory(
             Path("models"), identity["configurations"], identity["case"]
@@ -474,16 +289,15 @@ def test_run_hash_excludes_invocation_settings():
     )
     for section, key, value in (
         ("source", "identity", {"sha256": "different-data"}),
-        ("configurations", "evaluation", {"horizons": [2]}),
         ("configurations", "model", {"epochs": 3}),
         ("case", "dimensions", {"nx": 4}),
     ):
         semantic = copy.deepcopy(identity)
         semantic[section][key] = value
-        assert fingerprint(compatibility_identity(semantic)) != expected
+        assert fingerprint(fit_identity(semantic)) != expected
     for key, value in (("fold", 1), ("selected_ids", ["M1_039_unit_1"])):
         semantic = dict(identity, **{key: value})
-        assert fingerprint(compatibility_identity(semantic)) != expected
+        assert fingerprint(fit_identity(semantic)) != expected
 
 
 @pytest.fixture(autouse=True)
@@ -494,6 +308,8 @@ def test_model_resolver(monkeypatch):
     module = types.ModuleType("test")
 
     class Model:
+        model_name = "TestModel"
+
         @staticmethod
         def resolve_fit_configuration(
             configuration, dimensions, overrides=None, features=None
@@ -523,7 +339,10 @@ def test_defaulted_braid_hash_and_effective_batch(tmp_path, monkeypatch):
     snapshots["experiment"]["model_plugin"] = (
         "experiments.braid_backend:BRAIDBackend"
     )
-    case = {"name": "small", "dimensions": {"n1": 2, "n2": 2, "nx": 4}}
+    case = {
+        "name": "small", "dimensions": {"n1": 2, "n2": 2, "nx": 4},
+        "population_scale": 1.0,
+    }
     omitted = copy.deepcopy(snapshots)
     omitted["model"]["training"].pop("optimiser")
     assert model_identity(snapshots, case) == model_identity(omitted, case)
@@ -582,8 +401,9 @@ def test_defaulted_braid_hash_and_effective_batch(tmp_path, monkeypatch):
         selected_ids=["a", "b"],
         resolved_fit=resolved,
     )
-    atomic_json(
-        artifact_path(directory, "identity.json"),
-        {k: v for k, v in identity.items() if k != "resolved_fit"},
+    assert (
+        json.loads(artifact_path(directory, "fit_arguments.json").read_text())[
+            "args_base"
+        ]["batch_size"]
+        == 2
     )
-    assert compatible_run(tmp_path, identity) == directory.resolve()

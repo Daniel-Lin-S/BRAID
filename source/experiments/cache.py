@@ -48,11 +48,17 @@ def atomic_json(path: Path, value: object) -> None:
 
 
 @contextmanager
-def writer_lock(path: Path) -> Iterator[None]:
+def writer_lock(path: Path, blocking: bool = True) -> Iterator[None]:
     """Serialize writers for one cache entry or experiment result."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as stream:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+        try:
+            fcntl.flock(stream.fileno(), flags)
+        except BlockingIOError as error:
+            raise RuntimeError(
+                f"Cannot acquire lock; active writer at {path.resolve()}"
+            ) from error
         try:
             yield
         finally:

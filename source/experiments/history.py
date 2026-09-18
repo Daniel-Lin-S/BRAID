@@ -9,14 +9,15 @@ from pathlib import Path
 
 import numpy as np
 
-from .artifacts import artifact_path
 from .cache import atomic_json
 from .previews import trace_plot
 
 TREND_WINDOW = 3
 
 
-def summarize_histories(directory: Path, plots: bool = True) -> None:
+def summarize_histories(
+    directory: Path, destination: Path, plots: bool = True,
+) -> None:
     """Save measured loss trends for each independently trained component."""
     summaries = []
     for path in sorted((directory / "components").rglob("history.jsonl")):
@@ -57,7 +58,8 @@ def summarize_histories(directory: Path, plots: bool = True) -> None:
             summaries.append(summary)
             if panels and plots:
                 trace_plot(
-                    path.parent / f"loss_attempt_{attempt}.png",
+                    destination / path.parent.relative_to(directory)
+                    / f"loss_attempt_{attempt}.png",
                     epochs,
                     panels,
                     path.parent.name + " training history",
@@ -65,4 +67,4 @@ def summarize_histories(directory: Path, plots: bool = True) -> None:
                 )
     if not summaries:
         raise ValueError("No persisted component history to summarize.")
-    atomic_json(artifact_path(directory, "stage_loss_summary.json"), summaries)
+    atomic_json(destination / "stage_loss_summary.json", summaries)

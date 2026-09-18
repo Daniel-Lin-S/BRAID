@@ -1,6 +1,6 @@
 """Plot cached preprocessing stages on shared real-data time windows.
 
-PNG panels and numeric NPZ excerpts are written under cache previews.
+PNG panels and numeric excerpts are published under analysis previews.
 Preview settings do not contribute to the numerical feature identity.
 """
 
@@ -89,7 +89,9 @@ def preprocessing_previews(
     """Persist raw and transformed excerpts for deterministic valid windows."""
     if not settings["enabled"]:
         return
-    base = fold.path or (fallback / fingerprint(fold.metadata))
+    base = fallback / fingerprint(
+        dict(stage="preprocess", source=fold.metadata, previews=settings)
+    )
     from .preview_publication import publish_previews
 
     return publish_previews(
@@ -108,8 +110,9 @@ def fitted_previews(
     run: Path,
     model_plugin: str,
     columns: np.ndarray,
+    destination: Path,
 ) -> Path | None:
-    """Publish checkpoint-derived previews inside the fold cache.
+    """Publish checkpoint-derived previews inside the analysis.
 
     Parameters
     ----------
@@ -123,6 +126,8 @@ def fitted_previews(
         Adapter function extracting fitted arrays without refitting.
     columns : ndarray, shape (C,)
         Neural columns belonging to this fitted model's population.
+    destination : Path
+        Analysis-owned preview destination.
 
     Returns
     -------
@@ -141,7 +146,7 @@ def fitted_previews(
         windows=windows,
     )
     checkpoint = artifact_path(run, "model.p")
-    base = fold.path or (run / "previews")
+    base = destination
     return publish_previews(
         session,
         fold,
