@@ -33,6 +33,7 @@ def render_safely(
 def _watch_components(
     run: Path,
     style: dict,
+    regenerate: bool,
     stop: object,
     result: object,
 ) -> None:
@@ -51,6 +52,7 @@ def _watch_components(
                     render_component,
                     completion.parent,
                     style,
+                    regenerate,
                 )
                 seen.add(completion)
         if finished:
@@ -66,6 +68,7 @@ def history_monitor(
     style: dict,
     failures: list[str],
     enabled: bool = True,
+    regenerate: bool = False,
 ) -> Iterator[None]:
     """Observe completions in a spawned CPU process, never in batch callbacks.
 
@@ -79,6 +82,8 @@ def history_monitor(
         Invocation-owned error collector.
     enabled : bool, optional
         Whether to start rendering; default is True.
+    regenerate : bool, optional
+        Whether to redraw existing figures; default is False.
     """
     if not enabled:
         yield
@@ -88,7 +93,7 @@ def history_monitor(
     reader, writer = context.Pipe(duplex=False)
     process = context.Process(
         target=_watch_components,
-        args=(run, style, stop, writer),
+        args=(run, style, regenerate, stop, writer),
     )
     try:
         process.start()

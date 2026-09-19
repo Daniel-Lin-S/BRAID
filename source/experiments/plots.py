@@ -1,8 +1,8 @@
 """Render analysis comparisons from accepted per-session summary statistics.
 
-Outputs are named target_metric_vs_parameter_selection.png figures. Missing
-observations remain gaps; SEM is never manufactured. This module does not
-load a checkpoint, fit a model, or produce individual-fold plots.
+Outputs are named target_metric_vs_parameter_selection.png figures. Failed
+observations remain annotated gaps; pending comparisons are deferred. This
+module does not load checkpoints, fit models or produce individual-fold plots.
 """
 
 import logging
@@ -14,6 +14,12 @@ import numpy as np
 from .presentation import METRIC_LABELS, presentation, save_figure, style_axis
 
 LOGGER = logging.getLogger(__name__)
+READINESS_FIELDS = {
+    "pending", "expected_count", "completed_count", "failed_members",
+}
+FAILURE_MARKER_HEIGHT = 0.03
+FAILURE_LABEL_OFFSET = (0, 12)
+MISSING_LABEL_OFFSET = (0, 10)
 PARAMETER_LABELS = {
     "horizon": "Forecast horizon (steps)",
     "nx": "Latent dimension (nx)",
@@ -85,7 +91,6 @@ def metric_curve(
             dtype=float,
         )
         if not np.isfinite(y).all():
-            LOGGER.warning("Missing/undefined points in %s.", spec["name"])
             y[~np.isfinite(y)] = np.nan
         color_index = {16: 0, 64: 1}.get(value, number)
         color = style["pair_colors"][color_index % len(style["pair_colors"])]
@@ -96,6 +101,30 @@ def metric_curve(
             label=f"{group}={value}" if group else "BRAID",
             color=color,
         )
+        for index, row in enumerate(selected):
+            failures = row.get("failed_members", [])
+            if not failures:
+                continue
+            label = (
+                f"{row['completed_count']}/{row['expected_count']} results"
+                f"\n{len(failures)} failed"
+            )
+            if np.isfinite(y[index]):
+                axis.annotate(
+                    label, (x[index], y[index]), xytext=FAILURE_LABEL_OFFSET,
+                    textcoords="offset points", ha="center", color=color,
+                )
+            else:
+                transform = axis.get_xaxis_transform()
+                axis.plot(
+                    [x[index]], [FAILURE_MARKER_HEIGHT], "x", color=color,
+                    transform=transform,
+                )
+                axis.annotate(
+                    label, (x[index], FAILURE_MARKER_HEIGHT),
+                    xycoords=transform, xytext=MISSING_LABEL_OFFSET,
+                    textcoords="offset points", ha="center", color=color,
+                )
         valid_sem = [
             i
             for i, row in enumerate(selected)
@@ -133,7 +162,7 @@ def metric_curve(
         f"{fixed}; {spec['where']['evaluation_set']} scoring"
     )
     figure.suptitle(
-        title + ("\n(partial)" if partial else ""),
+        title + ("\n(partial: failed experiments)" if partial else ""),
         fontsize=style["title_font"],
         wrap=True,
     )
@@ -147,45 +176,120 @@ def metric_curve(
     return figure
 
 
+def comparison_rows(
+    chosen: list[dict], dependencies: list[dict], name: str,
+) -> list[dict]:
+    """Attach failure counts to means and reject unexplained missing metrics.
+
+    Parameters
+    ----------
+    chosen : list of dict
+        Available aggregate metric rows for one figure.
+    dependencies : list of dict
+        Terminal expected points with contribution counts and failure keys.
+    name : str
+        Figure identifier used in validation errors.
+
+    Returns
+    -------
+    list of dict
+        Available means plus explicit gaps caused by failed experiments.
+    """
+    result = [dict(row) for row in chosen]
+    for candidate in dependencies:
+        criteria = {
+            k: v for k, v in candidate.items() if k not in READINESS_FIELDS
+        }
+        row = next((
+            row for row in result
+            if all(row[k] == v for k, v in criteria.items())
+        ), None)
+        if row is None:
+            if not candidate.get("failed_members"):
+                raise ValueError(
+                    f"Missing completed result in {name}: {criteria}"
+                )
+            row = dict(criteria, mean=None, sem=None)
+            result.append(row)
+        row.update({
+            k: candidate[k] for k in READINESS_FIELDS if k in candidate
+        })
+    for row in result:
+        if row["mean"] is None or not np.isfinite(row["mean"]):
+            if not row.get("failed_members") or row.get("completed_count", 0):
+                raise ValueError(f"Undefined completed metric in {name}: {row}")
+    return result
+
+
 def plot_suite(
     summaries: list[dict],
     root: Path,
     settings: dict,
     expected: list[dict] | None = None,
     pending: bool = False,
+    rendered: set[str] | None = None,
 ) -> None:
-    """Publish available comparisons, retaining gaps for unfinished settings."""
+    """Publish terminal comparisons, annotating only failed contributions.
+
+    Parameters
+    ----------
+    summaries : list of dict
+        Aggregate metric means and SEM values from completed evaluations.
+    root : Path
+        Destination for comparison PNG files.
+    settings : dict
+        Enabled flag, curve selections and presentation preferences.
+    expected : list of dict, optional
+        Per-point dependencies and readiness; default None.
+    pending : bool, optional
+        Defer without explicit dependencies when True; default False.
+    rendered : set of str, optional
+        Names already attempted during this invocation; default None.
+        Updated only for eligible figures, including rendering failures.
+    """
     if not settings["enabled"]:
         return
     style = presentation(settings.get("presentation"))
     errors = []
     for spec in curve_specs(settings):
-        chosen = [row for row in summaries if matches(row, spec["where"])]
-        missing = []
-        partial = False
-        for candidate in expected or []:
-            if not matches(candidate, spec["where"]):
-                continue
-            partial |= candidate.get("pending", False)
-            criteria = {k: v for k, v in candidate.items() if k != "pending"}
-            if not any(
-                all(row[key] == criteria[key] for key in criteria)
-                for row in chosen
-            ):
-                missing.append(dict(criteria, mean=None, sem=None))
-        if not chosen and (partial or pending and expected is None):
-            LOGGER.warning("Comparison pending: %s", spec["name"])
+        name = spec["name"]
+        if rendered is not None and name in rendered:
             continue
+        dependencies = [
+            row for row in expected or [] if matches(row, spec["where"])
+        ]
+        if any(row.get("pending", False) for row in dependencies) or (
+            pending and expected is None
+        ):
+            continue
+        if rendered is not None:
+            rendered.add(name)
+        chosen = [row for row in summaries if matches(row, spec["where"])]
         try:
-            figure = metric_curve(
-                chosen + missing,
-                spec,
-                style,
-                partial=partial or bool(missing),
-            )
-            save_figure(figure, root / f"{spec['name']}.png", style)
+            rows = comparison_rows(chosen, dependencies, name)
+            failures = sorted({
+                key for row in dependencies
+                for key in row.get("failed_members", [])
+            })
+            if failures:
+                counts = "; ".join(
+                    f"{row[spec['parameter']]}: "
+                    f"{row['completed_count']}/{row['expected_count']} results"
+                    for row in dependencies if row.get("failed_members")
+                )
+                LOGGER.warning(
+                    "Incomplete comparison %s (%s); failed members: %s",
+                    name, counts, ", ".join(failures),
+                )
+                if not any(
+                    row["mean"] is not None and np.isfinite(row["mean"])
+                    for row in rows
+                ):
+                    continue
+            figure = metric_curve(rows, spec, style, partial=bool(failures))
+            save_figure(figure, root / f"{name}.png", style)
         except Exception as error:
-            LOGGER.exception("Comparison failed: %s", spec["name"])
+            LOGGER.exception("Comparison failed: %s", name)
             errors.append(str(error))
     if errors:
         raise RuntimeError("Comparison rendering failed: " + "; ".join(errors))

@@ -75,6 +75,17 @@ def test_sweeps_have_separate_grids_and_plotting(tmp_path):
     assert latent["model"]["training"]["training_batch_size"] == 32
     assert latent["model"]["training"]["maximum_epochs"] == 2500
     assert latent["plotting"] != population["plotting"]
+    assert latent["runtime"]["figure_regeneration"] == "missing"
+
+
+def test_figure_regeneration_policy_is_validated(tmp_path):
+    """Require an explicit missing-only or full component redraw policy."""
+    local = local_settings(tmp_path)
+    settings = read_yaml(local)
+    settings["runtime"]["figure_regeneration"] = "automatic"
+    local.write_text(yaml.safe_dump(settings))
+    with pytest.raises(ValueError, match="figure_regeneration"):
+        resolve("latent_dimension_sweep.yaml", local)
 
 
 def test_module_inheritance_does_not_mutate_defaults(tmp_path):

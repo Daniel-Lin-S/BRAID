@@ -13,18 +13,38 @@ from .evaluation import aggregate, collect_results
 from .plots import plot_suite
 
 
-def braid_report(root: Path, settings: dict, sample_rate: float) -> None:
-    """Produce the required BRAID tables and optional figures from artifacts."""
+def braid_report(
+    root: Path, settings: dict, sample_rate: float,
+    attempted: set[str] | None = None, rendered: set[str] | None = None,
+) -> None:
+    """Publish tables and comparisons whose dependencies are terminal.
+
+    Parameters
+    ----------
+    root : Path
+        Analysis directory with a validated membership manifest.
+    settings : dict
+        Plot selections and presentation settings.
+    sample_rate : float
+        Dataset sampling rate in Hz.
+    attempted : set of str, optional
+        Members attempted in this invocation. None uses saved terminal states.
+    rendered : set of str, optional
+        Figure names already attempted in this invocation; default None.
+        Updated in place to avoid repeated rendering and failure warnings.
+    """
     from .model_summary import write_model_summary
 
     record_plotting(root, settings)
     write_model_summary(root)
     manifest = read_manifest(root)
-    members = list(manifest["members"].values())
-    if not any(member.get("state") == "complete" for member in members):
-        return
     destination = root / "summaries"
-    summaries = aggregate(collect_results(root), destination)
+    completed = any(
+        member["state"] == "complete"
+        for member in manifest["members"].values()
+    )
+    rows = collect_results(root) if completed else []
+    summaries = aggregate(rows, destination) if rows else []
     table = {}
     for row in summaries:
         if (
@@ -49,10 +69,38 @@ def braid_report(root: Path, settings: dict, sample_rate: float) -> None:
             )
             writer.writeheader()
             writer.writerows(table.values())
+    expected = expected_comparisons(manifest, attempted)
+    plot_suite(
+        summaries, root / "plots", settings, expected, rendered=rendered,
+    )
+
+
+def expected_comparisons(
+    manifest: dict, attempted: set[str] | None = None,
+) -> list[dict]:
+    """Expand comparison membership with pending and failed contributions.
+
+    Parameters
+    ----------
+    manifest : dict
+        Analysis specification and per-session/fold/model member records.
+    attempted : set of str, optional
+        Current invocation's finished attempts; None uses saved states.
+
+    Returns
+    -------
+    list of dict
+        One record per aggregate point, with pending, expected/completed
+        counts and failed member keys in addition to metric selection fields.
+    """
     horizons = manifest["specification"]["settings"]["evaluation"]["horizons"]
-    expected = []
-    for member in members:
+    expected = {}
+    for key, member in manifest["members"].items():
         case = member["case"]
+        state = member["state"]
+        pending = state not in ("complete", "failed") or (
+            attempted is not None and key not in attempted
+        )
         scoring = ["full", "common"] if member["common_ids"] else ["full"]
         for horizon in horizons:
             for evaluation_set in scoring:
@@ -65,18 +113,16 @@ def braid_report(root: Path, settings: dict, sample_rate: float) -> None:
                             horizon=horizon, evaluation_set=evaluation_set,
                             target=target, metric=metric,
                         )
-                        existing = next((
-                            row for row in expected if all(
-                                row[key] == value
-                                for key, value in candidate.items()
-                            )
-                        ), None)
-                        incomplete = member.get("state") != "complete"
-                        if existing is None:
-                            expected.append(dict(candidate, pending=incomplete))
-                        else:
-                            existing["pending"] |= incomplete
-    plot_suite(
-        summaries, root / "plots", settings, expected,
-        pending=any(m.get("state") != "complete" for m in members),
-    )
+                        group = tuple(candidate.values())
+                        point = expected.setdefault(
+                            group, dict(
+                                candidate, pending=False, expected_count=0,
+                                completed_count=0, failed_members=[],
+                            ),
+                        )
+                        point["pending"] |= pending
+                        point["expected_count"] += 1
+                        point["completed_count"] += int(state == "complete")
+                        if state == "failed" and not pending:
+                            point["failed_members"].append(key)
+    return list(expected.values())

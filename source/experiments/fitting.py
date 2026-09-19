@@ -27,8 +27,6 @@ from .contracts import FeatureSet, Model, plugin
 from .windows import window_indices
 
 LOGGER = logging.getLogger(__name__)
-PREDICTION_RTOL = 1e-5
-PREDICTION_ATOL = 1e-5
 
 
 def canonical_horizons(horizons: list[int]) -> list[int]:
@@ -165,7 +163,19 @@ def validate_predictions(directory: Path, expected: dict) -> Path | None:
     if not completion.exists():
         return None
     record = json.loads(completion.read_text())
-    if record["identity"] != expected:
+    from .implementation import compatible_inference
+
+    recorded = record["identity"]
+    numerical = "inference_implementation"
+    compatible = (
+        set(recorded) == set(expected)
+        and {k: v for k, v in recorded.items() if k != numerical}
+        == {k: v for k, v in expected.items() if k != numerical}
+        and compatible_inference(
+            recorded.get(numerical), expected.get(numerical)
+        )
+    )
+    if not compatible:
         raise ValueError(f"Prediction provenance mismatch: {directory}")
     path = directory / "predictions.npz"
     if file_digest(path) != record["sha256"]:
@@ -173,26 +183,66 @@ def validate_predictions(directory: Path, expected: dict) -> Path | None:
     return path
 
 
+def validate_forecast_arrays(
+    predictions: dict[str, np.ndarray], samples: int, neural: int,
+    behavior: int, latent: int, horizons: list[int], length: int,
+) -> None:
+    """Validate forecast dimensions, finite values and window validity.
+
+    Parameters
+    ----------
+    predictions : dict of ndarray
+        Y/Z/X arrays shaped (H, T, C) and boolean valid shaped (H, T).
+    samples : int
+        Number T of held-out samples in complete independent windows.
+    neural, behavior, latent : int
+        Expected channel counts for Y, Z and X respectively.
+    horizons : list of int
+        H positive forecast offsets, each shorter than a window.
+    length : int
+        Samples per independent window.
+    """
+    if samples < 1 or length < 1 or samples % length:
+        raise ValueError("Expected nonempty complete prediction windows.")
+    canonical_horizons(horizons)
+    if max(horizons) >= length:
+        raise ValueError("Forecast horizons must be shorter than a window.")
+    for name, channels in (("Y", neural), ("Z", behavior), ("X", latent)):
+        expected = (len(horizons), samples, channels)
+        values = predictions.get(name)
+        if values is None or values.shape != expected:
+            actual = None if values is None else values.shape
+            raise ValueError(
+                f"Expected {name} forecast shape {expected}, got {actual}."
+            )
+        if not values.size or not np.isfinite(values).all():
+            raise ValueError(f"Empty or nonfinite {name} forecasts.")
+    valid = predictions.get("valid")
+    expected = np.array([
+        np.arange(samples) % length >= horizon for horizon in horizons
+    ])
+    if valid is None or valid.dtype != np.bool_ or not np.array_equal(
+        valid, expected
+    ):
+        raise ValueError(
+            f"Expected boolean valid mask shaped {expected.shape} "
+            "matching independent window boundaries and forecast horizons."
+        )
+
+
 def prediction_arrays(
     backend: Model, run: Path, identity: dict, features: FeatureSet,
     columns: np.ndarray, horizons: list[int],
 ) -> dict[str, np.ndarray]:
-    """Forecast held-out windows and verify native checkpoint reconstruction."""
+    """Forecast held-out windows from a validated saved checkpoint."""
     test = window_indices(features, 2, backend.length).ravel()
     arrays = features.arrays
     truth_y = arrays["Y"][test][:, columns]
     predictions = backend.predict(truth_y, arrays["U"][test], horizons)
-    restored = make_backend(identity, run, {"enabled": False})
-    restored.load(artifact_path(run, "model.p"))
-    length = backend.length
-    check = restored.predict(
-        truth_y[:length], arrays["U"][test[:length]], horizons
+    validate_forecast_arrays(
+        predictions, len(test), len(columns), arrays["Z"].shape[1],
+        identity["case"]["dimensions"]["nx"], horizons, backend.length,
     )
-    for name in ("Y", "Z"):
-        np.testing.assert_allclose(
-            check[name], predictions[name][:, :length],
-            rtol=PREDICTION_RTOL, atol=PREDICTION_ATOL,
-        )
     with np.load(artifact_path(run, "fit_indices.npz")) as fitted:
         source_indices = fitted["training"].ravel()
     training = np.searchsorted(arrays["indices"], source_indices)

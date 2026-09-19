@@ -187,6 +187,11 @@ def resolve_configuration(arguments: argparse.Namespace) -> dict:
     if runtime["log_level"] not in ("DEBUG", "INFO", "WARNING", "ERROR"):
         raise ValueError("Unsupported runtime.log_level.")
     runtime.setdefault("cpu_interop_threads", 1)
+    runtime.setdefault("figure_regeneration", "missing")
+    if runtime["figure_regeneration"] not in ("missing", "all"):
+        raise ValueError(
+            "runtime.figure_regeneration must be missing or all."
+        )
     for key in ("cpu_threads", "cpu_interop_threads"):
         if type(runtime[key]) is not int or runtime[key] < 1:
             raise ValueError(f"runtime.{key} must be a positive integer.")

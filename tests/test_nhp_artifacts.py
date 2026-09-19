@@ -23,7 +23,7 @@ LOG_SCRIPT = r"""
 import logging, os, sys
 from pathlib import Path
 from experiments.runtime import (
-    configure_logging, lifecycle_scope, session_logging,
+    configure_logging, lifecycle_scope, session_logging, stage_scope,
 )
 root = Path(sys.argv[1])
 configure_logging(root, 'INFO')
@@ -36,12 +36,19 @@ for session in ('session_a', 'session_b'):
             for fold in (0, 1):
                 with lifecycle_scope(root, session, fold):
                     for case in ('small', 'large'):
-                        token = f'{session}-{fold}-{case}'
-                        logging.getLogger('test.child').info('python-' + token)
-                        print('stdout-' + token)
-                        print('stderr-' + token, file=sys.stderr)
-                        os.write(1, ('native1-' + token + '\n').encode())
-                        os.write(2, ('native2-' + token + '\n').encode())
+                        with lifecycle_scope(root, session, fold, case):
+                            token = f'{session}-{fold}-{case}'
+                            logging.getLogger('test.child').info(
+                                'python-' + token
+                            )
+                            print('stdout-' + token)
+                            print('stderr-' + token, file=sys.stderr)
+                            os.write(1, ('native1-' + token + '\n').encode())
+                            os.write(2, ('native2-' + token + '\n').encode())
+with stage_scope(root, 'preprocess', session='preprocess_a', fold=0) as state:
+    state['completed'] = 2
+with stage_scope(root, 'plot', analysis_id='analysis_a') as state:
+    state['completed'] = 1
 if len(sys.argv) > 2:
     with lifecycle_scope(root, 'session_bad'):
         with session_logging(root, 'session_bad'):
@@ -85,6 +92,21 @@ def test_session_output_has_one_owner(tmp_path, failure):
                         assert message in text[f"sessions/{session}.log"]
         assert "Started session=session_a fold=0" in text["experiment.log"]
         assert "Finished session=session_b fold=1" in text["experiment.log"]
+        assert (
+            "Finished stage=preprocess session=preprocess_a fold=0; "
+            "previews=2 failed=0"
+        ) in text["experiment.log"]
+        assert (
+            "Finished stage=plot analysis=analysis_a; reports=1 failed=0"
+        ) in text["experiment.log"]
+        for session in ("session_a", "session_b"):
+            detail = str((root / "sessions" / f"{session}.log").resolve())
+            assert text["experiment.log"].count(detail) == 1
+            for fold in (0, 1):
+                for model in ("small", "large"):
+                    label = f"session={session} fold={fold} model={model}"
+                    assert f"Started {label}" in text["experiment.log"]
+                    assert f"Finished {label}" in text["experiment.log"]
         if failure:
             assert all_text.count("ValueError: unique-failure-marker") == 1
             assert "Failed session=session_bad" in text["experiment.log"]

@@ -10,7 +10,7 @@ import csv
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 import sys
@@ -84,16 +84,17 @@ def workflow(tmp_path, monkeypatch):
 
         def fit(self, features, columns, dimensions, directory):
             calls["fit"] += 1
+            self.nx = dimensions["nx"]
             np.savez_compressed(
                 artifact_path(directory, "fit_indices.npz"),
                 training=window_indices(features, 0, self.length),
             )
 
         def save(self, path):
-            path.write_bytes(b"deterministic-checkpoint")
+            path.write_text(json.dumps({"nx": self.nx}))
 
         def load(self, path):
-            assert path.read_bytes() == b"deterministic-checkpoint"
+            self.nx = json.loads(path.read_text())["nx"]
             calls["load"] += 1
 
         def predict(self, y, u, horizons):
@@ -101,7 +102,9 @@ def workflow(tmp_path, monkeypatch):
             return dict(
                 Y=np.stack([y + 0.1 for _ in horizons]),
                 Z=np.stack([u + 0.1 for _ in horizons]),
-                X=np.stack([y for _ in horizons]),
+                X=np.stack([
+                    np.repeat(y[:, :1], self.nx, axis=1) for _ in horizons
+                ]),
                 valid=np.stack([
                     np.arange(len(y)) % self.length >= h for h in horizons
                 ]),
@@ -231,7 +234,8 @@ def test_rendering_changes_reuse_analysis_and_fit(workflow):
     workflow.run(changed, cases[0], refreshed)
     assert workflow.calls == counts
     assert scientific == hashes(workflow.root / "experiments")
-    assert read_manifest(analysis)["rendering"]["plotting"] == changed["plotting"]
+    rendering = read_manifest(analysis)["rendering"]
+    assert rendering["plotting"] == changed["plotting"]
 
 
 def test_rendering_failure_preserves_fit_and_evaluation(workflow, monkeypatch):
@@ -320,7 +324,7 @@ def test_concurrent_analysis_requests_share_one_fit(workflow):
         ]
         assert all(job.result() for job in jobs)
     assert workflow.calls["fit"] == 1
-    assert workflow.calls["predict"] == 2  # Forecast plus reload check.
+    assert workflow.calls["predict"] == 1
 
 
 def test_fit_identity_uses_training_not_analysis(workflow):
@@ -524,11 +528,11 @@ def test_main_sweeps_share_two_fits_without_common_retraining(
         assert (manifests[0].parent / "summaries" / "summary.csv").exists()
         if name == "latent_dimension_sweep":
             assert workflow.calls["fit"] == 7
-            assert workflow.calls["predict"] == 14
+            assert workflow.calls["predict"] == 7
             saved_latent = hashes(artifacts / "experiments")
         else:
             assert workflow.calls["fit"] == 11
-            assert workflow.calls["predict"] == 22
+            assert workflow.calls["predict"] == 11
             assert all(
                 file_digest(path) == digest
                 for path, digest in saved_latent.items()
@@ -703,3 +707,268 @@ def test_old_model_settings_name_is_not_reused(workflow):
     assert run.exists()
     assert workflow.calls["fit"] == 2
     assert all(file_digest(path) == digest for path, digest in before.items())
+
+
+def configure_main(workflow, monkeypatch, config):
+    """Run a small multi-session/fold grid with real case persistence."""
+    from experiments import runner
+
+    sessions = ["session_a", "session_b"]
+    config["experiment"]["suite"]["nx_values"] = [1, 2]
+    config["experiment"]["selection"] = dict(sessions=sessions, folds=[0, 1])
+    config.update(
+        paths={"artifact_root": str(workflow.root)},
+        runtime=dict(
+            log_level="INFO", device="cpu", cpu_threads=1,
+            cpu_interop_threads=1,
+        ),
+    )
+
+    def load(name):
+        return FeatureSet(
+            workflow.features.arrays,
+            dict(workflow.features.metadata, session=name),
+        )
+
+    def fold(source, number, velocity):
+        return FeatureSet(source.arrays, dict(source.metadata, fold=number))
+
+    dataset = SimpleNamespace(
+        load=load, fold=fold, sessions=lambda: sessions,
+        inventory=lambda: {name: workflow.ids for name in sessions},
+    )
+    original = runner.plugin
+
+    def dispatch(reference, **kwargs):
+        if reference == "experiments.nhp:NHPDataset":
+            return dataset
+        return original(reference, **kwargs)
+
+    monkeypatch.setattr(runner, "plugin", dispatch)
+    monkeypatch.setattr(runner, "configure_device", lambda *a: None)
+    monkeypatch.setattr(runner, "configure_logging", lambda *a: None)
+    monkeypatch.setattr(runner, "session_logging", lambda *a: nullcontext())
+    monkeypatch.setattr(
+        runner, "launch_directory", lambda *a: workflow.root / "logs"
+    )
+    monkeypatch.setattr(runner, "resolve_configuration", lambda args: config)
+    monkeypatch.setattr(
+        sys, "argv", ["runner", "--experiment", "fixture.yaml", "--no-plots"]
+    )
+    return runner
+
+
+def test_preprocess_uses_stage_specific_lifecycle(workflow, monkeypatch):
+    """Preprocessing reports preview work without fitting counters."""
+    runner = configure_main(
+        workflow, monkeypatch, sweep("latent_dimension_sweep")
+    )
+    scopes = []
+
+    @contextmanager
+    def record_stage(*args, **kwargs):
+        state = dict(completed=0, failed=0)
+        scopes.append((args, kwargs, state))
+        yield state
+
+    def forbidden_lifecycle(*args, **kwargs):
+        raise AssertionError("Preprocessing must not use fitting lifecycle.")
+
+    monkeypatch.setattr(runner, "stage_scope", record_stage)
+    monkeypatch.setattr(runner, "lifecycle_scope", forbidden_lifecycle)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "runner",
+            "--experiment",
+            "fixture.yaml",
+            "--stage",
+            "preprocess",
+        ],
+    )
+    runner.main()
+    records = [
+        (kwargs["session"], kwargs.get("fold"), state)
+        for args, kwargs, state in scopes
+        if args[1] == "preprocess"
+    ]
+    assert {
+        (session, fold, state["completed"], state["failed"])
+        for session, fold, state in records
+    } == {
+        ("session_a", None, 4, 0),
+        ("session_a", 0, 2, 0),
+        ("session_a", 1, 2, 0),
+        ("session_b", None, 4, 0),
+        ("session_b", 0, 2, 0),
+        ("session_b", 1, 2, 0),
+    }
+
+
+def test_plot_uses_stage_specific_lifecycle(tmp_path, monkeypatch):
+    """Plot-only runs report one report without fitting lifecycle fields."""
+    from experiments import analysis, runner
+
+    config = sweep("latent_dimension_sweep")
+    config.update(
+        paths={"artifact_root": str(tmp_path / "artifacts")},
+        runtime=dict(
+            log_level="INFO",
+            device="cpu",
+            cpu_threads=1,
+            cpu_interop_threads=1,
+        ),
+    )
+    states = []
+
+    @contextmanager
+    def record_stage(*args, **kwargs):
+        state = dict(completed=0, failed=0)
+        states.append((args, kwargs, state))
+        yield state
+
+    monkeypatch.setattr(
+        runner,
+        "resolve_configuration",
+        lambda args: copy.deepcopy(config),
+    )
+    monkeypatch.setattr(runner, "configure_logging", lambda *args: None)
+    monkeypatch.setattr(
+        runner,
+        "launch_directory",
+        lambda *args: tmp_path / "logs",
+    )
+    monkeypatch.setattr(runner, "stage_scope", record_stage)
+    monkeypatch.setattr(analysis, "find_analysis", lambda *args: tmp_path)
+    monkeypatch.setattr(runner, "plugin", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "runner",
+            "--experiment",
+            "fixture.yaml",
+            "--stage",
+            "plot",
+            "--analysis-id",
+            "analysis_a",
+        ],
+    )
+    runner.main()
+    assert states == [
+        (
+            (tmp_path / "logs", "plot"),
+            {"analysis_id": "analysis_a"},
+            {"completed": 1, "failed": 0},
+        )
+    ]
+
+
+@pytest.mark.parametrize("phase", ["fit", "prediction", "evaluation"])
+def test_model_failure_continues_all_scopes_and_resumes(
+    workflow, monkeypatch, caplog, phase,
+):
+    """A failed model cannot discard successful work or abort later scopes."""
+    from experiments import evaluation, fitting
+
+    caplog.set_level("INFO", logger="experiments.lifecycle")
+    config = sweep("latent_dimension_sweep")
+    runner = configure_main(workflow, monkeypatch, config)
+    target = {
+        "fit": (fitting, "ensure_fit"),
+        "prediction": (fitting, "ensure_predictions"),
+        "evaluation": (evaluation, "evaluate_forecasts"),
+    }[phase]
+    original = getattr(*target)
+    attempts = []
+
+    def fail_once(*args, **kwargs):
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise RuntimeError("injected model failure")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(*target, fail_once)
+    with pytest.raises(RuntimeError, match="experiment failures"):
+        runner.main()
+    path = next((workflow.root / "analysis").glob("*/*/manifest.json"))
+    manifest = read_manifest(path.parent)
+    failed = [m for m in manifest["members"].values() if m["state"] == "failed"]
+    assert len(failed) == 1
+    assert failed[0]["failure_phase"] == phase
+    assert failed[0]["error_type"] == "RuntimeError"
+    complete = [
+        m for m in manifest["members"].values() if m["state"] == "complete"
+    ]
+    assert len(complete) == 7
+    assert len(attempts) == 8
+    assert len([r for r in caplog.records if r.exc_info]) == 1
+    completed = {
+        path: digest
+        for member in manifest["members"].values()
+        if member["state"] == "complete"
+        for path, digest in hashes(workflow.root / member["fit"]).items()
+    }
+    lifecycle = [
+        r.message for r in caplog.records if r.name == "experiments.lifecycle"
+    ]
+    assert sum(m.startswith("Started") and "model=" in m
+               for m in lifecycle) == 8
+    assert any(m.startswith("Failed") and f"phase={phase}" in m
+               for m in lifecycle)
+    assert any("Finished with failures session=session_a;" in m
+               and "completed=3 reused=0 failed=1" in m for m in lifecycle)
+    fitted = workflow.calls["fit"]
+    runner.main()
+    assert workflow.calls["fit"] == fitted + int(phase == "fit")
+    reused = [r for r in caplog.records if r.message.startswith("Reused")]
+    assert len(reused) == 7
+    assert all(file_digest(p) == digest for p, digest in completed.items())
+    assert all(
+        m["state"] == "complete"
+        for m in read_manifest(path.parent)["members"].values()
+    )
+
+
+def test_interrupt_is_not_contained_as_model_failure(workflow, monkeypatch):
+    """Operator interruption must stop without starting subsequent models."""
+    from experiments import fitting
+
+    runner = configure_main(
+        workflow, monkeypatch, sweep("latent_dimension_sweep")
+    )
+    attempts = []
+
+    def interrupt(*args, **kwargs):
+        attempts.append(True)
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(fitting, "ensure_fit", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        runner.main()
+    assert len(attempts) == 1
+    assert not workflow.calls["fit"]
+
+
+def test_certified_prediction_reuse_preserves_bundle(workflow):
+    """Verification-only provenance accepts just its certified predecessor."""
+    from experiments import implementation
+
+    config = sweep("latent_dimension_sweep")
+    old, new = next(iter(implementation.INFERENCE_REUSE))
+    assert implementation.implementation_signatures()[
+        "inference_implementation"
+    ] == new
+    config["inference_implementation"] = old
+    cases, directory = workflow.prepare(config)
+    workflow.run(config, cases[0], directory)
+    before = hashes(workflow.root / "experiments")
+    calls = dict(workflow.calls)
+    config["inference_implementation"] = new
+    workflow.run(config, cases[0], directory)
+    assert workflow.calls == calls
+    assert before == hashes(workflow.root / "experiments")
+    config["inference_implementation"] = "unrelated-implementation"
+    with pytest.raises(ValueError, match="provenance mismatch"):
+        workflow.run(config, cases[0], directory)

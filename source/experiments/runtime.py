@@ -44,6 +44,11 @@ def launch_directory(settings: dict, stage: str) -> Path:
 
 LIFECYCLE_LOGGER = "experiments.lifecycle"
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+STAGE_ACTIVITY = {
+    "plot": "reports",
+    "preview": "preview",
+    "preprocess": "previews",
+}
 
 
 @contextmanager
@@ -107,8 +112,9 @@ def lifecycle_scope(
     directory: Path,
     session: str,
     fold: int | None = None,
+    model: str | None = None,
 ) -> Iterator[dict]:
-    """Record a session/fold boundary without copying detailed session text.
+    """Record session, fold and model boundaries with terminal outcomes.
 
     Parameters
     ----------
@@ -118,25 +124,111 @@ def lifecycle_scope(
         Session identifier.
     fold : int, optional
         Fold identifier; default None denotes the entire session.
+    model : str, optional
+        Model setting name; default None denotes a session or fold.
 
     Yields
     ------
     dict
-        Set skipped=True when every selected unit reused completed work.
+        Outcome counts (completed/reused/failed) and active model phase.
+        Set skipped=True for a reused model.
     """
     logger = logging.getLogger(LIFECYCLE_LOGGER)
     label = f"session={session}" + (f" fold={fold}" if fold is not None else "")
-    path = (directory / "sessions" / f"{session}.log").resolve()
-    state = {"skipped": False}
-    logger.info("Started %s; details: %s", label, path)
+    if model is not None:
+        label += f" model={model}"
+    state = dict(skipped=False, completed=0, reused=0, failed=0, phase="setup")
+    if fold is None and model is None:
+        path = (directory / "sessions" / f"{session}.log").resolve()
+        logger.info("Started %s; details: %s", label, path)
+    else:
+        logger.info("Started %s", label)
     try:
         yield state
     except BaseException:
-        logger.error("Failed %s; details: %s", label, path)
+        logger.error("Failed %s; phase=%s", label, state["phase"])
         raise
     else:
-        event = "Skipped completed" if state["skipped"] else "Finished"
-        logger.info("%s %s; details: %s", event, label, path)
+        if state["failed"]:
+            event = "Failed" if model else "Finished with failures"
+        else:
+            event = "Reused" if state["skipped"] else "Finished"
+        counts = " ".join(
+            f"{key}={state[key]}" for key in ("completed", "reused", "failed")
+        )
+        detail = counts
+        if model and state["failed"]:
+            detail += f" phase={state['phase']}"
+        level = logging.ERROR if state["failed"] else logging.INFO
+        logger.log(level, "%s %s; %s", event, label, detail)
+
+
+@contextmanager
+def stage_scope(
+    directory: Path,
+    stage: str,
+    session: str | None = None,
+    fold: int | None = None,
+    analysis_id: str | None = None,
+) -> Iterator[dict[str, int]]:
+    """Record a non-fitting stage using its own work counters.
+
+    Parameters
+    ----------
+    directory : Path
+        Launch log directory.
+    stage : str
+        One of preprocess, preview, or plot.
+    session : str, optional
+        Session identifier for preprocessing; default None.
+    fold : int, optional
+        Fold identifier for preprocessing; default None.
+    analysis_id : str, optional
+        Requested analysis identifier for plotting; default None.
+
+    Yields
+    ------
+    dict of int
+        Completed and failed stage work counts.
+    """
+    if stage not in STAGE_ACTIVITY:
+        raise ValueError(f"Unsupported lifecycle stage: {stage}.")
+    if fold is not None and session is None:
+        raise ValueError("A preprocessing fold requires a session.")
+    if analysis_id is not None and stage != "plot":
+        raise ValueError("An analysis ID is only valid for the plot stage.")
+    logger = logging.getLogger(LIFECYCLE_LOGGER)
+    parts = [f"stage={stage}"]
+    if session is not None:
+        parts.append(f"session={session}")
+    if fold is not None:
+        parts.append(f"fold={fold}")
+    if analysis_id is not None:
+        parts.append(f"analysis={analysis_id}")
+    label = " ".join(parts)
+    state = dict(completed=0, failed=0)
+    if session is not None and fold is None:
+        path = (directory / "sessions" / f"{session}.log").resolve()
+        logger.info("Started %s; details: %s", label, path)
+    else:
+        logger.info("Started %s", label)
+    try:
+        yield state
+    except BaseException:
+        logger.error("Failed %s", label)
+        raise
+    else:
+        event = "Finished with failures" if state["failed"] else "Finished"
+        level = logging.ERROR if state["failed"] else logging.INFO
+        logger.log(
+            level,
+            "%s %s; %s=%d failed=%d",
+            event,
+            label,
+            STAGE_ACTIVITY[stage],
+            state["completed"],
+            state["failed"],
+        )
 
 
 def configure_logging(directory: Path, level: str) -> None:

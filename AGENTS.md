@@ -2,7 +2,9 @@
 
 ## Break-point restoration
 
-All experiments should store artifacts immediately after the results of one fit (the smallest unit of experiment, e.g., be one neural or non-neural fitting of a single random seed) are obtained so that interrupted runs can be restored. However, failed, invalid, or interrupted run artifacts should be removed or quanrantined in the next invocation, starting a fresh experiment on that fit.
+All experiments should store artifacts immediately after the results of one fit (the smallest unit of experiment, e.g., be one neural or non-neural fitting of a single random seed) are obtained to avoid losing results of already completed runs. However, failed, invalid, or interrupted run artifacts should be removed or quanrantined in the next invocation, starting a fresh experiment on that fit.
+
+If the failure in one experiment is not fatal (definitely affects the following fits), please report failure and continue trying following experiment rather than stopping the whole process.
 
 NEVER retrain a model on a data / fold / session that already have completion records under the same configurations. (changines in invocation parameters like number of GPU/CPUs used should NOT restart already completed experiments)
 

@@ -26,6 +26,7 @@ from .previews import preprocessing_previews
 from .runtime import (
     session_logging,
     lifecycle_scope,
+    stage_scope,
     configure_device,
     configure_logging,
     launch_directory,
@@ -128,6 +129,7 @@ def run_case(
     root: Path,
     analysis_root: Path,
     rendering_errors: list[str] | None = None,
+    progress: dict | None = None,
 ) -> bool:
     """Complete a shared fit and publish this analysis's scoring separately."""
     from .analysis import member_key, read_manifest
@@ -135,6 +137,8 @@ def run_case(
     from .diagnostics import history_monitor, render_safely
     from .presentation import presentation
 
+    progress = {} if progress is None else progress
+    progress["phase"] = "setup"
     features = dataset.fold(session, fold, settings["velocity"])
     identity, columns = case_identity(
         features, fold, case, snapshots, shared_order
@@ -164,11 +168,18 @@ def run_case(
         run,
         columns,
     )
+    progress["phase"] = "fit"
     with history_monitor(
         run,
         style,
         errors,
         enabled=not arguments.no_plots and snapshots["plotting"]["enabled"],
+        regenerate=(
+            snapshots.get("runtime", {}).get(
+                "figure_regeneration", "missing"
+            )
+            == "all"
+        ),
     ):
         trained = ensure_fit(run, identity, features, columns, arguments, gpu)
     from .previews import fitted_previews
@@ -186,10 +197,15 @@ def run_case(
             columns,
         )
     horizons = canonical_horizons(settings["horizons"])
-    predictions = ensure_predictions(run, identity, features, columns, horizons)
+    progress["phase"] = "prediction"
+    predictions = ensure_predictions(
+        run, identity, features, columns, horizons
+    )
+    progress["phase"] = "evaluation"
     scored = score_member(
         analysis_root, key, run, predictions, identity, horizons, root
     )
+    progress["phase"] = "rendering"
     if rendering_errors is None and errors:
         raise RuntimeError("Rendering failed: " + "; ".join(errors))
     return trained or scored
@@ -259,7 +275,8 @@ def score_member(
                 analysis_root,
                 key,
                 dict(
-                    state="complete",
+                    state="complete", error=None, error_type=None,
+                    failure_phase=None,
                     metrics=str(metrics.relative_to(analysis_root)),
                     metrics_sha256=file_digest(metrics),
                     predictions=str(predictions.relative_to(root.resolve())),
@@ -295,7 +312,9 @@ def main() -> None:
     if arguments.stage == "preview":
         from .preview_regeneration import regenerate_previews
 
-        regenerate_previews(snapshots)
+        with stage_scope(arguments.log_directory, "preview") as state:
+            regenerate_previews(snapshots)
+            state["completed"] = 1
         return
     experiment = snapshots["experiment"]
     data = snapshots["data"]
@@ -310,13 +329,21 @@ def main() -> None:
     if arguments.stage == "plot":
         from .analysis import find_analysis
 
-        analysis_root = find_analysis(root, snapshots, arguments.analysis_id)
-        plugin(
-            experiment["report_plugin"],
-            root=analysis_root,
-            settings=plotting,
-            sample_rate=data["sampling_rate_hz"],
-        )
+        with stage_scope(
+            arguments.log_directory,
+            "plot",
+            analysis_id=arguments.analysis_id,
+        ) as state:
+            analysis_root = find_analysis(
+                root, snapshots, arguments.analysis_id
+            )
+            plugin(
+                experiment["report_plugin"],
+                root=analysis_root,
+                settings=plotting,
+                sample_rate=data["sampling_rate_hz"],
+            )
+            state["completed"] = 1
         return
     dataset = plugin(data["plugin"], settings=data)
     sessions = dataset.sessions()
@@ -354,6 +381,9 @@ def main() -> None:
     from .presentation import presentation
 
     rendering_errors = []
+    model_errors = []
+    attempted = set()
+    rendered = set()
     if arguments.stage != "preprocess":
         analysis_root = plan_analysis(
             dataset, selected, folds, cases, snapshots, shared, root
@@ -363,15 +393,34 @@ def main() -> None:
 
         write_model_summary(analysis_root)
     for session in selected:
-        with lifecycle_scope(arguments.log_directory, session):
+        session_context = (
+            stage_scope(
+                arguments.log_directory,
+                "preprocess",
+                session=session,
+            )
+            if arguments.stage == "preprocess"
+            else lifecycle_scope(arguments.log_directory, session)
+        )
+        with session_context as session_state:
             with session_logging(arguments.log_directory, session):
                 source = dataset.load(session)
                 for fold in folds:
-                    with lifecycle_scope(
-                        arguments.log_directory,
-                        session,
-                        fold,
-                    ) as fold_state:
+                    fold_context = (
+                        stage_scope(
+                            arguments.log_directory,
+                            "preprocess",
+                            session=session,
+                            fold=fold,
+                        )
+                        if arguments.stage == "preprocess"
+                        else lifecycle_scope(
+                            arguments.log_directory,
+                            session,
+                            fold,
+                        )
+                    )
+                    with fold_context as fold_state:
                         if arguments.stage == "preprocess":
                             features = dataset.fold(
                                 source,
@@ -393,6 +442,7 @@ def main() -> None:
                                         "args_base"
                                     ]["sequence_length"],
                                 )
+                                previous_errors = len(rendering_errors)
                                 render_safely(
                                     rendering_errors,
                                     str(run.resolve()),
@@ -403,66 +453,87 @@ def main() -> None:
                                     run,
                                     columns,
                                 )
+                                outcome = (
+                                    "failed"
+                                    if len(rendering_errors) > previous_errors
+                                    else "completed"
+                                )
+                                fold_state[outcome] += 1
+                                session_state[outcome] += 1
                             LOGGER.info(
                                 "Cached fold %s at %s", fold, features.path
                             )
                             continue
-                        changed = []
-                        for case in cases:
-                            try:
-                                changed.append(
-                                    run_case(
-                                        dataset,
-                                        source,
-                                        fold,
-                                        case,
-                                        settings,
-                                        arguments,
-                                        shared,
-                                        snapshots,
-                                        gpu,
-                                        root,
-                                        analysis_root,
-                                        rendering_errors,
-                                    )
-                                )
-                            except BaseException as error:
-                                from .analysis import (
-                                    member_key,
-                                    read_manifest,
-                                    update_member,
-                                )
+                        from .analysis import (
+                            member_key, read_manifest, update_member,
+                        )
 
-                                key = member_key(case, session, fold)
-                                member = read_manifest(analysis_root)[
-                                    "members"
-                                ][key]
-                                if member["state"] != "complete":
-                                    update_member(
-                                        analysis_root,
-                                        key,
-                                        dict(
-                                            state="failed",
-                                            error=str(error),
-                                        ),
+                        for case in cases:
+                            key = member_key(case, session, fold)
+                            with lifecycle_scope(
+                                arguments.log_directory, session, fold,
+                                case["name"],
+                            ) as model_state:
+                                try:
+                                    changed = run_case(
+                                        dataset, source, fold, case, settings,
+                                        arguments, shared, snapshots, gpu,
+                                        root, analysis_root, rendering_errors,
+                                        model_state,
                                     )
-                                raise
-                            finally:
-                                write_model_summary(analysis_root)
-                                render_safely(
-                                    rendering_errors,
-                                    "Analysis report",
-                                    plugin,
-                                    experiment["report_plugin"],
-                                    root=analysis_root,
-                                    settings=plotting,
-                                    sample_rate=data["sampling_rate_hz"],
-                                )
-                        fold_state["skipped"] = not any(changed)
-    if rendering_errors:
+                                except Exception as error:
+                                    phase = model_state.get("phase", "setup")
+                                    message = (
+                                        f"{key} [{phase}]: "
+                                        f"{type(error).__name__}: {error}"
+                                    )
+                                    model_errors.append(message)
+                                    model_state["failed"] = 1
+                                    LOGGER.exception(
+                                        "Model failed: %s", message
+                                    )
+                                    member = read_manifest(analysis_root)[
+                                        "members"
+                                    ][key]
+                                    if member["state"] != "complete":
+                                        update_member(
+                                            analysis_root, key,
+                                            dict(
+                                                state="failed",
+                                                failure_phase=phase,
+                                                error_type=type(error).__name__,
+                                                error=str(error),
+                                            ),
+                                        )
+                                else:
+                                    model_state["skipped"] = not changed
+                                    outcome = (
+                                        "completed" if changed else "reused"
+                                    )
+                                    model_state[outcome] = 1
+                                for outcome in (
+                                    "completed", "reused", "failed"
+                                ):
+                                    count = model_state.get(outcome, 0)
+                                    fold_state[outcome] = (
+                                        fold_state.get(outcome, 0) + count
+                                    )
+                                    session_state[outcome] = (
+                                        session_state.get(outcome, 0) + count
+                                    )
+                            attempted.add(key)
+                            render_safely(
+                                rendering_errors, "Analysis report", plugin,
+                                experiment["report_plugin"],
+                                root=analysis_root, settings=plotting,
+                                sample_rate=data["sampling_rate_hz"],
+                                attempted=attempted, rendered=rendered,
+                            )
+    if model_errors or rendering_errors:
+        details = model_errors + rendering_errors
         raise RuntimeError(
-            "Scientific results remain saved; rendering failed:\n"
-            + "\n".join(rendering_errors)
+            "Scientific results remain saved; experiment failures:\n"
+            + "\n".join(details)
         )
 
 

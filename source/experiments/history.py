@@ -19,7 +19,10 @@ from .cache import file_digest, fingerprint, writer_lock
 from .presentation import METRIC_LABELS, presentation, save_figure, style_axis
 
 LOGGER = logging.getLogger(__name__)
-STEP_METRIC = re.compile(r"rnn_(\d+)step_(loss|MSE|R2|CC)$")
+STEP_METRIC = re.compile(
+    r"rnn_(?:(?P<output>\d+)_)?"
+    r"(?P<horizon>\d+)step_(?P<metric>loss|MSE|R2|CC)$"
+)
 CANONICAL = {"loss": "total_loss", "MSE": "mse", "R2": "r2", "CC": "cc"}
 
 
@@ -44,6 +47,7 @@ def history_figure(
     steps: list[int],
     title: str,
     style: dict,
+    output: str | None = None,
 ) -> object:
     """Build an overlay or shared-axis horizon figure from actual epoch rows."""
     epochs = np.array([row["epoch"] for row in rows])
@@ -65,7 +69,10 @@ def history_figure(
             ("Training", "Validation"),
         ):
             for horizon in steps:
-                key = f"{prefix}rnn_{horizon}step_{metric}"
+                output_prefix = "" if output is None else f"{output}_"
+                key = (
+                    f"{prefix}rnn_{output_prefix}{horizon}step_{metric}"
+                )
                 axis.plot(
                     epochs,
                     metric_values(rows, key),
@@ -111,8 +118,72 @@ def history_figure(
     return figure
 
 
-def render_component(directory: Path, settings: dict | None = None) -> None:
-    """Render completed component attempts without changing their history."""
+def horizon_definitions(
+    keys: set[str],
+) -> list[tuple[str, list[int], str, str | None]]:
+    """Group logged step metrics by metric and optional output index.
+
+    Parameters
+    ----------
+    keys : set of str
+        Metric names from one component attempt.
+
+    Returns
+    -------
+    list of tuple
+        Metric name, sorted horizons, output filename stem, and optional
+        recurrent output index for each horizon plot.
+    """
+    groups = {}
+    for key in keys:
+        match = STEP_METRIC.fullmatch(key)
+        if match is None:
+            continue
+        group = (match["metric"], match["output"])
+        groups.setdefault(group, set()).add(int(match["horizon"]))
+    definitions = []
+    for metric in CANONICAL:
+        outputs = sorted(
+            (
+                (output, sorted(steps))
+                for (name, output), steps in groups.items()
+                if name == metric
+            ),
+            key=lambda item: "" if item[0] is None else item[0],
+        )
+        for output, steps in outputs:
+            qualifier = (
+                ""
+                if len(outputs) == 1
+                else f"_output_{output or 'default'}"
+            )
+            definitions.append(
+                (
+                    metric,
+                    steps,
+                    f"{metric.lower()}{qualifier}_by_horizon",
+                    output,
+                )
+            )
+    return definitions
+
+
+def render_component(
+    directory: Path,
+    settings: dict | None = None,
+    regenerate: bool = False,
+) -> None:
+    """Render missing component plots or explicitly redraw the full set.
+
+    Parameters
+    ----------
+    directory : Path
+        Completed component directory containing history.jsonl.
+    settings : dict, optional
+        Figure presentation settings; default None uses shared settings.
+    regenerate : bool, optional
+        Whether to redraw valid existing PNGs; default is False.
+    """
     style = presentation(settings)
     history = directory / "history.jsonl"
     rows = [json.loads(line) for line in history.read_text().splitlines()]
@@ -133,39 +204,23 @@ def render_component(directory: Path, settings: dict | None = None) -> None:
             selected = [row for row in rows if row["attempt"] == attempt]
             keys = set().union(*(row["metrics"].keys() for row in selected))
             definitions = [
-                (metric, [], filename)
+                (metric, [], filename, None)
                 for metric, filename in CANONICAL.items()
                 if metric in keys
             ]
-            for metric in CANONICAL:
-                steps = sorted(
-                    {
-                        int(match[1])
-                        for key in keys
-                        if (match := STEP_METRIC.fullmatch(key))
-                        and match[2] == metric
-                    }
-                )
-                if steps:
-                    definitions.append(
-                        (
-                            metric,
-                            steps,
-                            f"{metric.lower()}_by_horizon",
-                        )
-                    )
-            for metric, steps, filename in definitions:
+            definitions.extend(horizon_definitions(keys))
+            for metric, steps, filename, output in definitions:
                 path = (
                     directory
                     / "plots"
                     / f"attempt_{attempt}"
                     / (filename + ".png")
                 )
-                if path.exists():
+                if path.exists() and not regenerate:
                     try:
                         with Image.open(path) as saved:
-                            if saved.info.get("BRAID-rendering") == signature:
-                                continue
+                            saved.verify()
+                        continue
                     except OSError:
                         LOGGER.warning("Redrawing damaged PNG: %s", path)
                 figure = history_figure(
@@ -174,5 +229,6 @@ def render_component(directory: Path, settings: dict | None = None) -> None:
                     steps,
                     f"{directory.name}\n{METRIC_LABELS[metric.lower()]}",
                     style,
+                    output,
                 )
                 save_figure(figure, path, style, signature)
