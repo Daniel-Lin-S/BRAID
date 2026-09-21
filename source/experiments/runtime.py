@@ -8,6 +8,7 @@ CPU execution must be explicitly requested; GPU failures are not hidden.
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 import logging
+from time import monotonic
 from typing import Iterator
 from uuid import uuid4
 import os
@@ -143,6 +144,8 @@ def lifecycle_scope(
         logger.info("Started %s; details: %s", label, path)
     else:
         logger.info("Started %s", label)
+    started = monotonic()
+    written = process_write_bytes()
     try:
         yield state
     except BaseException:
@@ -161,6 +164,13 @@ def lifecycle_scope(
             detail += f" phase={state['phase']}"
         level = logging.ERROR if state["failed"] else logging.INFO
         logger.log(level, "%s %s; %s", event, label, detail)
+    finally:
+        after = process_write_bytes()
+        delta = None if written is None or after is None else after - written
+        logger.info(
+            "Timing %s; elapsed_seconds=%.3f write_bytes=%s",
+            label, monotonic() - started, delta,
+        )
 
 
 @contextmanager
@@ -281,17 +291,20 @@ def thread_environment(threads: int, inter_threads: int) -> dict[str, str]:
     return result
 
 
-def select_gpu(request: str) -> dict:
-    """Resolve a physical GPU within CUDA_VISIBLE_DEVICES restrictions.
+def select_gpus(request: str, count: int = 1) -> list[dict]:
+    """Rank physical GPUs within CUDA_VISIBLE_DEVICES restrictions.
 
     Parameters
     ----------
     request : str
         auto, a physical GPU index, or a full GPU UUID.
 
+    count : int, optional
+        Number of distinct GPUs to return; default 1.
+
     Returns
     -------
-    dict
+    list of dict
         Physical index, UUID, free memory in MiB and utilization percentage.
 
     Raises
@@ -345,20 +358,30 @@ def select_gpu(request: str) -> dict:
             "No requested GPU is visible. Check CUDA_VISIBLE_DEVICES "
             "or use --device cpu for explicit CPU execution."
         )
-    return max(
+    if count < 1 or len(devices) < count:
+        raise RuntimeError(
+            f"Requested {count} GPUs, but only {len(devices)} are visible."
+        )
+    return sorted(
         devices,
         key=lambda d: (
-            d["free_memory_mib"],
-            -d["utilization_percent"],
-            -d["index"],
+            -d["free_memory_mib"],
+            d["utilization_percent"],
+            d["index"],
         ),
-    )
+    )[:count]
+
+
+def select_gpu(request: str) -> dict:
+    """Select one visible GPU by free memory, utilization, then index."""
+    return select_gpus(request)[0]
 
 
 def configure_device(
     device: str,
     threads: int,
     inter_threads: int = 1,
+    selected_gpu: dict | None = None,
 ) -> dict:
     """Configure CPU/CUDA placement and verify a forward/backward operation.
 
@@ -371,12 +394,17 @@ def configure_device(
     inter_threads : int, optional
         TensorFlow inter-operation threads; default is 1.
 
+    selected_gpu : dict, optional
+        Preselected physical GPU metadata; default None queries discovery.
+
     Returns
     -------
     dict
         Selected device, thread limits, TensorFlow build and gradient probe.
     """
-    selected = None if device == "cpu" else select_gpu(device)
+    selected = selected_gpu
+    if selected is None and device != "cpu":
+        selected = select_gpu(device)
     os.environ["CUDA_VISIBLE_DEVICES"] = (
         "-1" if selected is None else selected["uuid"]
     )
@@ -418,3 +446,14 @@ def configure_device(
     )
     logging.getLogger(__name__).info("Execution device: %s", metadata)
     return metadata
+
+
+def process_write_bytes() -> int | None:
+    """Read process storage writes, or report unavailable OS accounting."""
+    try:
+        for line in Path("/proc/self/io").read_text().splitlines():
+            if line.startswith("write_bytes:"):
+                return int(line.split()[1])
+    except (OSError, ValueError):
+        pass
+    return None

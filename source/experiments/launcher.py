@@ -2,12 +2,13 @@
 
 Each launch creates console.log for launch diagnostics, experiment.log for
 session/fold lifecycle notices, and flat sessions/<session>.log detail files.
-launch.json records the invocation. Detached workers start a new OS session.
+launch.json records the invocation. Workers start an independent OS session.
 Dry runs print resolved settings and do not create logs or artifacts.
 """
 
 import json
 import os
+import signal
 from pathlib import Path
 import subprocess
 import sys
@@ -58,7 +59,7 @@ def main() -> None:
             stdout=stream if args.detach else subprocess.PIPE,
             stderr=subprocess.STDOUT,
             env=environment,
-            start_new_session=args.detach,
+            start_new_session=True,
             text=True,
         )
         metadata["pid"] = process.pid
@@ -74,7 +75,7 @@ def main() -> None:
                     print(line, end="", flush=True)
                 returncode = process.wait()
             except KeyboardInterrupt:
-                process.terminate()
+                process.send_signal(signal.SIGINT)
                 process.wait()
                 raise
             if returncode:

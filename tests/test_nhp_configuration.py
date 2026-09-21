@@ -202,3 +202,34 @@ def test_yaml_suffix_does_not_change_semantics(tmp_path):
     assert resolved[0] == resolved[1]
     assert resolved[0]["experiment"]["seed"] == 17
     assert resolved[0]["model"]["training"]["training_batch_size"] == 32
+
+
+@pytest.mark.parametrize("workers", [0, -1, True, 1.5, "4"])
+def test_invalid_parallel_workers(tmp_path, workers):
+    """Reject ambiguous or nonpositive worker allocations."""
+    local = local_settings(tmp_path)
+    settings = read_yaml(local)
+    settings["runtime"]["parallel_workers"] = workers
+    local.write_text(yaml.safe_dump(settings))
+    with pytest.raises(ValueError, match="parallel_workers"):
+        resolve("latent_dimension_sweep.yaml", local)
+
+
+def test_parallel_workers_default_override_and_explicit_device(tmp_path):
+    """Serial is default; a CLI count overrides local GPU allocation."""
+    local = local_settings(tmp_path)
+    assert resolve("latent_dimension_sweep.yaml", local)["runtime"][
+        "parallel_workers"
+    ] == 1
+    experiment = local.parent / "latent_dimension_sweep.yaml"
+    args = argument_parser().parse_args([
+        "--experiment", str(experiment), "--parallel-workers", "4",
+    ])
+    assert resolve_configuration(args)["runtime"]["parallel_workers"] == 4
+    for device in ("cpu", "0", "GPU-example"):
+        args.device = device
+        with pytest.raises(ValueError, match="device=auto"):
+            resolve_configuration(args)
+        args.parallel_workers = 1
+        assert resolve_configuration(args)["runtime"]["device"] == device
+        args.parallel_workers = 4

@@ -33,3 +33,36 @@ adding training callbacks. Rendering failures are collected separately from
 scientific fit completion. `preview_regeneration.py`,
 `preview_publication.py`, `preview_rendering.py`, and
 `signal_previews.py` own saved-preview regeneration and display details.
+
+## Parallel fitting
+
+`runtime.parallel_workers` defaults to 1 and accepts a positive integer;
+`--parallel-workers` overrides it. Multiple workers require `device: auto`.
+Only fitting uses the pool; other stages execute serially. Each worker has
+the configured CPU thread limits, so total CPU demand scales with workers.
+
+The coordinator ranks visible GPUs once by descending free memory, ascending
+utilization, then physical index, and requires enough distinct devices.
+Selection respects `CUDA_VISIBLE_DEVICES` but does not reserve resources
+against unrelated jobs. Assignments remain fixed for the invocation.
+
+A CPU-only reporting child resolves the complete analysis membership. The
+coordinator never initializes TensorFlow. Sessions with more unresolved models
+run first, with sample count as the tie-breaker. Completed sessions still pass
+through validation and reuse. Each persistent spawned GPU process receives
+one session at a time and executes its folds and models sequentially.
+
+Workers own their session logs, including native output. A logging queue sends
+lifecycle events to the coordinator's sole `experiment.log` writer. Session
+completion triggers serialized reports in that CPU child; pending sessions
+remain deferred. Final reporting runs after all session attempts finish.
+
+Model failures are collected while independent work continues. Shared setup
+errors, worker crashes, and interrupts cancel dispatch and stop worker process
+groups, including component renderers. Completed artifacts remain available
+for normal validated reuse. Worker count and GPU allocation do not enter
+scientific identity.
+
+Launch diagnostics record assignments, elapsed session/model time, and Linux
+process write-byte deltas (unavailable on unsupported systems). These counters
+include all process writes and cannot isolate checkpoint callback time.

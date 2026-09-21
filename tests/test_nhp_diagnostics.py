@@ -79,18 +79,24 @@ def test_horizon_layout_colors_and_axes(tmp_path):
 def test_analysis_catalogue_and_undefined_gaps(tmp_path):
     specifications = []
     for name, count in (
-        ("latent_dimension_sweep", 12),
+        ("latent_dimension_sweep", 6),
         ("neural_population_sweep", 6),
     ):
         settings = read_yaml(CONFIGURATION / "plotting" / f"{name}.yaml")
         specs = curve_specs(settings)
         assert len(specs) == count
         specifications.extend(specs)
-    assert len({spec["name"] for spec in specifications}) == 18
-    spec = next(
-        s
-        for s in specifications
-        if s["name"] == ("neural_r2_vs_nx_horizon4_full")
+    assert len({spec["name"] for spec in specifications}) == 12
+    spec = dict(
+        name="neural_r2_vs_nx_horizon4_full",
+        parameter="nx",
+        group=None,
+        where=dict(
+            target="neural",
+            metric="r2",
+            horizon=4,
+            evaluation_set="full",
+        ),
     )
     rows = [
         dict(spec["where"], nx=nx, mean=value, sem=None)
@@ -201,11 +207,11 @@ def test_completed_indexed_component_repairs_only_missing_plots(tmp_path):
 
 
 def test_all_comparison_files_are_generated(tmp_path):
-    """Publish all 18 comparison figures using real plot configurations."""
+    """Publish all 12 comparison figures using real plot configurations."""
     from itertools import product
 
     for name, count in (
-        ("latent_dimension_sweep", 12),
+        ("latent_dimension_sweep", 6),
         ("neural_population_sweep", 6),
     ):
         settings = read_yaml(CONFIGURATION / "plotting" / f"{name}.yaml")
@@ -234,6 +240,194 @@ def test_all_comparison_files_are_generated(tmp_path):
         plot_suite(rows, destination, settings)
         assert len(list(destination.glob("*.png"))) == count
         assert not (destination / "behavior_example.png").exists()
+
+
+def test_latent_comparisons_use_panels_and_redundant_group_styles():
+    """Both latent views distinguish every series beyond color alone."""
+    from itertools import product
+
+    settings = read_yaml(
+        CONFIGURATION / "plotting" / "latent_dimension_sweep.yaml"
+    )
+    specs = curve_specs(settings)
+    assert {spec["name"] for spec in specs} == {
+        f"{metric}_vs_{parameter}_by_{group}"
+        for metric in ("cc", "r2", "mse")
+        for parameter, group in (("nx", "horizon"), ("horizon", "nx"))
+    }
+    rows = [
+        dict(
+            nx=nx,
+            horizon=horizon,
+            target=target,
+            metric="cc",
+            population_scale=1.0,
+            evaluation_set="full",
+            mean=0.5,
+            std=0.05,
+        )
+        for nx, horizon, target in product(
+            [1, 2, 4, 16, 64],
+            [1, 2, 4, 8, 16, 32],
+            ["neural", "behavior"],
+        )
+    ]
+    for name, count, labels in (
+        (
+            "cc_vs_nx_by_horizon",
+            6,
+            [
+                "1 step", "2 steps", "4 steps", "8 steps", "16 steps",
+                "32 steps",
+            ],
+        ),
+        (
+            "cc_vs_horizon_by_nx",
+            5,
+            ["nx=1", "nx=2", "nx=4", "nx=16", "nx=64"],
+        ),
+    ):
+        spec = next(item for item in specs if item["name"] == name)
+        figure = metric_curve(rows, spec, STYLE)
+        try:
+            assert len(figure.axes) == 2
+            np.testing.assert_allclose(
+                figure.get_size_inches(), STYLE["horizon_size"]
+            )
+            for axis, target in zip(figure.axes, ("Neural", "Behavior")):
+                lines = [
+                    line for line in axis.lines
+                    if not line.get_label().startswith("_")
+                ]
+                assert axis.get_title() == target
+                assert len(lines) == count
+                assert [line.get_label() for line in lines] == labels
+                assert len({line.get_color() for line in lines}) == count
+                assert len({line.get_marker() for line in lines}) == count
+                assert len({line.get_linestyle() for line in lines}) >= 4
+            if spec["parameter"] == "nx":
+                assert all(
+                    axis.get_xscale() == "log" for axis in figure.axes
+                )
+        finally:
+            plt.close(figure)
+
+
+def test_panel_curve_change_invalidates_existing_png(tmp_path):
+    """Missing-only rendering replaces figures with changed semantics."""
+    from copy import deepcopy
+    from itertools import product
+
+    settings = read_yaml(
+        CONFIGURATION / "plotting" / "latent_dimension_sweep.yaml"
+    )
+    settings["metrics"] = ["cc"]
+    settings["curves"] = settings["curves"][:1]
+    rows = [
+        dict(
+            nx=nx,
+            horizon=horizon,
+            target=target,
+            metric="cc",
+            population_scale=1.0,
+            evaluation_set="full",
+            mean=0.5,
+            sem=0.05,
+        )
+        for nx, horizon, target in product(
+            [1, 2], [1, 2], ["neural", "behavior"]
+        )
+    ]
+    plot_suite(rows, tmp_path, settings)
+    path = tmp_path / "cc_vs_nx_by_horizon.png"
+    original = path.read_bytes()
+    changed = deepcopy(settings)
+    changed["curves"][0]["where"]["target"].reverse()
+    plot_suite(rows, tmp_path, changed)
+    assert path.read_bytes() != original
+
+
+def test_panel_style_change_requires_full_regeneration(tmp_path):
+    """Presentation changes redraw comprehensive figures only when explicit."""
+    from copy import deepcopy
+    from itertools import product
+
+    settings = read_yaml(
+        CONFIGURATION / "plotting" / "latent_dimension_sweep.yaml"
+    )
+    settings["metrics"] = ["cc"]
+    settings["curves"] = settings["curves"][:1]
+    rows = [
+        dict(
+            nx=nx,
+            horizon=horizon,
+            target=target,
+            metric="cc",
+            population_scale=1.0,
+            evaluation_set="full",
+            mean=0.5,
+            sem=0.05,
+        )
+        for nx, horizon, target in product(
+            [1, 2], [1, 2], ["neural", "behavior"]
+        )
+    ]
+    plot_suite(rows, tmp_path, settings)
+    path = tmp_path / "cc_vs_nx_by_horizon.png"
+    original = path.read_bytes()
+    changed = deepcopy(settings)
+    changed["presentation"]["title_font"] += 1
+    plot_suite(rows, tmp_path, changed)
+    assert path.read_bytes() == original
+    plot_suite(rows, tmp_path, changed, regenerate=True)
+    assert path.read_bytes() != original
+
+
+def test_panel_metric_error_does_not_block_other_metrics(
+    tmp_path, monkeypatch,
+):
+    """Each configured panel metric retains an independent render boundary."""
+    from itertools import product
+
+    from experiments import plots
+
+    settings = read_yaml(
+        CONFIGURATION / "plotting" / "latent_dimension_sweep.yaml"
+    )
+    rows = [
+        dict(
+            nx=nx,
+            horizon=horizon,
+            target=target,
+            metric=metric,
+            population_scale=1.0,
+            evaluation_set="full",
+            mean=0.5,
+            sem=0.05,
+        )
+        for nx, horizon, target, metric in product(
+            [1, 2],
+            [1, 2],
+            ["neural", "behavior"],
+            ["cc", "r2", "mse"],
+        )
+    ]
+    original = plots.metric_curve
+
+    def fail_r2(selected, spec, style, partial=False):
+        if spec["where"]["metric"] == "r2":
+            raise ValueError("synthetic R2 comparison failure")
+        return original(selected, spec, style, partial)
+
+    monkeypatch.setattr(plots, "metric_curve", fail_r2)
+    with pytest.raises(RuntimeError, match="synthetic R2 comparison failure"):
+        plot_suite(rows, tmp_path, settings)
+    assert {path.name for path in tmp_path.glob("*.png")} == {
+        "cc_vs_nx_by_horizon.png",
+        "mse_vs_nx_by_horizon.png",
+        "cc_vs_horizon_by_nx.png",
+        "mse_vs_horizon_by_nx.png",
+    }
 
 
 

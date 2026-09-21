@@ -44,6 +44,8 @@ bash scripts/train_nhp.sh --experiment assets/config/nhp/experiments/latent_dime
 `--session` and `--fold` restrict the run. `--device` selects `auto`,
 `cpu`, or a GPU index/UUID; `--cache-mode` selects `reuse`, `rebuild`,
 or `off`. Use `--no-plots` or `--no-previews` to suppress those outputs.
+`--parallel-workers N` (or `runtime.parallel_workers`) runs N sessions on
+distinct GPUs with `device: auto`; the default is one worker.
 `--dry-run` only resolves configuration.
 
 On resume, incomplete figures are repaired automatically, including

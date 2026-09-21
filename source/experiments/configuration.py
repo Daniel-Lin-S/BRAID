@@ -100,6 +100,10 @@ def argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--device", help="auto (most free GPU memory), cpu, GPU index or UUID"
     )
+    parser.add_argument(
+        "--parallel-workers", type=int,
+        help="Concurrent fitting sessions on distinct GPUs (default: 1)",
+    )
     parser.add_argument("--cpu-threads", type=int)
     parser.add_argument("--cpu-interop-threads", type=int)
     parser.add_argument(
@@ -186,6 +190,15 @@ def resolve_configuration(arguments: argparse.Namespace) -> dict:
             runtime[key] = value
     if runtime["log_level"] not in ("DEBUG", "INFO", "WARNING", "ERROR"):
         raise ValueError("Unsupported runtime.log_level.")
+    workers = getattr(arguments, "parallel_workers", None)
+    if workers is not None:
+        runtime["parallel_workers"] = workers
+    runtime.setdefault("parallel_workers", 1)
+    if (type(runtime["parallel_workers"]) is not int
+            or runtime["parallel_workers"] < 1):
+        raise ValueError("runtime.parallel_workers must be positive integer.")
+    if runtime["parallel_workers"] > 1 and runtime["device"] != "auto":
+        raise ValueError("Multiple workers require device=auto.")
     runtime.setdefault("cpu_interop_threads", 1)
     runtime.setdefault("figure_regeneration", "incomplete")
     if runtime["figure_regeneration"] not in ("incomplete", "all"):

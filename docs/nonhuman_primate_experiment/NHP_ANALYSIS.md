@@ -26,6 +26,11 @@ configured curve definitions and renders each comparison after all of its
 contributing members have been attempted in the current invocation. Reused
 validated results count as attempted.
 
+Curves may assign an x-axis parameter, grouped lines, and target panels.
+Grouped lines use color, line style, and markers together. The latent-dimension
+sweep plots both latent dimension by horizon and horizon by latent dimension
+for each configured metric.
+
 Pending contributions defer a comparison silently. Failed contributions are
 shown as annotated gaps or reduced contribution counts and produce one warning
 that names the failed members. A comparison with no finite results is skipped.

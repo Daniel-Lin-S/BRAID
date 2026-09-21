@@ -1083,3 +1083,18 @@ def test_failed_member_recovers_with_chained_prediction_reuse(
     assert workflow.run(config, cases[0], directory)
     assert workflow.calls == calls
     assert read_manifest(directory)["members"][key]["state"] == "complete"
+
+
+def test_worker_count_preserves_all_completed_artifacts(workflow):
+    """Changing only concurrency reuses fits, predictions and evaluation."""
+    config = sweep("latent_dimension_sweep")
+    config["runtime"] = dict(parallel_workers=1, device="auto")
+    cases, analysis = workflow.prepare(config)
+    workflow.run(config, cases[0], analysis)
+    before, calls = hashes(workflow.root), dict(workflow.calls)
+    config["runtime"]["parallel_workers"] = 4
+    _, resumed = workflow.prepare(config)
+    assert resumed == analysis
+    assert not workflow.run(config, cases[0], resumed)
+    assert workflow.calls == calls
+    assert hashes(workflow.root) == before

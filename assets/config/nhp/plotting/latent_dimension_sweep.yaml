@@ -2,39 +2,21 @@ extends: style.yaml
 enabled: true
 metrics: [cc, r2, mse]
 curves:
-- name: neural_horizon
-  parameter: horizon
-  where:
-    target: neural
-    metric: cc
-    nx: 16
-    population_scale: 1.0
-    evaluation_set: full
-  group: null
-- name: neural_dimension
+- name: dimension_by_horizon
   parameter: nx
+  group: horizon
+  panel: target
   where:
-    target: neural
+    target: [neural, behavior]
     metric: cc
-    horizon: 4
     population_scale: 1.0
     evaluation_set: full
-  group: null
-- name: behavior_horizon
+- name: horizon_by_dimension
   parameter: horizon
+  group: nx
+  panel: target
   where:
-    target: behavior
+    target: [neural, behavior]
     metric: cc
-    nx: 16
     population_scale: 1.0
     evaluation_set: full
-  group: null
-- name: behavior_dimension
-  parameter: nx
-  where:
-    target: behavior
-    metric: cc
-    horizon: 4
-    population_scale: 1.0
-    evaluation_set: full
-  group: null
