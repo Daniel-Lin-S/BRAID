@@ -36,11 +36,11 @@ from .tools.model_base_classes import ModelWithFitWithRetry, Reconstructable
 from .tools.tensorboard import event_scope
 from .tools.plot import plotPredictionScatter, plotTimeSeriesPrediction
 from .tools.tf_losses import (
+    MaskedR2,
     masked_CategoricalCrossentropy,
     masked_CC,
     masked_mse,
     masked_PoissonLL_loss,
-    masked_R2,
 )
 from .tools.tf_tools import set_global_tf_eagerly_flag
 from .tools.tools import get_one_hot
@@ -943,7 +943,7 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
                 # loss = tf.keras.losses.MeanSquaredError()
             else:
                 loss = masked_mse(self.missing_marker)
-            metrics.append(masked_R2(self.missing_marker))
+            metrics.append(MaskedR2(self.missing_marker))
             metrics.append(masked_CC(self.missing_marker))
         metrics.append(loss)
 
@@ -975,7 +975,17 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
             loss_weights = None
         else:
             all_losses = [loss]*len(self.steps_ahead) + [None]*len(self.steps_ahead)+ [None]*len(self.steps_ahead)
-            metrics = [metrics]*len(self.steps_ahead) + [None]*len(self.steps_ahead)+ [None]*len(self.steps_ahead) # For each output
+            metrics = [
+                [
+                    (
+                        MaskedR2(self.missing_marker)
+                        if isinstance(metric, MaskedR2)
+                        else metric
+                    )
+                    for metric in metrics
+                ]
+                for _ in self.steps_ahead
+            ] + [None] * len(self.steps_ahead) * 2
         if self.steps_ahead_loss_weights is not None:
             loss_weights = [float(lw) for lw in self.steps_ahead_loss_weights] + [0]*len(self.steps_ahead) + [0]*len(self.steps_ahead) # For each output
         else:

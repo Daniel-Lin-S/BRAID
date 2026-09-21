@@ -9,13 +9,14 @@ import csv
 from pathlib import Path
 
 from .analysis import read_manifest, record_plotting
-from .evaluation import aggregate, collect_results
+from .evaluation import aggregate, aggregate_folds, collect_results
 from .plots import plot_suite
 
 
 def braid_report(
     root: Path, settings: dict, sample_rate: float,
     attempted: set[str] | None = None, rendered: set[str] | None = None,
+    regenerate: bool = False,
 ) -> None:
     """Publish tables and comparisons whose dependencies are terminal.
 
@@ -32,6 +33,9 @@ def braid_report(
     rendered : set of str, optional
         Figure names already attempted in this invocation; default None.
         Updated in place to avoid repeated rendering and failure warnings.
+    regenerate : bool, optional
+        Replace existing comparison figures; default False generates only
+        missing figures.
     """
     from .model_summary import write_model_summary
 
@@ -72,11 +76,30 @@ def braid_report(
     expected = expected_comparisons(manifest, attempted)
     plot_suite(
         summaries, root / "plots", settings, expected, rendered=rendered,
+        regenerate=regenerate,
     )
+    fold_summaries = aggregate_folds(rows)
+    session_expected = expected_comparisons(
+        manifest, attempted, per_session=True
+    )
+    sessions = sorted({
+        member["session"] for member in manifest["members"].values()
+    })
+    for session in sessions:
+        plot_suite(
+            [row for row in fold_summaries if row["session"] == session],
+            root / "plots" / "sessions" / session,
+            settings,
+            [row for row in session_expected if row["session"] == session],
+            rendered=rendered,
+            namespace=f"session/{session}",
+            regenerate=regenerate,
+        )
 
 
 def expected_comparisons(
     manifest: dict, attempted: set[str] | None = None,
+    per_session: bool = False,
 ) -> list[dict]:
     """Expand comparison membership with pending and failed contributions.
 
@@ -86,6 +109,8 @@ def expected_comparisons(
         Analysis specification and per-session/fold/model member records.
     attempted : set of str, optional
         Current invocation's finished attempts; None uses saved states.
+    per_session : bool, optional
+        Keep each session's fold dependencies separate; default False.
 
     Returns
     -------
@@ -113,6 +138,8 @@ def expected_comparisons(
                             horizon=horizon, evaluation_set=evaluation_set,
                             target=target, metric=metric,
                         )
+                        if per_session:
+                            candidate["session"] = member["session"]
                         group = tuple(candidate.values())
                         point = expected.setdefault(
                             group, dict(

@@ -237,3 +237,25 @@ def test_preview_windows_are_deterministic_and_isolated(real_session):
         np.testing.assert_array_equal(left, right)
         assert len(left) == 100
         assert len(np.unique(features.arrays["segment"][left])) == 1
+
+
+
+def test_flat_removal_precedes_zscore_parameter_fitting():
+    """Fit z-score parameters only after removing constant dimensions."""
+    from BRAID.MainModel import MainModel
+
+    values = np.array([
+        [0.0, 1.0, 2.0, 3.0],
+        [5.0, 5.0, 5.0, 5.0],
+        [2.0, 4.0, 8.0, 16.0],
+    ])
+    model = MainModel.__new__(MainModel)
+    mapping = model.get_input_prep_map(values)
+    transformed = mapping.apply(values)
+    assert transformed.shape == (2, 4)
+    np.testing.assert_allclose(transformed.mean(axis=1), 0.0, atol=1e-12)
+    np.testing.assert_allclose(
+        transformed.std(axis=1, ddof=1), 1.0, atol=1e-12
+    )
+    assert mapping.maps[1].b.shape == (2,)
+    assert mapping.maps[1].W.shape == (2,)

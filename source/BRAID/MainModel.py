@@ -683,14 +683,51 @@ class MainModel(PredictorModel):
                 YTrue = Y.T
         return YLossFuncs, YTrue, yDist
 
-    def get_input_prep_map(self, Y, remove_flat_dims=True, zscore_inputs=True, zscore_per_dim=True, signal_name=''):
-        map = LinearMappingSequence()
-        # Detect and remove flat data dimensions
+    def get_input_prep_map(
+        self,
+        Y,
+        remove_flat_dims=True,
+        zscore_inputs=True,
+        zscore_per_dim=True,
+        signal_name="",
+    ):
+        """Fit preprocessing maps against each preceding map's output.
+
+        Parameters
+        ----------
+        Y : ndarray, shape (dimensions, samples), optional
+            Signal used to fit preprocessing parameters; default is None.
+        remove_flat_dims : bool, optional
+            Remove constant dimensions; default True.
+        zscore_inputs : bool, optional
+            Center and scale retained dimensions; default True.
+        zscore_per_dim : bool, optional
+            Scale each retained dimension separately; default True.
+        signal_name : str, optional
+            Signal identifier used in diagnostics; default is empty.
+
+        Returns
+        -------
+        LinearMappingSequence
+            Ordered flat-removal and z-score mappings.
+        """
+        mapping = LinearMappingSequence()
+        transformed = Y
         if remove_flat_dims:
-            map.append( getFlatRemoverMapping(Y, signal_name, axis=1) )
+            flat_remover = getFlatRemoverMapping(
+                transformed, signal_name, axis=1
+            )
+            mapping.append(flat_remover)
+            if flat_remover is not None and transformed is not None:
+                transformed = flat_remover.apply(transformed)
         if zscore_inputs:
-            map.append( getZScoreMapping(Y, signal_name, axis=1, zscore_per_dim=zscore_per_dim) )
-        return map
+            mapping.append(getZScoreMapping(
+                transformed,
+                signal_name,
+                axis=1,
+                zscore_per_dim=zscore_per_dim,
+            ))
+        return mapping
 
     def setTrainableParameters(self, base=None, fw=None, initial_state=None):
         MainModelSetTrainableParameters(base=base, fw=fw, initial_state=initial_state,

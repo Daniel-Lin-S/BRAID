@@ -22,8 +22,38 @@ LOGGER = logging.getLogger(__name__)
 METRICS = {"cc": "CC", "r2": "R2", "mse": "MSE"}
 
 
-def score_channels(truth: np.ndarray, predicted: np.ndarray) -> dict:
-    """Reuse BRAID metrics while marking undefined channel scores explicitly."""
+def _evaluation_context(context: dict) -> str:
+    """Format stable evaluation identifiers for diagnostic warnings."""
+    fields = (
+        "session", "fold", "model", "horizon", "evaluation_set", "target",
+    )
+    return " ".join(f"{field}={context[field]}" for field in fields)
+
+
+def score_channels(
+    truth: np.ndarray,
+    predicted: np.ndarray,
+    channel_ids: list[str],
+    context: dict,
+) -> dict:
+    """Score channels and diagnose expected and unexpected exclusions.
+
+    Parameters
+    ----------
+    truth : ndarray, shape (samples, channels)
+        Finite held-out observations.
+    predicted : ndarray, shape (samples, channels)
+        Finite forecasts aligned with ``truth``.
+    channel_ids : list of str
+        Stable identifiers for the channel axis.
+    context : dict
+        Session, fold, model, horizon, evaluation set and target identifiers.
+
+    Returns
+    -------
+    dict
+        Per-channel values, finite-channel means and validity counts.
+    """
     if (
         truth.ndim != 2 or truth.shape != predicted.shape
         or len(truth) < 2 or truth.shape[1] < 1
@@ -34,25 +64,61 @@ def score_channels(truth: np.ndarray, predicted: np.ndarray) -> dict:
         )
     if not np.isfinite(truth).all() or not np.isfinite(predicted).all():
         raise ValueError("Scored observations and forecasts must be finite.")
+    if len(channel_ids) != truth.shape[1]:
+        raise ValueError(
+            f"Expected {truth.shape[1]} channel IDs, got {len(channel_ids)}."
+        )
+    required = {
+        "session", "fold", "model", "horizon", "evaluation_set", "target",
+    }
+    if set(context) != required:
+        raise ValueError(
+            f"Expected evaluation context fields {sorted(required)}, "
+            f"got {sorted(context)}."
+        )
     output = {}
     flat = np.ptp(truth, axis=0) == 0
+    if flat.any():
+        affected = [channel_ids[i] for i in np.flatnonzero(flat)]
+        LOGGER.warning(
+            "Ignoring flat truth channels for CC and R2 because their "
+            "observed range is zero; %s affected_count=%d "
+            "total_channels=%d affected_channels=%s",
+            _evaluation_context(context), len(affected), len(channel_ids),
+            affected,
+        )
     for name, measure in METRICS.items():
         values = np.asarray(evalPrediction(truth, predicted, measure))
         values = np.atleast_1d(values).astype(float)
+        if values.shape != (truth.shape[1],):
+            raise ValueError(
+                f"Expected {truth.shape[1]} {name} values, got "
+                f"shape {values.shape}."
+            )
         if name in ("cc", "r2"):
             values[flat] = np.nan
         good = np.isfinite(values)
-        if not good.all():
+        unexpected = ~good & (~flat if name in ("cc", "r2") else True)
+        if np.any(unexpected):
+            indices = np.flatnonzero(unexpected)
             LOGGER.warning(
-                "%s undefined for %d/%d channels",
-                name,
-                int((~good).sum()),
-                len(good),
+                "Unexpected nonfinite %s values although truth and "
+                "predictions are finite and truth range is nonzero; %s "
+                "affected_count=%d total_channels=%d affected_channels=%s "
+                "values=%s",
+                name.upper(),
+                _evaluation_context(context),
+                len(indices),
+                len(channel_ids),
+                [channel_ids[i] for i in indices],
+                [str(values[i]) for i in indices],
             )
         output[f"per_dimension_{name}"] = [
             float(v) if ok else None for v, ok in zip(values, good)
         ]
-        output[f"mean_{name}"] = float(values.mean()) if good.all() else None
+        output[f"mean_{name}"] = (
+            float(values[good].mean()) if good.any() else None
+        )
         output[f"valid_{name}_channels"] = int(good.sum())
     return output
 
@@ -77,13 +143,28 @@ def evaluate_forecasts(
     rows = []
     for number, horizon in enumerate(horizons):
         valid = predictions["valid"][number]
-        behavior = score_channels(
-            truth["Z"][valid], predictions["Z"][number, valid]
-        )
         for name, selected in groups:
+            shared_context = dict(
+                session=metadata["session"],
+                fold=metadata["fold"],
+                model=metadata["configuration"],
+                horizon=horizon,
+                evaluation_set=name,
+            )
+            behavior = score_channels(
+                truth["Z"][valid],
+                predictions["Z"][number, valid],
+                [f"behavior_{i}" for i in range(truth["Z"].shape[1])],
+                dict(shared_context, target="behavior"),
+            )
+            channel_ids = [
+                metadata["selected_channel_ids"][i] for i in selected
+            ]
             neural = score_channels(
                 truth["Y"][valid][:, selected],
                 predictions["Y"][number, valid][:, selected],
+                channel_ids,
+                dict(shared_context, target="neural"),
             )
             row = dict(
                 metadata,
@@ -92,9 +173,7 @@ def evaluate_forecasts(
                 behavior=behavior,
                 neural=neural,
                 samples=int(valid.sum()),
-                scored_channel_ids=[
-                    metadata["selected_channel_ids"][i] for i in selected
-                ],
+                scored_channel_ids=channel_ids,
             )
             for target, columns in (
                 ("Y", selected),
@@ -136,6 +215,71 @@ def collect_results(root: Path) -> list[dict]:
     if not rows:
         raise ValueError(f"No completed evaluation results: {root.resolve()}")
     return rows
+
+
+def aggregate_folds(rows: list[dict]) -> list[dict]:
+    """Calculate per-session fold statistics for in-memory plotting.
+
+    Parameters
+    ----------
+    rows : list of dict
+        Completed evaluation rows from individual folds.
+
+    Returns
+    -------
+    list of dict
+        Per-session means and sample standard deviations. No files are written.
+    """
+    groups = {}
+    names = (
+        "session",
+        "configuration",
+        "population_scale",
+        "nx",
+        "n1",
+        "horizon",
+        "evaluation_set",
+        "target",
+        "metric",
+    )
+    for row in rows:
+        for target in ("behavior", "neural"):
+            for metric in METRICS:
+                key = (
+                    row["session"],
+                    row["configuration"],
+                    row["population_scale"],
+                    row["nx"],
+                    row["n1"],
+                    row["horizon"],
+                    row["evaluation_set"],
+                    target,
+                    metric,
+                )
+                groups.setdefault(key, []).append(
+                    row[target][f"mean_{metric}"]
+                )
+    summaries = []
+    for key, values in sorted(groups.items()):
+        finite = np.asarray(
+            [value for value in values if value is not None], dtype=float
+        )
+        if finite.size and not np.isfinite(finite).all():
+            identity = dict(zip(names, key))
+            raise ValueError(f"Nonfinite fold aggregate for {identity}.")
+        summaries.append(
+            dict(
+                zip(names, key),
+                mean=float(finite.mean()) if finite.size else None,
+                std=(
+                    float(finite.std(ddof=1))
+                    if finite.size > 1
+                    else None
+                ),
+                folds=int(finite.size),
+            )
+        )
+    return summaries
 
 
 def aggregate(rows: list[dict], destination: Path) -> list[dict]:

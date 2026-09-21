@@ -176,7 +176,7 @@ def run_case(
         enabled=not arguments.no_plots and snapshots["plotting"]["enabled"],
         regenerate=(
             snapshots.get("runtime", {}).get(
-                "figure_regeneration", "missing"
+                "figure_regeneration", "incomplete"
             )
             == "all"
         ),
@@ -342,6 +342,9 @@ def main() -> None:
                 root=analysis_root,
                 settings=plotting,
                 sample_rate=data["sampling_rate_hz"],
+                regenerate=(
+                    runtime.get("figure_regeneration", "incomplete") == "all"
+                ),
             )
             state["completed"] = 1
         return
@@ -522,13 +525,20 @@ def main() -> None:
                                         session_state.get(outcome, 0) + count
                                     )
                             attempted.add(key)
-                            render_safely(
-                                rendering_errors, "Analysis report", plugin,
-                                experiment["report_plugin"],
-                                root=analysis_root, settings=plotting,
-                                sample_rate=data["sampling_rate_hz"],
-                                attempted=attempted, rendered=rendered,
-                            )
+                if arguments.stage != "preprocess":
+                    render_safely(
+                        rendering_errors, "Analysis report", plugin,
+                        experiment["report_plugin"],
+                        root=analysis_root,
+                        settings=plotting,
+                        sample_rate=data["sampling_rate_hz"],
+                        attempted=attempted,
+                        rendered=rendered,
+                        regenerate=(
+                            runtime.get("figure_regeneration", "incomplete")
+                            == "all"
+                        ),
+                    )
     if model_errors or rendering_errors:
         details = model_errors + rendering_errors
         raise RuntimeError(

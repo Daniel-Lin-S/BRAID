@@ -29,7 +29,8 @@ validated results count as attempted.
 Pending contributions defer a comparison silently. Failed contributions are
 shown as annotated gaps or reduced contribution counts and produce one warning
 that names the failed members. A comparison with no finite results is skipped.
-Unexpected missing completed metrics are rendering errors.
+Unexpected missing completed metrics are rendering errors. Comparison
+figures are replaced when their recorded dependency state changes.
 
 `history.py` renders fit-owned component histories. `presentation.py` owns
 figure style, metric labels, and output formatting. Plotting does not fit or

@@ -1,4 +1,4 @@
-"""Render analysis comparisons from accepted per-session summary statistics.
+"""Render global summaries and in-memory per-session fold comparisons.
 
 Outputs are named target_metric_vs_parameter_selection.png figures. Failed
 observations remain annotated gaps; pending comparisons are deferred. This
@@ -10,7 +10,9 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from PIL import Image
 
+from .cache import fingerprint
 from .presentation import METRIC_LABELS, presentation, save_figure, style_axis
 
 LOGGER = logging.getLogger(__name__)
@@ -66,7 +68,7 @@ def metric_curve(
     style: dict,
     partial: bool = False,
 ) -> object:
-    """Build one metric figure from summary rows with mean/SEM and x values."""
+    """Build one metric figure from means, uncertainties and x values."""
     if not rows or not any(
         row["mean"] is not None and np.isfinite(row["mean"]) for row in rows
     ):
@@ -125,18 +127,19 @@ def metric_curve(
                     xycoords=transform, xytext=MISSING_LABEL_OFFSET,
                     textcoords="offset points", ha="center", color=color,
                 )
-        valid_sem = [
+        uncertainty = "std" if any("std" in row for row in selected) else "sem"
+        valid_uncertainty = [
             i
             for i, row in enumerate(selected)
             if np.isfinite(y[i])
-            and row["sem"] is not None
-            and np.isfinite(row["sem"])
+            and row.get(uncertainty) is not None
+            and np.isfinite(row[uncertainty])
         ]
-        if valid_sem:
+        if valid_uncertainty:
             axis.errorbar(
-                x[valid_sem],
-                y[valid_sem],
-                yerr=[selected[i]["sem"] for i in valid_sem],
+                x[valid_uncertainty],
+                y[valid_uncertainty],
+                yerr=[selected[i][uncertainty] for i in valid_uncertainty],
                 fmt="none",
                 color=color,
                 capsize=4,
@@ -161,6 +164,9 @@ def metric_curve(
         f"{target.capitalize()} {METRIC_LABELS[metric]}\n"
         f"{fixed}; {spec['where']['evaluation_set']} scoring"
     )
+    context_label = spec.get("context_label")
+    if context_label:
+        title += f"\n{context_label}"
     figure.suptitle(
         title + ("\n(partial: failed experiments)" if partial else ""),
         fontsize=style["title_font"],
@@ -209,7 +215,7 @@ def comparison_rows(
                 raise ValueError(
                     f"Missing completed result in {name}: {criteria}"
                 )
-            row = dict(criteria, mean=None, sem=None)
+            row = dict(criteria, mean=None, sem=None, std=None)
             result.append(row)
         row.update({
             k: candidate[k] for k in READINESS_FIELDS if k in candidate
@@ -221,6 +227,26 @@ def comparison_rows(
     return result
 
 
+def _comparison_signature(rows: list[dict], dependencies: list[dict]) -> str:
+    """Fingerprint numerical values and terminal dependency states."""
+    return fingerprint(dict(
+        rows=sorted(rows, key=repr),
+        dependencies=sorted(dependencies, key=repr),
+    ))
+
+
+def _current_figure(path: Path, signature: str) -> bool:
+    """Return whether a readable PNG represents the current comparison."""
+    try:
+        with Image.open(path) as saved:
+            recorded = saved.info.get("BRAID-rendering")
+            saved.verify()
+    except OSError:
+        LOGGER.warning("Redrawing damaged comparison PNG: %s", path)
+        return False
+    return recorded == signature
+
+
 def plot_suite(
     summaries: list[dict],
     root: Path,
@@ -228,13 +254,15 @@ def plot_suite(
     expected: list[dict] | None = None,
     pending: bool = False,
     rendered: set[str] | None = None,
+    namespace: str | None = None,
+    regenerate: bool = False,
 ) -> None:
     """Publish terminal comparisons, annotating only failed contributions.
 
     Parameters
     ----------
     summaries : list of dict
-        Aggregate metric means and SEM values from completed evaluations.
+        Aggregate metric means and uncertainty values.
     root : Path
         Destination for comparison PNG files.
     settings : dict
@@ -244,16 +272,25 @@ def plot_suite(
     pending : bool, optional
         Defer without explicit dependencies when True; default False.
     rendered : set of str, optional
-        Names already attempted during this invocation; default None.
-        Updated only for eligible figures, including rendering failures.
+        Qualified figure names already handled in this invocation; default None.
+    namespace : str, optional
+        Figure namespace used for session-specific rendering; default None.
+    regenerate : bool, optional
+        Replace all figures; default False repairs missing, damaged or stale
+        figures while preserving current ones.
     """
     if not settings["enabled"]:
         return
     style = presentation(settings.get("presentation"))
     errors = []
-    for spec in curve_specs(settings):
+    warning_details = []
+    warning_members = set()
+    for configured_spec in curve_specs(settings):
+        spec = dict(configured_spec)
         name = spec["name"]
-        if rendered is not None and name in rendered:
+        render_key = f"{namespace}/{name}" if namespace else name
+        path = root / f"{name}.png"
+        if rendered is not None and render_key in rendered:
             continue
         dependencies = [
             row for row in expected or [] if matches(row, spec["where"])
@@ -262,34 +299,47 @@ def plot_suite(
             pending and expected is None
         ):
             continue
-        if rendered is not None:
-            rendered.add(name)
         chosen = [row for row in summaries if matches(row, spec["where"])]
         try:
             rows = comparison_rows(chosen, dependencies, name)
+            signature = _comparison_signature(rows, dependencies)
+            if path.exists() and not regenerate and _current_figure(
+                path, signature
+            ):
+                if rendered is not None:
+                    rendered.add(render_key)
+                continue
+            if rendered is not None:
+                rendered.add(render_key)
             failures = sorted({
                 key for row in dependencies
                 for key in row.get("failed_members", [])
             })
             if failures:
-                counts = "; ".join(
-                    f"{row[spec['parameter']]}: "
-                    f"{row['completed_count']}/{row['expected_count']} results"
+                counts = ", ".join(
+                    f"{row[spec['parameter']]}="
+                    f"{row['completed_count']}/{row['expected_count']}"
                     for row in dependencies if row.get("failed_members")
                 )
-                LOGGER.warning(
-                    "Incomplete comparison %s (%s); failed members: %s",
-                    name, counts, ", ".join(failures),
-                )
+                warning_details.append(f"{name} ({counts})")
+                warning_members.update(failures)
                 if not any(
                     row["mean"] is not None and np.isfinite(row["mean"])
                     for row in rows
                 ):
                     continue
+            if namespace and namespace.startswith("session/"):
+                spec["context_label"] = namespace.removeprefix("session/")
             figure = metric_curve(rows, spec, style, partial=bool(failures))
-            save_figure(figure, root / f"{name}.png", style)
+            save_figure(figure, path, style, signature)
         except Exception as error:
-            LOGGER.exception("Comparison failed: %s", name)
+            LOGGER.exception("Comparison failed: %s", render_key)
             errors.append(str(error))
+    if warning_members:
+        LOGGER.warning(
+            "Incomplete comparisons %s; failed members: %s",
+            "; ".join(warning_details),
+            ", ".join(sorted(warning_members)),
+        )
     if errors:
         raise RuntimeError("Comparison rendering failed: " + "; ".join(errors))

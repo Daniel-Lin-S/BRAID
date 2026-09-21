@@ -405,6 +405,7 @@ def test_reports_follow_manifest_membership_only(workflow):
         row["configuration"] == cases[0]["name"]
         for row in collect_results(directory)
     )
+    assert not list((directory / "summaries").glob("session_summary.*"))
     assert workflow.calls == counts
 
 
@@ -593,6 +594,65 @@ def test_settings_hash_covers_complete_recipe(workflow, change):
     )
     assert actual != expected
     assert re.fullmatch(r"BRAID_[0-9a-f]{64}", actual.name)
+
+
+
+def test_certified_fitting_predecessor_reuses_only_completed_fit(
+    workflow, monkeypatch,
+):
+    """Reuse a certified completion while leaving an incomplete fit behind."""
+    from experiments import implementation
+
+    old = sweep("latent_dimension_sweep")
+    old["fitting_implementation"] = "old-fitting"
+    new = copy.deepcopy(old)
+    new["fitting_implementation"] = "new-fitting"
+    monkeypatch.setattr(
+        implementation,
+        "FITTING_REUSE",
+        frozenset({("old-fitting", "new-fitting")}),
+    )
+    case = build_cases(old["experiment"]["suite"])[0]
+    old_identity, _ = case_identity(
+        workflow.features, 0, case, old, workflow.ids
+    )
+    new_identity, _ = case_identity(
+        workflow.features, 0, case, new, workflow.ids
+    )
+    old_run = fit_directory(workflow.root, old_identity)
+    assert fit_directory(workflow.root, new_identity) != old_run
+
+    _, old_analysis = workflow.prepare(old)
+    assert workflow.run(old, case, old_analysis)
+    assert fit_directory(workflow.root, new_identity) == old_run
+
+    _, new_analysis = workflow.prepare(new)
+    assert workflow.run(new, case, new_analysis)
+    assert workflow.calls["fit"] == 1
+
+
+def test_certified_transition_chains_are_forward_only(monkeypatch):
+    """Accept every certified ancestor without accepting reverse paths."""
+    from experiments import implementation
+
+    transitions = frozenset({
+        ("old", "middle"),
+        ("middle", "current"),
+        ("unrelated", "other"),
+    })
+    monkeypatch.setattr(implementation, "FITTING_REUSE", transitions)
+    monkeypatch.setattr(implementation, "INFERENCE_REUSE", transitions)
+
+    assert implementation.compatible_fitting("old", "current")
+    assert implementation.compatible_inference("old", "current")
+    assert implementation.compatible_inference("middle", "current")
+    assert implementation.compatible_inference("current", "current")
+    assert not implementation.compatible_inference("current", "old")
+    assert not implementation.compatible_inference("old", "other")
+    assert not implementation.compatible_inference("missing", "current")
+    assert implementation.fitting_predecessors("current") == (
+        "middle", "old",
+    )
 
 
 def test_recipe_defaults_and_configured_batch_limit(workflow):
@@ -952,23 +1012,74 @@ def test_interrupt_is_not_contained_as_model_failure(workflow, monkeypatch):
 
 
 def test_certified_prediction_reuse_preserves_bundle(workflow):
-    """Verification-only provenance accepts just its certified predecessor."""
+    """Prediction reuse follows every certified transition without writes."""
     from experiments import implementation
 
     config = sweep("latent_dimension_sweep")
-    old, new = next(iter(implementation.INFERENCE_REUSE))
-    assert implementation.implementation_signatures()[
+    current = implementation.implementation_signatures()[
         "inference_implementation"
-    ] == new
+    ]
+    by_successor = {
+        successor: recorded
+        for recorded, successor in implementation.INFERENCE_REUSE
+    }
+    direct = by_successor[current]
+    old = by_successor[direct]
     config["inference_implementation"] = old
     cases, directory = workflow.prepare(config)
     workflow.run(config, cases[0], directory)
-    before = hashes(workflow.root / "experiments")
+    before = hashes(workflow.root)
     calls = dict(workflow.calls)
-    config["inference_implementation"] = new
+    config["inference_implementation"] = current
     workflow.run(config, cases[0], directory)
     assert workflow.calls == calls
-    assert before == hashes(workflow.root / "experiments")
+    assert before == hashes(workflow.root)
     config["inference_implementation"] = "unrelated-implementation"
     with pytest.raises(ValueError, match="provenance mismatch"):
         workflow.run(config, cases[0], directory)
+
+
+def test_failed_member_recovers_with_chained_prediction_reuse(
+    workflow, monkeypatch,
+):
+    """A retry can replace failure state while reusing the saved forecast."""
+    from experiments import implementation, runner
+    from experiments.analysis import member_key, update_member
+
+    config = sweep("latent_dimension_sweep")
+    current = implementation.implementation_signatures()[
+        "inference_implementation"
+    ]
+    by_successor = {
+        successor: recorded
+        for recorded, successor in implementation.INFERENCE_REUSE
+    }
+    old = by_successor[by_successor[current]]
+    config["inference_implementation"] = old
+    cases, directory = workflow.prepare(config)
+    score_member = runner.score_member
+
+    def fail_scoring(*args, **kwargs):
+        raise ValueError("Prediction provenance mismatch")
+
+    monkeypatch.setattr(runner, "score_member", fail_scoring)
+    with pytest.raises(ValueError, match="provenance mismatch"):
+        workflow.run(config, cases[0], directory)
+    calls = dict(workflow.calls)
+
+    key = member_key(cases[0], "session_a", 0)
+    update_member(
+        directory,
+        key,
+        {
+            "state": "failed",
+            "failure_phase": "prediction",
+            "error_type": "ValueError",
+            "error": "Prediction provenance mismatch",
+        },
+    )
+    monkeypatch.setattr(runner, "score_member", score_member)
+    config["inference_implementation"] = current
+    assert workflow.run(config, cases[0], directory)
+    assert workflow.calls == calls
+    assert read_manifest(directory)["members"][key]["state"] == "complete"

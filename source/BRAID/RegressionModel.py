@@ -22,11 +22,11 @@ from .tools.abstract_classes import PredictorModel
 from .tools.model_base_classes import ModelWithFitWithRetry, Reconstructable
 from .tools.tensorboard import event_scope
 from .tools.tf_losses import (
+    MaskedR2,
     masked_CategoricalCrossentropy,
     masked_CC,
     masked_mse,
     masked_PoissonLL_loss,
-    masked_R2,
 )
 from .tools.tf_tools import set_global_tf_eagerly_flag
 from .tools.tools import get_one_hot, getIsOk
@@ -208,7 +208,7 @@ class RegressionModel(tf.keras.layers.Layer, ModelWithFitWithRetry, Reconstructa
                 loss = 'mse' # Without masking
             else:
                 loss = masked_mse(self.missing_marker)
-            metrics.append(masked_R2(self.missing_marker))
+            metrics.append(MaskedR2(self.missing_marker))
             metrics.append(masked_CC(self.missing_marker))
         metrics.append(loss)
         

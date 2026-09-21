@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
 
-from .cache import file_digest, fingerprint, writer_lock
+from .cache import atomic_json, file_digest, fingerprint, writer_lock
 from .presentation import METRIC_LABELS, presentation, save_figure, style_axis
 
 LOGGER = logging.getLogger(__name__)
@@ -24,21 +24,85 @@ STEP_METRIC = re.compile(
     r"(?P<horizon>\d+)step_(?P<metric>loss|MSE|R2|CC)$"
 )
 CANONICAL = {"loss": "total_loss", "MSE": "mse", "R2": "r2", "CC": "cc"}
+RENDERING_RECORD = "rendering.json"
+RENDERING_RECORD_VERSION = 1
 
 
 def metric_values(rows: list[dict], key: str) -> np.ndarray:
-    """Return logged values, shape (epochs,), with warned, explicit gaps."""
-    values = np.array(
+    """Return logged metric values, with explicit NaN gaps."""
+    return np.array(
         [
             np.nan if row["metrics"].get(key) is None else row["metrics"][key]
             for row in rows
         ],
         dtype=float,
     )
-    if not np.isfinite(values).all():
-        LOGGER.warning("Undefined history values for %s; displaying gaps.", key)
-        values[~np.isfinite(values)] = np.nan
-    return values
+
+
+def metric_keys(
+    metric: str,
+    steps: list[int],
+    output: str | None,
+) -> tuple[str, ...]:
+    """Return the history keys contributing to one rendered figure."""
+    if not steps:
+        return (metric, f"val_{metric}")
+    output_prefix = "" if output is None else f"{output}_"
+    return tuple(
+        f"{prefix}rnn_{output_prefix}{horizon}step_{metric}"
+        for prefix in ("", "val_")
+        for horizon in steps
+    )
+
+
+def has_finite_metric_values(
+    rows: list[dict],
+    metric: str,
+    steps: list[int],
+    output: str | None,
+) -> bool:
+    """Return whether one figure has at least one finite history value."""
+    return any(
+        np.isfinite(metric_values(rows, key)).any()
+        for key in metric_keys(metric, steps, output)
+    )
+
+
+def load_skipped_metrics(path: Path, signature: str) -> dict[str, dict]:
+    """Read matching intentional omissions from one component attempt."""
+    if not path.is_file():
+        return {}
+    try:
+        record = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        LOGGER.warning("Ignoring invalid rendering record %s: %s", path, error)
+        return {}
+    if (
+        record.get("version") != RENDERING_RECORD_VERSION
+        or record.get("signature") != signature
+    ):
+        return {}
+    skipped = record.get("skipped")
+    if not isinstance(skipped, dict):
+        LOGGER.warning("Ignoring invalid rendering record: %s", path)
+        return {}
+    return skipped
+
+
+def write_skipped_metrics(
+    path: Path,
+    signature: str,
+    skipped: dict[str, dict],
+) -> None:
+    """Atomically publish intentional omissions for one component attempt."""
+    atomic_json(
+        path,
+        {
+            "signature": signature,
+            "skipped": skipped,
+            "version": RENDERING_RECORD_VERSION,
+        },
+    )
 
 
 def history_figure(
@@ -209,6 +273,15 @@ def render_component(
                 if metric in keys
             ]
             definitions.extend(horizon_definitions(keys))
+            record_path = (
+                directory
+                / "plots"
+                / f"attempt_{attempt}"
+                / RENDERING_RECORD
+            )
+            skipped = load_skipped_metrics(record_path, signature)
+            updated_skipped = dict(skipped)
+            failures = []
             for metric, steps, filename, output in definitions:
                 path = (
                     directory
@@ -216,6 +289,26 @@ def render_component(
                     / f"attempt_{attempt}"
                     / (filename + ".png")
                 )
+                if not has_finite_metric_values(
+                    selected,
+                    metric,
+                    steps,
+                    output,
+                ):
+                    if filename not in skipped or regenerate:
+                        LOGGER.warning(
+                            "Omitting all-gap history figure: component=%s "
+                            "attempt=%s metric=%s "
+                            "reason=no_finite_epoch_values",
+                            directory,
+                            attempt,
+                            metric,
+                        )
+                    updated_skipped[filename] = {
+                        "metric": metric,
+                        "reason": "no_finite_epoch_values",
+                    }
+                    continue
                 if path.exists() and not regenerate:
                     try:
                         with Image.open(path) as saved:
@@ -223,12 +316,24 @@ def render_component(
                         continue
                     except OSError:
                         LOGGER.warning("Redrawing damaged PNG: %s", path)
-                figure = history_figure(
-                    selected,
-                    metric,
-                    steps,
-                    f"{directory.name}\n{METRIC_LABELS[metric.lower()]}",
-                    style,
-                    output,
+                try:
+                    figure = history_figure(
+                        selected,
+                        metric,
+                        steps,
+                        f"{directory.name}\n{METRIC_LABELS[metric.lower()]}",
+                        style,
+                        output,
+                    )
+                    save_figure(figure, path, style, signature)
+                except Exception as error:
+                    failures.append((filename, error))
+            if updated_skipped:
+                write_skipped_metrics(record_path, signature, updated_skipped)
+            if failures:
+                details = "; ".join(
+                    f"{filename}: {error}" for filename, error in failures
                 )
-                save_figure(figure, path, style, signature)
+                raise RuntimeError(
+                    f"Component rendering failed for {directory}: {details}"
+                )

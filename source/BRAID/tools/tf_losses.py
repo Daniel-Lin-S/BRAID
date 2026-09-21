@@ -61,26 +61,59 @@ def compute_CC(x, y):  # https://stackoverflow.com/a/58890795/2275605
     return r_num / r_den
 
 
+def _undefined_r2(dtype):
+    """Return a scalar undefined R2 value with the requested dtype."""
+    return tf.cast(float("nan"), dtype)
+
+
+def _finite_mean(values):
+    """Average finite values and return NaN only when none are available."""
+    finite = tf.boolean_mask(values, tf.math.is_finite(values))
+    return tf.cond(
+        tf.size(finite) > 0,
+        lambda: tf.reduce_mean(finite),
+        lambda: _undefined_r2(values.dtype),
+    )
+
+
 def compute_R2(y_true, y_pred):  # https://stackoverflow.com/a/58890795/2275605
-    """Computes correlation of determination (R2) in tensorflow
+    """Compute per-dimension R2 with NaN for undefined flat targets.
 
-    Args:
-        x (numpy array): input 1
-        y (numpy array): input 2
+    Parameters
+    ----------
+    y_true, y_pred : tf.Tensor, shape (samples, dimensions)
+        Matched target and prediction arrays.
 
-    Returns:
-        tf.Tensor: CC value
+    Returns
+    -------
+    tf.Tensor, shape (dimensions,)
+        Per-dimension R2 values. Dimensions with zero target variance are NaN.
     """
-    m_true = tf.math.reduce_mean(y_true, axis=0)
-
-    r_num = tf.math.reduce_sum(tf.math.pow(y_true - y_pred, 2), axis=0)
-    r_den = tf.math.reduce_sum(tf.math.pow(y_true - m_true, 2), axis=0)
-
-    R2 = 1 - (r_num / r_den)
-
-    isFlat = (tf.reduce_max(y_true, axis=0) - tf.reduce_min(y_pred, axis=0)) < 1e-9
-    R2 = tf.where(isFlat, tf.zeros_like(R2), R2)
-    return R2
+    dtype = y_pred.dtype
+    samples = tf.cast(tf.shape(y_true)[0], dtype)
+    total = tf.math.reduce_sum(y_true, axis=0)
+    m_true = tf.math.divide_no_nan(total, samples)
+    r_num = tf.math.reduce_sum(
+        tf.math.squared_difference(y_true, y_pred),
+        axis=0,
+    )
+    r_den = tf.math.reduce_sum(
+        tf.math.squared_difference(y_true, m_true),
+        axis=0,
+    )
+    valid = tf.logical_and(
+        samples > 0,
+        tf.logical_and(
+            r_den > 0,
+            tf.logical_and(
+                tf.math.is_finite(r_num),
+                tf.math.is_finite(r_den),
+            ),
+        ),
+    )
+    values = 1 - tf.math.divide_no_nan(r_num, r_den)
+    undefined = tf.fill(tf.shape(values), _undefined_r2(dtype))
+    return tf.where(valid, values, undefined)
 
 
 def computeCC_masked(y_true, y_pred, mask_value=None):
@@ -161,19 +194,70 @@ def masked_CC(mask_value=None):
 
 
 def masked_R2(mask_value=None):
-    """Returns a tf R2 computation function, but with support for setting one value as a mask indicator.
-    Takes mean of R2 across dimensions. See computeR2_masked for details of computing R2 for each dimension.
-    Args:
-        mask_value (numpy value, optional): if not None, will treat this value as mask indicator. Defaults to
+    """Return a batch R2 function that excludes undefined dimensions.
+
+    Parameters
+    ----------
+    mask_value : number, optional
+        Marker that excludes an observation row; default None.
     """
 
     def f(y_true, y_pred):
-        allR2 = computeR2_masked(y_true, y_pred, mask_value)
-        meanR2 = tf.math.reduce_mean(allR2)  # Average across dimensions
-        return meanR2
+        return _finite_mean(computeR2_masked(y_true, y_pred, mask_value))
 
     f.__name__ = R2_NAME
     return f
+
+
+class MaskedR2(tf.keras.metrics.Metric):
+    """Aggregate finite per-dimension R2 values across one Keras epoch.
+
+    Parameters
+    ----------
+    mask_value : number, optional
+        Marker that excludes an observation row; default None.
+    name : str, optional
+        Keras history key; default "R2".
+    dtype : str or tf.dtypes.DType, optional
+        Metric accumulator dtype; default TensorFlow's configured dtype.
+    """
+
+    def __init__(self, mask_value=None, name=R2_NAME, dtype=None):
+        super().__init__(name=name, dtype=dtype)
+        self.mask_value = mask_value
+        self.total = self.add_weight(name="total", initializer="zeros")
+        self.count = self.add_weight(name="count", initializer="zeros")
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        """Accumulate finite R2 values without counting flat dimensions."""
+        if sample_weight is not None:
+            raise ValueError("MaskedR2 does not support sample weights.")
+        values = computeR2_masked(y_true, y_pred, self.mask_value)
+        valid = tf.math.is_finite(values)
+        finite = tf.where(valid, values, tf.zeros_like(values))
+        self.total.assign_add(tf.reduce_sum(tf.cast(finite, self.dtype)))
+        self.count.assign_add(
+            tf.reduce_sum(tf.cast(valid, self.dtype))
+        )
+
+    def result(self):
+        """Return NaN only when the complete epoch had no valid R2 values."""
+        return tf.cond(
+            self.count > 0,
+            lambda: tf.math.divide_no_nan(self.total, self.count),
+            lambda: _undefined_r2(self.dtype),
+        )
+
+    def reset_state(self):
+        """Clear the epoch accumulators."""
+        self.total.assign(0)
+        self.count.assign(0)
+
+    def get_config(self):
+        """Return serializable construction parameters."""
+        config = super().get_config()
+        config.update({"mask_value": self.mask_value})
+        return config
 
 
 def masked_negativeCC(mask_value=None):
@@ -201,10 +285,7 @@ def masked_negativeR2(mask_value=None):
     """
 
     def f(y_true, y_pred):
-        meanR2 = tf.math.reduce_mean(
-            computeR2_masked(y_true, y_pred, mask_value)
-        )  # Average across dimensions
-        return -meanR2
+        return -_finite_mean(computeR2_masked(y_true, y_pred, mask_value))
 
     f.__name__ = NEGATIVE_R2_NAME
     return f

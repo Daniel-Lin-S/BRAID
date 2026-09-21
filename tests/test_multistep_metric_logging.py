@@ -3,13 +3,20 @@
 import unittest
 
 import numpy as np
+import tensorflow as tf
 
 from BRAID.MainModel import (
     getLossLogStr,
     shift_1s_to_ms_series,
     shift_ms_to_1s_series,
 )
-from BRAID.tools.tf_losses import masked_CC, masked_mse, masked_R2
+from BRAID.tools.tf_losses import (
+    MaskedR2,
+    compute_R2,
+    masked_CC,
+    masked_mse,
+    masked_R2,
+)
 
 HORIZON = 4
 SAMPLE_COUNT = 10
@@ -82,6 +89,28 @@ class MultiStepMetricLoggingTest(unittest.TestCase):
         )
 
         _assert_perfect_metrics(self, log_message)
+
+
+def test_r2_ignores_flat_dimensions_without_losing_valid_values() -> None:
+    """A flat target dimension must not invalidate a varying dimension."""
+    targets = tf.constant([[0.0, 1.0], [1.0, 1.0], [2.0, 1.0]])
+    values = compute_R2(targets, targets).numpy()
+    assert values[0] == 1.0
+    assert np.isnan(values[1])
+    assert masked_R2()(targets, targets).numpy() == 1.0
+
+
+def test_stateful_r2_skips_all_flat_batches_and_epochs() -> None:
+    """R2 remains undefined only when an entire epoch has no valid dimension."""
+    flat = tf.constant([[1.0], [1.0]])
+    varying = tf.constant([[0.0], [1.0], [2.0]])
+    metric = MaskedR2()
+    metric.update_state(flat, flat)
+    assert np.isnan(metric.result().numpy())
+    metric.reset_state()
+    metric.update_state(flat, flat)
+    metric.update_state(varying, varying)
+    assert metric.result().numpy() == 1.0
 
 
 if __name__ == "__main__":

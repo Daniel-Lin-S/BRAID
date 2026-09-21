@@ -46,9 +46,10 @@ bash scripts/train_nhp.sh --experiment assets/config/nhp/experiments/latent_dime
 or `off`. Use `--no-plots` or `--no-previews` to suppress those outputs.
 `--dry-run` only resolves configuration.
 
-On resume, missing component-history figures are repaired automatically.
-Set `runtime.figure_regeneration: all` to redraw existing figures after a
-style change; the default is `missing`.
+On resume, incomplete figures are repaired automatically, including
+comparisons whose failed contributions later complete. Set
+`runtime.figure_regeneration: all` to redraw comparison and training-history
+figures after a style change; the default is `incomplete`.
 
 ## Find results and recover from interruption
 

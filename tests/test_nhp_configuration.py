@@ -75,7 +75,7 @@ def test_sweeps_have_separate_grids_and_plotting(tmp_path):
     assert latent["model"]["training"]["training_batch_size"] == 32
     assert latent["model"]["training"]["maximum_epochs"] == 2500
     assert latent["plotting"] != population["plotting"]
-    assert latent["runtime"]["figure_regeneration"] == "missing"
+    assert latent["runtime"]["figure_regeneration"] == "incomplete"
 
 
 def test_figure_regeneration_policy_is_validated(tmp_path):

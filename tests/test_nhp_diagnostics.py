@@ -236,6 +236,105 @@ def test_all_comparison_files_are_generated(tmp_path):
         assert not (destination / "behavior_example.png").exists()
 
 
+
+def evaluation_context() -> dict:
+    """Return complete diagnostic identifiers for one synthetic evaluation."""
+    return dict(
+        session="session_a",
+        fold=2,
+        model="BRAID_nx4_p1",
+        horizon=4,
+        evaluation_set="full",
+        target="neural",
+    )
+
+
+def test_flat_channels_are_ignored_with_context(caplog):
+    """Flat truth is expected exclusion, distinct from invalid metric output."""
+    from experiments.evaluation import score_channels
+
+    truth = np.array([[0.0, 1.0], [1.0, 1.0], [2.0, 1.0]])
+    predicted = np.array([[0.0, 2.0], [1.0, 2.0], [2.0, 2.0]])
+    scores = score_channels(
+        truth, predicted, ["unit_a", "unit_flat"], evaluation_context()
+    )
+    assert scores["valid_cc_channels"] == 1
+    assert scores["valid_r2_channels"] == 1
+    assert scores["per_dimension_cc"][1] is None
+    assert scores["per_dimension_r2"][1] is None
+    assert scores["mean_cc"] == pytest.approx(
+        scores["per_dimension_cc"][0]
+    )
+    messages = [record.message for record in caplog.records]
+    assert len(messages) == 1
+    assert "observed range is zero" in messages[0]
+    assert "session=session_a" in messages[0]
+    assert "fold=2" in messages[0]
+    assert "model=BRAID_nx4_p1" in messages[0]
+    assert "horizon=4" in messages[0]
+    assert "evaluation_set=full" in messages[0]
+    assert "target=neural" in messages[0]
+    assert "affected_count=1" in messages[0]
+    assert "total_channels=2" in messages[0]
+    assert "unit_flat" in messages[0]
+
+
+def test_nonfinite_nonflat_metric_has_distinct_warning(caplog, monkeypatch):
+    """Unexpected metric failures identify their metric, value and channel."""
+    from experiments import evaluation
+
+    def metric(_truth, _predicted, measure):
+        return [np.nan, 0.5] if measure == "CC" else [0.25, 0.5]
+
+    monkeypatch.setattr(evaluation, "evalPrediction", metric)
+    truth = np.array([[0.0, 1.0], [1.0, 2.0], [2.0, 4.0]])
+    scores = evaluation.score_channels(
+        truth, truth, ["unit_bad", "unit_ok"], evaluation_context()
+    )
+    assert scores["mean_cc"] == pytest.approx(0.5)
+    assert scores["valid_cc_channels"] == 1
+    messages = [record.message for record in caplog.records]
+    assert len(messages) == 1
+    assert "Unexpected nonfinite CC" in messages[0]
+    assert "truth range is nonzero" in messages[0]
+    assert "affected_count=1" in messages[0]
+    assert "total_channels=2" in messages[0]
+    assert "unit_bad" in messages[0]
+    assert "nan" in messages[0]
+    assert "session=session_a" in messages[0]
+
+
+def test_per_session_fold_statistics_use_sample_standard_deviation():
+    """Per-session plotting values remain in memory and vary across folds."""
+    from experiments.evaluation import aggregate_folds
+
+    rows = []
+    for fold, value in enumerate((1.0, 3.0, 5.0)):
+        score = {
+            f"mean_{metric}": value for metric in ("cc", "r2", "mse")
+        }
+        rows.append(dict(
+            session="session_a",
+            fold=fold,
+            configuration="BRAID_nx4_p1",
+            population_scale=1.0,
+            nx=4,
+            n1=4,
+            horizon=4,
+            evaluation_set="full",
+            neural=score,
+            behavior=score,
+        ))
+    summaries = aggregate_folds(rows)
+    neural_cc = next(
+        row for row in summaries
+        if row["target"] == "neural" and row["metric"] == "cc"
+    )
+    assert neural_cc["mean"] == pytest.approx(3.0)
+    assert neural_cc["std"] == pytest.approx(2.0)
+    assert neural_cc["folds"] == 3
+
+
 @pytest.fixture
 def comparison_design():
     """Provide one comparison with two models and two contributing folds."""
@@ -258,7 +357,7 @@ def comparison_design():
                     name=f"nx{nx}", dimensions={"nx": nx},
                     population_scale=1.0,
                 ),
-                state="complete", common_ids=[],
+                state="complete", common_ids=[], session="session",
             )
     manifest = dict(
         specification=dict(settings=dict(evaluation=dict(horizons=[4]))),
@@ -268,6 +367,7 @@ def comparison_design():
         dict(
             settings["curves"][0]["where"], nx=nx,
             configuration=f"nx{nx}", population_scale=1.0,
+            session="session",
             mean=0.5, sem=None,
         )
         for nx in (1, 2)
@@ -295,6 +395,44 @@ def test_pending_contributors_silently_defer_figure(
     assert not caplog.records
 
 
+
+def test_session_readiness_does_not_wait_for_pending_sessions(
+    tmp_path, comparison_design,
+):
+    """Terminal sessions render while later sessions remain silent."""
+    from copy import deepcopy
+
+    from experiments.reporting import expected_comparisons
+
+    settings, manifest, rows = comparison_design
+    pending = {}
+    for key, member in manifest["members"].items():
+        copied = deepcopy(member)
+        copied["session"] = "later_session"
+        copied["state"] = "pending"
+        pending[key.replace("/session/", "/later_session/")] = copied
+    manifest["members"].update(pending)
+    expected = expected_comparisons(manifest, per_session=True)
+    current = [row for row in expected if row["session"] == "session"]
+    later = [row for row in expected if row["session"] == "later_session"]
+    plot_suite(
+        rows,
+        tmp_path / "sessions" / "session",
+        settings,
+        current,
+        namespace="session/session",
+    )
+    plot_suite(
+        [],
+        tmp_path / "sessions" / "later_session",
+        settings,
+        later,
+        namespace="session/later_session",
+    )
+    assert len(list((tmp_path / "sessions" / "session").glob("*.png"))) == 1
+    assert not (tmp_path / "sessions" / "later_session").exists()
+
+
 def test_failed_point_is_annotated_and_warned_once(
     tmp_path, caplog, comparison_design, monkeypatch,
 ):
@@ -308,7 +446,7 @@ def test_failed_point_is_annotated_and_warned_once(
             member["state"] = "failed"
     saved = []
 
-    def save(figure, path, style):
+    def save(figure, path, style, signature):
         saved.append(figure)
 
     monkeypatch.setattr(plots, "save_figure", save)
@@ -330,6 +468,30 @@ def test_failed_point_is_annotated_and_warned_once(
     assert len(warnings) == 1
     assert "nx2/session/fold_0" in warnings[0].message
     assert "nx2/session/fold_1" in warnings[0].message
+
+
+
+def test_completed_reattempt_replaces_partial_comparison(
+    tmp_path, comparison_design,
+):
+    """A changed dependency state invalidates an existing partial PNG."""
+    from experiments.reporting import expected_comparisons
+
+    settings, manifest, rows = comparison_design
+    failed_key = "nx2/session/fold_1"
+    manifest["members"][failed_key]["state"] = "failed"
+    expected = expected_comparisons(manifest)
+    plot_suite(rows, tmp_path, settings, expected)
+    figure = next(tmp_path.glob("*.png"))
+    partial = figure.read_bytes()
+
+    manifest["members"][failed_key]["state"] = "complete"
+    plot_suite(rows, tmp_path, settings, expected_comparisons(manifest))
+    repaired = figure.read_bytes()
+    assert repaired != partial
+
+    plot_suite(rows, tmp_path, settings, expected_comparisons(manifest))
+    assert figure.read_bytes() == repaired
 
 
 def test_partial_aggregate_marks_reduced_contributions(comparison_design):
@@ -418,3 +580,94 @@ def test_unexplained_missing_metric_is_a_rendering_error(
     with pytest.raises(RuntimeError, match="Missing completed result"):
         plot_suite(rows[:1], tmp_path, settings, expected_comparisons(manifest))
     assert not list(tmp_path.glob("*.png"))
+
+
+def canonical_history_rows(r2_values: tuple[float | None, ...]) -> list[dict]:
+    """Build direct component metrics with configurable R2 history values."""
+    return [
+        {
+            "epoch": epoch,
+            "attempt": 1,
+            "metrics": {
+                "loss": 1.0 / epoch,
+                "val_loss": 2.0 / epoch,
+                "MSE": 0.5 / epoch,
+                "val_MSE": 0.75 / epoch,
+                "R2": r2,
+                "val_R2": r2,
+                "CC": 0.25 * epoch,
+                "val_CC": 0.2 * epoch,
+            },
+        }
+        for epoch, r2 in enumerate(r2_values, 1)
+    ]
+
+
+def test_all_gap_r2_is_recorded_without_suppressing_cc(tmp_path, caplog):
+    """An intentionally omitted R2 plot does not block independent metrics."""
+    component = tmp_path / "components" / "main" / "decoder"
+    component.mkdir(parents=True)
+    history = component / "history.jsonl"
+    rows = canonical_history_rows((None, None, None))
+    history.write_text("\n".join(json.dumps(row) for row in rows))
+
+    render_component(component, STYLE)
+
+    plots = component / "plots" / "attempt_1"
+    assert (plots / "total_loss.png").is_file()
+    assert (plots / "mse.png").is_file()
+    assert (plots / "cc.png").is_file()
+    assert not (plots / "r2.png").exists()
+    record = json.loads((plots / "rendering.json").read_text())
+    assert record["skipped"]["r2"]["reason"] == "no_finite_epoch_values"
+    warnings = [
+        message
+        for message in (item.message for item in caplog.records)
+        if "Omitting all-gap history figure" in message
+    ]
+    assert len(warnings) == 1
+    assert "metric=R2" in warnings[0]
+
+    caplog.clear()
+    render_component(component, STYLE)
+    assert not [
+        item
+        for item in caplog.records
+        if "Omitting all-gap history figure" in item.message
+    ]
+
+    rows = canonical_history_rows((0.1, 0.2, 0.3))
+    history.write_text("\n".join(json.dumps(row) for row in rows))
+    render_component(component, STYLE)
+    assert (plots / "r2.png").is_file()
+
+
+def test_metric_render_error_does_not_block_later_metrics(
+    tmp_path,
+    monkeypatch,
+):
+    """A rendering exception is combined after unaffected figures are saved."""
+    from experiments import history as history_module
+
+    component = tmp_path / "components" / "main" / "decoder"
+    component.mkdir(parents=True)
+    rows = canonical_history_rows((0.1, 0.2, 0.3))
+    (component / "history.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in rows)
+    )
+    original = history_module.history_figure
+
+    def fail_r2(*args, **kwargs):
+        if args[1] == "R2":
+            raise ValueError("synthetic R2 renderer failure")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(history_module, "history_figure", fail_r2)
+    with pytest.raises(RuntimeError, match="r2: synthetic R2 renderer failure"):
+        render_component(component, STYLE)
+
+    plots = component / "plots" / "attempt_1"
+    assert (plots / "total_loss.png").is_file()
+    assert (plots / "mse.png").is_file()
+    assert (plots / "cc.png").is_file()
+    assert not (plots / "r2.png").exists()

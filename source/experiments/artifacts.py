@@ -269,35 +269,55 @@ def validate_model_settings(directory: Path) -> dict:
     return record
 
 
+def _compatible_model_settings(recorded: dict, expected: dict) -> bool:
+    """Compare recipes using only certified fitting compatibility."""
+    from .implementation import compatible_fitting
+
+    numerical = "fitting_implementation"
+    return (
+        set(recorded) == set(expected)
+        and {k: v for k, v in recorded.items() if k != numerical}
+        == {k: v for k, v in expected.items() if k != numerical}
+        and compatible_fitting(
+            recorded.get(numerical), expected.get(numerical)
+        )
+    )
+
+
 def prepare_model_settings(directory: Path, identity: dict) -> None:
-    """Publish a recipe once, rejecting existing missing or conflicting data.
+    """Publish a recipe or validate a certified predecessor recipe.
 
     Parameters
     ----------
     directory : Path
-        Canonical model-settings directory, not a fit directory.
+        Canonical or certified predecessor model-settings directory.
     identity : dict
         Resolved fit inputs whose configured recipe must match the directory.
     """
     expected = settings_record(identity)
     adapter = model_adapter(identity["configurations"])
-    if directory.name != (
-        f"{adapter.model_name}_{expected['settings_hash']}"
-    ):
-        raise ValueError(f"Unexpected model settings directory: {directory}")
     with writer_lock(directory / SETTINGS_LOCK):
         path = directory / SETTINGS_FILENAME
         if path.exists():
-            if validate_model_settings(directory) != expected:
-                raise ValueError(f"Conflicting model settings: {path}")
-        else:
-            if any(item.name != SETTINGS_LOCK for item in directory.iterdir()):
-                raise ValueError(f"Missing model settings metadata: {path}")
-            atomic_json(path, expected)
+            recorded = validate_model_settings(directory)
+            if recorded == expected or _compatible_model_settings(
+                recorded["settings"], expected["settings"]
+            ):
+                return
+            raise ValueError(f"Conflicting model settings: {path}")
+        if directory.name != (
+            f"{adapter.model_name}_{expected['settings_hash']}"
+        ):
+            raise ValueError(
+                f"Unexpected model settings directory: {directory}"
+            )
+        if any(item.name != SETTINGS_LOCK for item in directory.iterdir()):
+            raise ValueError(f"Missing model settings metadata: {path}")
+        atomic_json(path, expected)
 
 
-def fit_directory(root: Path, identity: dict) -> Path:
-    """Resolve a fit independently of analysis configuration and labels."""
+def _canonical_fit_directory(root: Path, identity: dict) -> Path:
+    """Address a fit using exactly the supplied implementation identity."""
     return (
         model_directory(
             root, identity["configurations"], identity["case"],
@@ -306,6 +326,34 @@ def fit_directory(root: Path, identity: dict) -> Path:
         / identity["source"]["session"] / f"fold_{identity['fold']}"
         / fingerprint(fit_identity(identity))
     )
+
+
+def _predecessor_identity(identity: dict, implementation: str) -> dict:
+    """Build one certified predecessor identity without mutating the request."""
+    predecessor = copy.deepcopy(identity)
+    predecessor["configurations"]["fitting_implementation"] = implementation
+    return predecessor
+
+
+def fit_directory(root: Path, identity: dict) -> Path:
+    """Resolve the current fit or a completed certified predecessor fit."""
+    current = _canonical_fit_directory(root, identity)
+    from .implementation import fitting_predecessors
+
+    predecessors = fitting_predecessors(
+        identity["configurations"].get("fitting_implementation")
+    )
+    completed = []
+    for implementation in predecessors:
+        predecessor = _predecessor_identity(identity, implementation)
+        candidate = _canonical_fit_directory(root, predecessor)
+        if completed_fit(candidate, predecessor):
+            completed.append(candidate)
+    if len(completed) > 1:
+        raise ValueError(
+            f"Multiple compatible completed fits found for {current.resolve()}."
+        )
+    return completed[0] if completed else current
 
 
 def validate_completion(run: Path) -> dict:
@@ -354,6 +402,29 @@ def completed_fit(run: Path, identity: dict) -> bool:
         return False
     validate_completion(run)
     recorded = json.loads(artifact_path(run, "identity.json").read_text())
-    if recorded["identity"] != fit_identity(identity):
-        raise ValueError(f"Completed fit identity mismatch: {run.resolve()}")
+    actual = recorded["identity"]
+    expected = fit_identity(identity)
+    if actual != expected:
+        from .implementation import compatible_fitting
+
+        actual_core = copy.deepcopy(actual)
+        expected_core = copy.deepcopy(expected)
+        actual_implementation = actual_core["model"].pop(
+            "fitting_implementation", None
+        )
+        expected_implementation = expected_core["model"].pop(
+            "fitting_implementation", None
+        )
+        for value in (actual_core, expected_core):
+            value.pop("fit_seed", None)
+            value.pop("settings_hash", None)
+        if (
+            actual_core != expected_core
+            or not compatible_fitting(
+                actual_implementation, expected_implementation
+            )
+        ):
+            raise ValueError(
+                f"Completed fit identity mismatch: {run.resolve()}"
+            )
     return True
