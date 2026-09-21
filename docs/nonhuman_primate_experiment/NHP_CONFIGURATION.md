@@ -18,6 +18,12 @@ module owns forecast horizons and scoring settings, and the plotting module
 owns comparison selections and presentation settings. Machine-only `paths`
 and `runtime` settings may be inherited through a local manifest.
 
+The LFP data module uses an ordered `preprocessing.steps` list. Each entry
+contains a step plugin and its parameter mapping. Common-average referencing
+is optional and is represented by a pipeline entry rather than a Boolean.
+The preview adapter is configured independently under `previews.adapter`, so
+rendering settings do not participate in fit identity.
+
 The launcher accepts `fit`, `preprocess`, `preview`, `evaluate`, and
 `plot`. `evaluate` requires an existing completed fit. `plot` reads a
 saved analysis and does not load the dataset. CLI values override resolved

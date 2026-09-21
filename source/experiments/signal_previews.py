@@ -75,20 +75,20 @@ def window_excerpts(
     raw = (native["native_t"] >= time[0]) & (native["native_t"] < stop)
     if not raw.any():
         raise ValueError("Preview window contains no native behavior samples.")
-    values = dict(
-        t=time,
-        channel_ids=arrays["ids"][columns],
-        unit_dimensions=arrays["units"][columns],
-        source_indices=arrays["indices"][indices],
-        counts=arrays["counts"][indices][:, columns],
-        smoothed=arrays["Y"][indices][:, columns],
-        position=session.arrays["Z"][arrays["indices"][indices]],
-        Z=arrays["Z"][indices],
-        U=arrays["U"][indices],
-        native_t=native["native_t"][raw],
-        native_Z=native["native_Z"][raw],
-        native_U=native["native_U"][raw],
-    )
+    values = {
+        "t": time,
+        "channel_ids": arrays["ids"][columns],
+        "unit_dimensions": arrays["units"][columns],
+        "source_indices": arrays["indices"][indices],
+        "counts": arrays["counts"][indices][:, columns],
+        "smoothed": arrays["Y"][indices][:, columns],
+        "position": session.arrays["Z"][arrays["indices"][indices]],
+        "Z": arrays["Z"][indices],
+        "U": arrays["U"][indices],
+        "native_t": native["native_t"][raw],
+        "native_Z": native["native_Z"][raw],
+        "native_U": native["native_U"][raw],
+    }
     np.testing.assert_array_equal(native["ids"][columns], values["channel_ids"])
     np.testing.assert_array_equal(
         native["units"][columns], values["unit_dimensions"]
@@ -168,56 +168,14 @@ def fitted_stages(
     return stages
 
 
-def signal_stages(excerpts: dict) -> list[tuple[str, str, list[PreviewStage]]]:
-    """Describe preprocessing-only or fitted-only figures from their arrays."""
+def coordinate_figures(
+    excerpts: dict,
+    fitted: bool,
+    suffix: str,
+) -> list[tuple[str, str, list[PreviewStage]]]:
+    """Describe shared behavior and measured-input preview figures."""
     time = excerpts["t"]
-    fitted = "pre_Y" in excerpts
-    suffix = "fitted" if fitted else "preprocessing"
     figures = []
-    for number, (channel, unit) in enumerate(
-        zip(
-            excerpts["channel_ids"],
-            excerpts["unit_dimensions"],
-        )
-    ):
-        if fitted:
-            stages = fitted_stages(excerpts, "Y", number)
-        else:
-            stages = [
-                PreviewStage(
-                    "spikes",
-                    "Original spike events",
-                    "Events",
-                    excerpts[f"spikes_{number}"],
-                    None,
-                    "spikes",
-                ),
-                PreviewStage(
-                    "counts",
-                    "Binned counts",
-                    "Spikes/bin",
-                    time,
-                    excerpts["counts"][:, number],
-                    "counts",
-                ),
-                PreviewStage(
-                    "smoothed",
-                    "Smoothed counts (offline Gaussian)",
-                    "Spikes/bin",
-                    time,
-                    excerpts["smoothed"][:, number],
-                ),
-            ]
-        safe = str(channel).replace(" ", "_")
-        if Path(safe).name != safe or safe in (".", ".."):
-            raise ValueError(f"Unsafe preview channel filename: {channel!r}")
-        figures.append(
-            (
-                f"neural_{safe}_unit_{unit}_{suffix}.png",
-                f"{channel}, unit {unit}",
-                stages,
-            )
-        )
     for name, group in (("Z", "behavior"), ("U", "input")):
         values = excerpts[f"pre_{name}" if fitted else name]
         if values.shape[1] not in ((2, 4) if name == "Z" else (2,)):
@@ -291,33 +249,89 @@ def signal_stages(excerpts: dict) -> list[tuple[str, str, list[PreviewStage]]]:
     return figures
 
 
-def render_window(
+def signal_stages(excerpts: dict) -> list[tuple[str, str, list[PreviewStage]]]:
+    """Describe preprocessing-only or fitted-only figures from their arrays."""
+    time = excerpts["t"]
+    fitted = "pre_Y" in excerpts
+    suffix = "fitted" if fitted else "preprocessing"
+    figures = []
+    for number, (channel, unit) in enumerate(
+        zip(
+            excerpts["channel_ids"],
+            excerpts["unit_dimensions"],
+        )
+    ):
+        if fitted:
+            stages = fitted_stages(excerpts, "Y", number)
+        else:
+            stages = [
+                PreviewStage(
+                    "spikes",
+                    "Original spike events",
+                    "Events",
+                    excerpts[f"spikes_{number}"],
+                    None,
+                    "spikes",
+                ),
+                PreviewStage(
+                    "counts",
+                    "Binned counts",
+                    "Spikes/bin",
+                    time,
+                    excerpts["counts"][:, number],
+                    "counts",
+                ),
+                PreviewStage(
+                    "smoothed",
+                    "Smoothed counts (offline Gaussian)",
+                    "Spikes/bin",
+                    time,
+                    excerpts["smoothed"][:, number],
+                ),
+            ]
+        safe = str(channel).replace(" ", "_")
+        if Path(safe).name != safe or safe in (".", ".."):
+            raise ValueError(f"Unsafe preview channel filename: {channel!r}")
+        figures.append(
+            (
+                f"neural_{safe}_unit_{unit}_{suffix}.png",
+                f"{channel}, unit {unit}",
+                stages,
+            )
+        )
+    figures.extend(coordinate_figures(excerpts, fitted, suffix))
+    return figures
+
+
+def render_figures(
     destination: Path,
     excerpts: dict,
     session: str,
     bounds: tuple[float, float],
     style: dict,
+    figures: list[tuple[str, str, list[PreviewStage]]],
+    fitted_metadata: tuple[str, ...] = ("unit_dimensions",),
 ) -> list[dict]:
-    """Write separated PNGs and a numerical archive for one time window."""
+    """Write supplied preview figures and their numerical excerpt archive."""
     records = []
-    for filename, label, stages in signal_stages(excerpts):
+    for filename, label, stages in figures:
         title = f"{session} — {label}\nWindow {bounds[0]:.3f}–{bounds[1]:.3f} s"
         save_signal(destination / filename, stages, label, title, bounds, style)
         records.append(
-            dict(
-                file=filename,
-                signal=label,
-                stages=[
-                    dict(
-                        key=s.key,
-                        label=s.label,
-                        unit=s.unit,
-                        kind=s.kind,
-                        coordinates=list(s.coordinates),
-                    )
+            {
+                "file": filename,
+                "signal": label,
+                "stages": [
+                    {
+                        "key": s.key,
+                        "label": s.label,
+                        "unit": s.unit,
+                        "kind": s.kind,
+                        "coordinates": list(s.coordinates),
+                    }
                     for s in stages
                 ],
-            )
+            }
         )
     payload = excerpts
     if "pre_Y" in excerpts:
@@ -328,11 +342,29 @@ def render_window(
             in (
                 "t",
                 "channel_ids",
-                "unit_dimensions",
                 "source_indices",
                 "learned_Z",
             )
+            or key in fitted_metadata
             or key.startswith(("pre_", "main_"))
         }
     np.savez_compressed(destination / "excerpts.npz", **payload)
     return records
+
+
+def render_window(
+    destination: Path,
+    excerpts: dict,
+    session: str,
+    bounds: tuple[float, float],
+    style: dict,
+) -> list[dict]:
+    """Write standard spike preview figures for one time window."""
+    return render_figures(
+        destination,
+        excerpts,
+        session,
+        bounds,
+        style,
+        signal_stages(excerpts),
+    )

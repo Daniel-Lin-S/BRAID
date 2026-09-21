@@ -9,18 +9,37 @@ scientific artifacts and old-layout directories are never modified.
 import hashlib
 import json
 import os
-from pathlib import Path
 import shutil
 import tempfile
+from pathlib import Path
 
 import numpy as np
 
 from .cache import atomic_json, file_digest, fingerprint, writer_lock
-from .contracts import FeatureSet
+from .contracts import FeatureSet, plugin
 from .previews import SPLIT_NAMES
 from .signal_previews import preview_columns, render_window, window_excerpts
 
-PREVIEW_VERSION = 5
+PREVIEW_VERSION = 6
+
+
+def _preview_adapter(settings: dict):
+    """Construct an optional modality-specific preview adapter."""
+    reference = settings.get("adapter")
+    if reference is None:
+        return None
+    if not isinstance(reference, str) or ":" not in reference:
+        raise ValueError("previews.adapter must have the form module:class.")
+    adapter = plugin(reference, settings=settings)
+    for attribute in (
+        "implementation_identity",
+        "window_excerpts",
+        "render_window",
+        "window_metadata",
+    ):
+        if not hasattr(adapter, attribute):
+            raise TypeError(f"Preview adapter {reference!r} lacks {attribute}.")
+    return adapter
 
 
 def publish_previews(
@@ -68,6 +87,7 @@ def publish_previews(
         if not len(indices) or not np.all(fold.arrays["role"][indices] == role):
             raise ValueError(f"Invalid {SPLIT_NAMES[role]} preview indices.")
     columns = preview_columns(fold, settings, available)
+    adapter = _preview_adapter(settings)
     protected = dict(source_checksums or {})
     for features in (session, fold):
         if features.path is not None:
@@ -76,26 +96,26 @@ def publish_previews(
                 protected[str(path)] = file_digest(path)
     if checkpoint is not None:
         protected[str(checkpoint.resolve())] = file_digest(checkpoint)
-    identity = dict(
-        version=PREVIEW_VERSION,
-        settings=settings,
-        fold=fold.metadata,
-        source_checksums=protected,
-        channels=fold.arrays["ids"][columns].tolist(),
-        indices=[fold.arrays["indices"][w].tolist() for w in windows],
-        checkpoint_sha256=file_digest(checkpoint) if checkpoint else None,
-        fitted_arrays=[
+    identity = {
+        "version": PREVIEW_VERSION,
+        "settings": settings,
+        "fold": fold.metadata,
+        "source_checksums": protected,
+        "channels": fold.arrays["ids"][columns].tolist(),
+        "indices": [fold.arrays["indices"][w].tolist() for w in windows],
+        "checkpoint_sha256": file_digest(checkpoint) if checkpoint else None,
+        "fitted_arrays": [
             {
-                key: dict(
-                    shape=list(value.shape),
-                    dtype=str(value.dtype),
-                    sha256=hashlib.sha256(value.tobytes()).hexdigest(),
-                )
+                key: {
+                    "shape": list(value.shape),
+                    "dtype": str(value.dtype),
+                    "sha256": hashlib.sha256(value.tobytes()).hexdigest(),
+                }
                 for key, value in window.items()
             }
             for window in fitted or []
         ],
-        implementation={
+        "implementation": {
             name: file_digest(Path(__file__).with_name(name))
             for name in (
                 "preview_publication.py",
@@ -104,7 +124,10 @@ def publish_previews(
                 "presentation.py",
             )
         },
-    )
+        "adapter_implementation": (
+            adapter.implementation_identity() if adapter else None
+        ),
+    }
     destination = root.resolve()
     with writer_lock(destination.parent / f".{destination.name}.lock"):
         manifest_path = destination / "manifest.json"
@@ -113,13 +136,16 @@ def publish_previews(
             if manifest_path.exists()
             else {}
         )
-        if previous.get("identity") == identity and previous.get("complete"):
-            if all(
+        if (
+            previous.get("identity") == identity
+            and previous.get("complete")
+            and all(
                 (destination / name).is_file()
                 and file_digest(destination / name) == digest
                 for name, digest in previous["checksums"].items()
-            ):
-                return destination
+            )
+        ):
+            return destination
         destination.parent.mkdir(parents=True, exist_ok=True)
         staging = Path(
             tempfile.mkdtemp(
@@ -134,7 +160,7 @@ def publish_previews(
             ):
                 start = float(fold.arrays["t"][indices[0]])
                 stop = start + settings["seconds"]
-                excerpts = window_excerpts(
+                arguments = (
                     session,
                     fold,
                     indices,
@@ -142,24 +168,34 @@ def publish_previews(
                     stop,
                     None if fitted is None else fitted[number],
                 )
-                figures = render_window(
+                excerpts = (
+                    adapter.window_excerpts(*arguments)
+                    if adapter
+                    else window_excerpts(*arguments)
+                )
+                render = adapter.render_window if adapter else render_window
+                figures = render(
                     staging / split,
                     excerpts,
                     fold.metadata["session"],
                     (start, stop),
                     settings["presentation"],
                 )
-                records.append(
-                    dict(
-                        directory=split,
-                        start=start,
-                        stop=stop,
-                        source_indices=excerpts["source_indices"].tolist(),
-                        channel_ids=excerpts["channel_ids"].tolist(),
-                        unit_dimensions=excerpts["unit_dimensions"].tolist(),
-                        figures=figures,
-                    )
-                )
+                record = {
+                    "directory": split,
+                    "start": start,
+                    "stop": stop,
+                    "source_indices": excerpts["source_indices"].tolist(),
+                    "channel_ids": excerpts["channel_ids"].tolist(),
+                    "figures": figures,
+                }
+                if adapter:
+                    record.update(adapter.window_metadata(excerpts))
+                else:
+                    record["unit_dimensions"] = excerpts[
+                        "unit_dimensions"
+                    ].tolist()
+                records.append(record)
             checksums = {
                 str(path.relative_to(staging)): file_digest(path)
                 for path in sorted(staging.rglob("*"))
@@ -168,17 +204,17 @@ def publish_previews(
             for name, digest in protected.items():
                 if file_digest(Path(name)) != digest:
                     raise ValueError(f"Source changed during rendering: {name}")
-            manifest = dict(
-                complete=True,
-                identity=identity,
-                rendering_id=fingerprint(identity),
-                windows=records,
-                source_files_unchanged=True,
-                session_cache=str(session.path) if session.path else None,
-                fold_cache=str(fold.path) if fold.path else None,
-                checkpoint=str(checkpoint.resolve()) if checkpoint else None,
-                checksums=checksums,
-            )
+            manifest = {
+                "complete": True,
+                "identity": identity,
+                "rendering_id": fingerprint(identity),
+                "windows": records,
+                "source_files_unchanged": True,
+                "session_cache": str(session.path) if session.path else None,
+                "fold_cache": str(fold.path) if fold.path else None,
+                "checkpoint": str(checkpoint.resolve()) if checkpoint else None,
+                "checksums": checksums,
+            }
             for name in checksums:
                 target = destination / name
                 target.parent.mkdir(parents=True, exist_ok=True)

@@ -1,0 +1,23 @@
+plugin: experiments.nhp_lfp:NHPLFPDataset
+features: lfp
+sampling_rate_hz: 20
+broadband_subdirectory: raw
+cache_mode: reuse
+preprocessing:
+  steps:
+  - plugin: experiments.lfp_preprocessing:PolyphaseResample
+    parameters:
+      anti_alias_lowpass_hz: 10
+      window: kaiser
+      beta: 5.0
+cv:
+  folds: 5
+  guard_seconds: 1.8
+infer_velocity: true
+previews:
+  enabled: true
+  adapter: experiments.lfp_previews:LFPPreviewAdapter
+  windows: 3
+  seconds: 5
+  channels: 3
+  seed: 42

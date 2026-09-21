@@ -8,7 +8,8 @@ implementation contracts are linked below.
 Obtain the Indy `.mat` spike/task files from the
 [public reaching dataset](https://zenodo.org/records/3854034). Save the
 record's [API metadata](https://zenodo.org/api/records/3854034) as
-`record.json` beside the session files.
+`record.json` beside the session files. LFP experiments additionally expect
+matching broadband files at `raw/<session>.nwb` beneath the same dataset root.
 
 Copy `assets/config/nhp/paths.example.yaml` to
 `assets/config/nhp/paths.local.yaml`, then set the absolute dataset, cache,
@@ -22,6 +23,7 @@ with `requirements.txt`; the validated lock file is
 | --- | --- |
 | `latent_dimension_sweep.yaml` | Full M1 population over latent dimensions 1–64 |
 | `neural_population_sweep.yaml` | 25%, 50%, and 100% nested populations at dimensions 16 and 64 |
+| `lfp_forecast.yaml` | Broadband LFP forecast sweep; selection is local |
 
 Create a local experiment YAML that inherits both the tracked manifest and
 `paths.local.yaml`:
@@ -30,6 +32,18 @@ Create a local experiment YAML that inherits both the tracked manifest and
 extends:
   - latent_dimension_sweep.yaml
   - ../paths.local.yaml
+```
+
+For LFP, use `lfp_forecast.local.yaml` and keep its sessions and folds in
+that local file:
+
+```yaml
+extends:
+  - lfp_forecast.yaml
+  - ../paths.local.yaml
+selection:
+  sessions: [indy_20160624_03]
+  folds: [0, 2, 4]
 ```
 
 Run from the repository root:
