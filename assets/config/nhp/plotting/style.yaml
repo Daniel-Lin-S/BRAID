@@ -18,3 +18,16 @@ presentation:
     - '#8c564b'
     - '#e377c2'
     - '#7f7f7f'
+outlier_rendering:
+  zoom_padding_fraction: 0.05
+  label_significant_figures: 3
+previews:
+  enabled: false
+  windows: 3
+  seconds: 5
+  channels: 3
+  seed: 42
+  selection:
+    sessions: null
+    folds: null
+    cases: null

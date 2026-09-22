@@ -10,7 +10,18 @@ from pathlib import Path
 
 from .analysis import read_manifest, record_plotting
 from .evaluation import aggregate, aggregate_folds, collect_results
-from .plots import plot_suite
+from .outliers import resolve_outliers
+from .plots import PlotRenderingError, plot_suite
+
+
+def attempt_plot_suite(
+    errors: list[str], label: str, *args: object, **kwargs: object,
+) -> None:
+    """Run one plot suite and retain renderer-local failures for the end."""
+    try:
+        plot_suite(*args, **kwargs)
+    except PlotRenderingError as error:
+        errors.append(f"{label}: {error}")
 
 
 def braid_report(
@@ -48,7 +59,8 @@ def braid_report(
         for member in manifest["members"].values()
     )
     rows = collect_results(root) if completed else []
-    summaries = aggregate(rows, destination) if rows else []
+    outliers = resolve_outliers(settings, rows) if rows else ()
+    summaries = aggregate(rows, destination, outliers) if rows else []
     table = {}
     for row in summaries:
         if (
@@ -58,9 +70,17 @@ def braid_report(
             or row["metric"] != "cc"
         ):
             continue
-        key = (row["population_scale"], row["nx"], row["n1"])
+        key = (
+            row["population_scale"],
+            row["nx"],
+            row["n1"],
+            row.get("n2", 0),
+        )
         item = table.setdefault(
-            key, dict(population_scale=key[0], nx=key[1], n1=key[2])
+            key,
+            dict(
+                population_scale=key[0], nx=key[1], n1=key[2], n2=key[3],
+            ),
         )
         for field in ("mean", "sem"):
             item[f"{row['target']}_cc_4step_{field}"] = row[field]
@@ -73,12 +93,19 @@ def braid_report(
             )
             writer.writeheader()
             writer.writerows(table.values())
+    rendering_errors = []
     expected = expected_comparisons(manifest, attempted)
-    plot_suite(
-        summaries, root / "plots", settings, expected, rendered=rendered,
+    attempt_plot_suite(
+        rendering_errors,
+        "aggregate",
+        summaries,
+        root / "plots",
+        settings,
+        expected,
+        rendered=rendered,
         regenerate=regenerate,
     )
-    fold_summaries = aggregate_folds(rows)
+    fold_summaries = aggregate_folds(rows, outliers)
     session_expected = expected_comparisons(
         manifest, attempted, per_session=True
     )
@@ -86,7 +113,9 @@ def braid_report(
         member["session"] for member in manifest["members"].values()
     })
     for session in sessions:
-        plot_suite(
+        attempt_plot_suite(
+            rendering_errors,
+            f"session/{session}",
             [row for row in fold_summaries if row["session"] == session],
             root / "plots" / "sessions" / session,
             settings,
@@ -94,6 +123,11 @@ def braid_report(
             rendered=rendered,
             namespace=f"session/{session}",
             regenerate=regenerate,
+        )
+    if rendering_errors:
+        raise PlotRenderingError(
+            "Comparison rendering failed after all suites were attempted: "
+            + "; ".join(rendering_errors)
         )
 
 
@@ -131,25 +165,34 @@ def expected_comparisons(
             for evaluation_set in scoring:
                 for target in ("neural", "behavior"):
                     for metric in ("cc", "r2", "mse"):
-                        candidate = dict(
+                        candidate = dict(case.get("summary_parameters", {}))
+                        candidate.update(
                             configuration=case["name"],
                             nx=case["dimensions"]["nx"],
                             population_scale=case["population_scale"],
-                            horizon=horizon, evaluation_set=evaluation_set,
-                            target=target, metric=metric,
+                            horizon=horizon,
+                            evaluation_set=evaluation_set,
+                            target=target,
+                            metric=metric,
                         )
                         if per_session:
                             candidate["session"] = member["session"]
                         group = tuple(candidate.values())
                         point = expected.setdefault(
                             group, dict(
-                                candidate, pending=False, expected_count=0,
-                                completed_count=0, failed_members=[],
+                                candidate,
+                                pending=False,
+                                expected_count=0,
+                                completed_count=0,
+                                completed_members=[],
+                                failed_members=[],
                             ),
                         )
                         point["pending"] |= pending
                         point["expected_count"] += 1
                         point["completed_count"] += int(state == "complete")
+                        if state == "complete":
+                            point["completed_members"].append(key)
                         if state == "failed" and not pending:
                             point["failed_members"].append(key)
     return list(expected.values())

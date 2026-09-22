@@ -14,10 +14,4 @@ cv:
   folds: 5
   guard_seconds: 1.8
 infer_velocity: true
-previews:
-  enabled: true
-  adapter: experiments.lfp_previews:LFPPreviewAdapter
-  windows: 3
-  seconds: 5
-  channels: 3
-  seed: 42
+preview_adapter: experiments.lfp_previews:LFPPreviewAdapter

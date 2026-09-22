@@ -10,7 +10,9 @@ import matplotlib.pyplot as plt
 from .plot import plotTimeSeriesPrediction, plotPredictionScatter
 from .tf_tools import getModelFitHistoyStr, set_global_tf_eagerly_flag, convertHistoryToDict
 
-from .tensorboard import ComponentTensorBoard, event_scope
+from .tensorboard import (
+    ComponentTensorBoard, event_scope, tensorboard_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -272,7 +274,7 @@ class ModelWithFitWithRetry:
                 callbacks_this.append(tf.keras.callbacks.LambdaCallback(
                     on_epoch_end=keep_latest_nonnan_weights_callback))
             # callbacks_this.append(CustomLearningRateScheduler())
-            if self.log_dir != '':
+            if self.log_dir != '' and tensorboard_enabled():
                 log_dir = self.log_dir
                 tensorboard = ComponentTensorBoard(log_dir)
                 callbacks_this.append(tensorboard)
@@ -468,7 +470,8 @@ class ModelWithFitWithRetry:
                     history = historyAll[bestInd]
                     history.params['history_all'] = [convertHistoryToDict(h) for h in historyAll]
                     history.params['selected_ind'] = bestInd
-            if self.log_dir != '' and (tb_make_prediction_plots or tb_make_prediction_scatters):
+            if (self.log_dir != '' and tensorboard_enabled() and (
+                    tb_make_prediction_plots or tb_make_prediction_scatters)):
                 plt.close('all')
                 del fig1, fig2, fig3, fig4
         return history

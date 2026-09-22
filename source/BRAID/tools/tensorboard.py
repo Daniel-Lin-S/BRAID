@@ -15,9 +15,33 @@ from typing import Iterator
 import tensorflow as tf
 
 _WRITERS = ContextVar("component_event_writers", default=None)
+_ENABLED = ContextVar("component_tensorboard_enabled", default=True)
 _MASK_SUFFIX = re.compile(
     r"_maskV_(?:None|[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)$"
 )
+
+
+@contextmanager
+def tensorboard_scope(enabled: bool) -> Iterator[None]:
+    """Set TensorBoard activation for one experiment fit invocation.
+
+    Parameters
+    ----------
+    enabled : bool
+        Whether component fits may attach TensorBoard callbacks.
+    """
+    if type(enabled) is not bool:
+        raise TypeError("TensorBoard activation must be Boolean.")
+    token = _ENABLED.set(enabled)
+    try:
+        yield
+    finally:
+        _ENABLED.reset(token)
+
+
+def tensorboard_enabled() -> bool:
+    """Return whether the active experiment permits event serialization."""
+    return _ENABLED.get()
 
 
 @contextmanager

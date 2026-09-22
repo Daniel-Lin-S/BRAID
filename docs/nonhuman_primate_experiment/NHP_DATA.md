@@ -45,6 +45,6 @@ Preview selection and rendering are deliberately outside numerical feature
 identity. Cached fold arrays remain the single source for fitting, scoring,
 and preview input selection.
 
-LFP preprocessing previews automatically compare short native-rate broadband
+Selected LFP preprocessing previews compare short native-rate broadband
 excerpts with the final aligned LFP. Only the selected preview interval and
 channels are read from the immutable NWB source.

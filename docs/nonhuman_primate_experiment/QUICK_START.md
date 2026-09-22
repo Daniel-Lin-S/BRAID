@@ -23,7 +23,7 @@ with `requirements.txt`; the validated lock file is
 | --- | --- |
 | `latent_dimension_sweep.yaml` | Full M1 population over latent dimensions 1–64 |
 | `neural_population_sweep.yaml` | 25%, 50%, and 100% nested populations at dimensions 16 and 64 |
-| `lfp_forecast.yaml` | Broadband LFP forecast sweep; selection is local |
+| `lfp_latent_dimension_sweep.yaml` | Broadband LFP latent sweep; selection is local |
 
 Create a local experiment YAML that inherits both the tracked manifest and
 `paths.local.yaml`:
@@ -34,13 +34,13 @@ extends:
   - ../paths.local.yaml
 ```
 
-For LFP, use `lfp_forecast.local.yaml` and keep its sessions and folds in
-that local file:
+For LFP, use `lfp_latent_dimension_sweep.local.yaml` and keep its sessions
+and folds in that local file:
 
 ```yaml
 extends:
-  - lfp_forecast.yaml
-  - ../paths.local.yaml
+  - lfp_latent_dimension_sweep.yaml
+  - ../paths.lfp.local.yaml
 selection:
   sessions: [indy_20160624_03]
   folds: [0, 2, 4]
@@ -53,25 +53,28 @@ bash scripts/train_nhp.sh --experiment assets/config/nhp/experiments/latent_dime
 bash scripts/train_nhp.sh --experiment assets/config/nhp/experiments/latent_dimension_sweep.local.yaml --stage preprocess
 bash scripts/train_nhp.sh --experiment assets/config/nhp/experiments/latent_dimension_sweep.local.yaml --stage fit --detach
 bash scripts/train_nhp.sh --experiment assets/config/nhp/experiments/latent_dimension_sweep.local.yaml --stage plot
+bash scripts/train_nhp.sh --experiment assets/config/nhp/experiments/latent_dimension_sweep.local.yaml --stage plot --previews --preview-session indy_20160407_02
 ```
 
 `--session` and `--fold` restrict the run. `--device` selects `auto`,
 `cpu`, or a GPU index/UUID; `--cache-mode` selects `reuse`, `rebuild`,
-or `off`. Use `--no-plots` or `--no-previews` to suppress those outputs.
-`--parallel-workers N` (or `runtime.parallel_workers`) runs N sessions on
+or `off`. Preview runs require selected sessions; `--preview-fold` and
+`--preview-case` narrow them. `--tensorboard` enables component event
+files for new fits. `--parallel-workers N` runs N sessions on
 distinct GPUs with `device: auto`; the default is one worker.
 `--dry-run` only resolves configuration.
 
 On resume, incomplete figures are repaired automatically, including
 comparisons whose failed contributions later complete. Set
 `runtime.figure_regeneration: all` to redraw comparison and training-history
-figures after a style change; the default is `incomplete`.
+figures after a style change. Use `runtime.preview_regeneration: all`
+to redraw selected data previews. Both default to `incomplete`.
 
 ## Find results and recover from interruption
 
 Each launch has a unique log directory containing `console.log`,
 `experiment.log`, and one `sessions/<session>.log` per session.
-`experiment.log` reports preprocessing, preview, plot, and fitting outcomes.
+`experiment.log` reports preprocessing, plotting, and fitting outcomes.
 Fitting includes session, fold, and model events; the session log contains
 detailed output and tracebacks.
 
@@ -80,9 +83,10 @@ Artifacts are rooted as follows:
 ```text
 <artifact_root>/
   experiments/<model-settings>/<session>/fold_<number>/<fit-id>/
-    checkpoints/  predictions/  components/  data_preview/
+    checkpoints/  predictions/  components/  data_preview/fitted/
   analysis/<experiment>/<analysis-id>/
     metrics/  summaries/  plots/
+<cache_root>/previews/preprocessing/<session>/fold_<number>/...
 ```
 
 Completed fits are validated and reused. A model-specific fitting, prediction,

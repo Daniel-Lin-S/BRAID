@@ -1,4 +1,4 @@
-"""Publish fit-owned previews at stable preprocessing/fitted destinations.
+"""Publish previews at stable cache-owned or fit-owned destinations.
 
 Each destination holds manifest.json and train/validation/test folders with
 PNG figures and excerpts.npz. Manifests describe sources, selections, stages,
@@ -52,6 +52,7 @@ def publish_previews(
     fitted: list[dict] | None = None,
     checkpoint: Path | None = None,
     source_checksums: dict[str, str] | None = None,
+    regenerate: bool = False,
 ) -> Path:
     """Stage all figures before replacing owned files and publishing manifest.
 
@@ -73,6 +74,8 @@ def publish_previews(
         Fitted source checkpoint; default is absent.
     source_checksums : dict, optional
         Additional protected file digests; default is absent.
+    regenerate : bool, optional
+        Force replacement of a valid matching rendering, by default False.
 
     Returns
     -------
@@ -137,7 +140,8 @@ def publish_previews(
             else {}
         )
         if (
-            previous.get("identity") == identity
+            not regenerate
+            and previous.get("identity") == identity
             and previous.get("complete")
             and all(
                 (destination / name).is_file()

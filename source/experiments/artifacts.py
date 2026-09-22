@@ -22,7 +22,10 @@ from .populations import POPULATION_SELECTION_POLICY
 FIT_SCHEMA = 1
 SEED_MODULUS = 2**31 - 1
 PRESENTATION_KEYS = ("verbose", "save_logs", "epoch_artifacts", "clear_graph")
-LOCATION_KEYS = ("root", "cache_root", "cache_mode", "previews", "path")
+LOCATION_KEYS = (
+    "root", "cache_root", "cache_mode", "previews",
+    "preview_adapter", "path",
+)
 MODEL_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 SETTINGS_FILENAME = "model_settings.json"
 SETTINGS_LOCK = "model_settings.lock"

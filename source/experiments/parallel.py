@@ -62,7 +62,7 @@ def _plan(snapshots: dict, arguments: object, root: Path) -> dict:
         settings=dict(
             snapshots["evaluation"], seed=experiment["seed"],
             model_plugin=experiment["model_plugin"],
-            velocity=data["infer_velocity"], previews=data["previews"],
+            velocity=data["infer_velocity"],
         ),
     )
 

@@ -94,7 +94,7 @@ def test_session_output_has_one_owner(tmp_path, failure):
         assert "Finished session=session_b fold=1" in text["experiment.log"]
         assert (
             "Finished stage=preprocess session=preprocess_a fold=0; "
-            "previews=2 failed=0"
+            "folds=2 failed=0"
         ) in text["experiment.log"]
         assert (
             "Finished stage=plot analysis=analysis_a; reports=1 failed=0"
@@ -224,10 +224,9 @@ def test_component_completion_restores_without_fit(tmp_path, monkeypatch):
     assert all(file_digest(p) == digest for p, digest in before.items())
 
 
-def test_fitted_excerpts_have_one_canonical_payload(tmp_path):
-    """Publish fitted arrays once and keep fitting indices only in the run."""
+def test_backend_save_does_not_publish_preview_payload(tmp_path):
+    """Checkpoint saving remains independent of preview rendering."""
     from experiments.braid_backend import BRAIDBackend
-    from experiments.cache import load_entry
 
     class SavedModel:
         def saveToFile(self, path):
@@ -244,15 +243,12 @@ def test_fitted_excerpts_have_one_canonical_payload(tmp_path):
     backend.feature_cache = tmp_path / "fold-cache"
     backend.preview_excerpts = [dict(t=np.arange(5), Y=np.ones((5, 2)))]
     np.savez_compressed(artifact_path(run, "fit_indices.npz"), training=[1, 2])
-    backend.save(artifact_path(run, "model.p"))
-    reference = json.loads(
-        artifact_path(run, "fitted_excerpts.json").read_text()
-    )
-    entry = load_entry(Path(reference["directory"]), reference["identity"])
-    assert entry.arrays["window_0_Y"].shape == (5, 2)
-    assert not list(run.glob("fitted_preprocessing*"))
+    checkpoint = artifact_path(run, "model.p")
+    backend.save(checkpoint)
+    assert checkpoint.read_bytes() == b"checkpoint"
+    assert not artifact_path(run, "fitted_excerpts.json").exists()
     assert len(list(tmp_path.rglob("fit_indices.npz"))) == 1
-    assert len(list(tmp_path.rglob("arrays.npz"))) == 1
+    assert not list(tmp_path.rglob("arrays.npz"))
 
 
 def test_run_hash_excludes_invocation_settings():

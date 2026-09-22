@@ -39,13 +39,12 @@ def canonical_horizons(horizons: list[int]) -> list[int]:
     return sorted(horizons)
 
 
-def make_backend(identity: dict, run: Path, previews: dict) -> Model:
+def make_backend(identity: dict, run: Path) -> Model:
     """Construct the configured fitting adapter using its recorded seed."""
     return plugin(
         identity["configurations"]["experiment"]["model_plugin"],
         configuration=str(artifact_path(run, "model_configuration.yaml")),
         overrides=identity["model_overrides"], seed=fit_seed(identity),
-        previews=previews,
     )
 
 
@@ -105,6 +104,9 @@ def ensure_fit(
             artifact_path(run, "runtime.json"),
             dict(
                 gpu=gpu, pid=os.getpid(),
+                tensorboard=bool(
+                    getattr(arguments, "tensorboard", False)
+                ),
                 cache=str(features.path) if features.path else None,
                 text_log=str((
                     arguments.log_directory / "sessions"
@@ -129,9 +131,19 @@ def ensure_fit(
             from .restart import prepare_components
 
             prepare_components(run / "components")
-            backend = make_backend(identity, run, {"enabled": False})
-            backend.fit(features, columns, identity["case"]["dimensions"], run)
-            backend.save(artifact_path(run, "model.p"))
+            from BRAID.tools.tensorboard import tensorboard_scope
+
+            backend = make_backend(identity, run)
+            with tensorboard_scope(
+                bool(getattr(arguments, "tensorboard", False))
+            ):
+                backend.fit(
+                    features,
+                    columns,
+                    identity["case"]["dimensions"],
+                    run,
+                )
+                backend.save(artifact_path(run, "model.p"))
             atomic_json(status, dict(state="complete"))
             checksums = {
                 name: file_digest(artifact_path(run, name))
@@ -295,7 +307,7 @@ def ensure_predictions(
                 quarantine.resolve(),
             )
         directory.mkdir()
-        backend = make_backend(identity, run, {"enabled": False})
+        backend = make_backend(identity, run)
         backend.load(artifact_path(run, "model.p"))
         arrays = prediction_arrays(
             backend, run, identity, features, columns, horizons

@@ -2,6 +2,8 @@
 
 import copy
 import json
+import os
+import time
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -12,7 +14,7 @@ from experiments.contracts import FeatureSet
 from experiments.presentation import presentation
 from experiments.preview_publication import publish_previews
 from experiments.preview_rendering import PreviewStage, signal_figure
-from experiments.previews import preview_windows
+from experiments.previews import fitted_previews, preview_windows
 from experiments.signal_previews import (
     preview_columns,
     signal_stages,
@@ -207,6 +209,18 @@ def test_file_tree_and_in_place_refresh(signals, tmp_path):
         columns,
     )
     assert image.stat().st_mtime_ns == before
+    time.sleep(0.01)
+    publish_previews(
+        signals,
+        signals,
+        settings,
+        destination,
+        windows,
+        columns,
+        regenerate=True,
+    )
+    refreshed = image.stat().st_mtime_ns
+    assert refreshed != before
     changed = copy.deepcopy(settings)
     changed["presentation"]["title_font"] = 34
     publish_previews(
@@ -217,7 +231,7 @@ def test_file_tree_and_in_place_refresh(signals, tmp_path):
         windows,
         columns,
     )
-    assert image.stat().st_mtime_ns != before
+    assert image.stat().st_mtime_ns != refreshed
     fitted = [
         dict(
             channel_ids=signals.arrays["ids"],
@@ -272,6 +286,9 @@ def test_checkpoint_inference_never_fits(signals, tmp_path, monkeypatch):
         def apply(self, values):
             return values + 3
 
+        def get_overall_W(self):
+            return None
+
     calls = []
 
     def predict(neural, inputs):
@@ -305,3 +322,419 @@ def test_checkpoint_inference_never_fits(signals, tmp_path, monkeypatch):
             values["main_Z"],
             values["learned_Z"] + 3,
         )
+
+
+def test_checkpoint_previews_follow_retained_neural_channels(
+    signals,
+    tmp_path,
+    monkeypatch,
+):
+    """Render only channels retained by a checkpoint preprocessing map."""
+    from types import SimpleNamespace
+
+    from BRAID.tools.LinearMapping import LinearMapping
+    from experiments import artifacts, braid_backend
+
+    (tmp_path / "configuration").mkdir()
+    (tmp_path / "data").mkdir()
+    (tmp_path / "configuration" / "fit_arguments.json").write_text(
+        json.dumps(dict(args_base=dict(sequence_length=128)))
+    )
+    np.savez_compressed(
+        tmp_path / "data" / "selection.npz",
+        selected_columns=np.arange(4),
+        channel_ids=signals.arrays["ids"],
+        unit_dimensions=signals.arrays["units"],
+    )
+
+    class Mapping:
+        def apply(self, values):
+            return values + 3
+
+        def get_overall_W(self):
+            return None
+
+    neural = LinearMapping()
+    neural.set_to_dimension_remover(np.array([True, False, True, True]))
+    component = SimpleNamespace(
+        YPrepMap=neural,
+        ZPrepMap=Mapping(),
+        UPrepMap=Mapping(),
+        predict=lambda y, u: (np.column_stack([u, u]),),
+    )
+    model = SimpleNamespace(sId_pre=component, sId=component)
+    monkeypatch.setattr(artifacts, "validate_completion", lambda run: {})
+    monkeypatch.setattr(
+        braid_backend.BRAIDModel,
+        "loadFromFile",
+        lambda path: model,
+    )
+    windows = preview_windows(signals, preview_settings())
+    fitted = braid_backend.checkpoint_preview_arrays(tmp_path, signals, windows)
+    for values in fitted:
+        np.testing.assert_array_equal(
+            values["channel_ids"],
+            np.array(["A", "C", "D"]),
+        )
+        assert values["pre_Y"].shape == (50, 3)
+        assert values["main_Y"].shape == (50, 3)
+
+    run = tmp_path / "fit"
+    checkpoint = run / "checkpoints" / "model.p"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"checkpoint")
+
+    def preview_plugin(reference, **kwargs):
+        return fitted
+
+    monkeypatch.setattr("experiments.previews.plugin", preview_plugin)
+    output = fitted_previews(
+        signals,
+        signals,
+        preview_settings(),
+        run,
+        "test:checkpoint_preview_arrays",
+        windows,
+    )
+    with np.load(output / "train" / "excerpts.npz") as excerpt:
+        np.testing.assert_array_equal(
+            excerpt["channel_ids"],
+            np.array(["A", "C", "D"]),
+        )
+        assert excerpt["pre_Y"].shape == (50, 3)
+
+
+def preview_manifest(cases, states):
+    """Build one analysis manifest for preview orchestration tests."""
+    members = {}
+    for case, state in zip(cases, states):
+        key = f"{case['name']}/session_a/fold_0"
+        members[key] = dict(
+            session="session_a",
+            fold=0,
+            case=case,
+            state=state,
+            fit=(
+                "experiments/model/session_a/fold_0/"
+                f"{case['name']}"
+            ),
+        )
+    return {"members": members}
+
+
+def preview_orchestration_fixture(tmp_path):
+    """Return cache-backed arrays and a deterministic in-memory dataset."""
+    arrays = dict(
+        t=np.arange(600) / 10,
+        Y=np.ones((600, 4)),
+        Z=np.ones((600, 2)),
+        U=np.ones((600, 2)),
+        indices=np.arange(600),
+        ids=np.array(["A", "B", "C", "D"]),
+        units=np.arange(4),
+        role=np.repeat(np.arange(3), 200),
+        segment=np.repeat(np.arange(3), 200),
+    )
+    session = FeatureSet(arrays, dict(session="session_a"))
+    fold_path = tmp_path / "cache" / "fold" / "entry"
+    fold_path.mkdir(parents=True)
+    (fold_path / "manifest.json").write_text(
+        json.dumps(
+            {
+                "identity": {"fold": 0, "source": "fixture"},
+                "sha256": "fold-payload",
+            }
+        )
+    )
+    fold = FeatureSet(
+        arrays,
+        dict(session="session_a", fold=0),
+        fold_path,
+    )
+    observed = {}
+
+    class Dataset:
+        def __init__(self, settings):
+            observed["settings"] = settings
+
+        def sessions(self):
+            return ["session_a"]
+
+        def inventory(self):
+            return {"session_a": arrays["ids"].tolist()}
+
+        def load(self, name):
+            observed.setdefault("loads", []).append(name)
+            return session
+
+        def fold(self, source, number, velocity):
+            observed.setdefault("folds", []).append((number, velocity))
+            return fold
+
+    return Dataset, observed
+
+
+def preview_snapshots(tmp_path, cases):
+    """Build minimal resolved settings for plot-stage preview tests."""
+    return dict(
+        experiment=dict(
+            seed=42,
+            preview_model_plugin="fixture:preview",
+        ),
+        data=dict(
+            plugin="fixture:dataset",
+            cache_mode="rebuild",
+            infer_velocity=True,
+            preview_adapter=None,
+        ),
+        plotting=dict(
+            presentation=STYLE,
+            previews=dict(
+                enabled=True,
+                windows=3,
+                seconds=5,
+                channels=3,
+                seed=42,
+                selection=dict(
+                    sessions=["session_a"],
+                    folds=None,
+                    cases=[case["name"] for case in cases],
+                ),
+            ),
+        ),
+        runtime=dict(preview_regeneration="incomplete"),
+        paths=dict(
+            cache_root=str(tmp_path / "cache"),
+            artifact_root=str(tmp_path / "artifacts"),
+        ),
+    )
+
+
+def test_render_settings_uses_whole_analysis_suite(monkeypatch):
+    """The largest model context defines every canonical preview window."""
+    from experiments import preview_regeneration
+
+    cases = [{"name": "short"}, {"name": "long"}]
+    snapshots = dict(
+        plotting=dict(
+            presentation=STYLE,
+            previews=dict(
+                enabled=True,
+                selection={},
+                windows=3,
+                seconds=5,
+                channels=3,
+                seed=42,
+            ),
+        ),
+        data=dict(preview_adapter="fixture:adapter"),
+    )
+
+    def resolve(identity):
+        length = 128 if identity["case"]["name"] == "short" else 256
+        return {"args_base": {"sequence_length": length}}
+
+    monkeypatch.setattr(preview_regeneration, "resolved_fit", resolve)
+    settings = preview_regeneration._render_settings(snapshots, cases)
+    assert settings["context_samples"] == 256
+    assert settings["adapter"] == "fixture:adapter"
+    assert "enabled" not in settings and "selection" not in settings
+
+
+def test_population_destination_excludes_source_location(tmp_path):
+    """Shared preview ownership follows scientific fold provenance."""
+    from experiments.preview_regeneration import _population_destination
+
+    arrays = dict(ids=np.array(["A", "B"]))
+    destinations = []
+    for number, source in enumerate(("/machine/a", "/machine/b")):
+        path = tmp_path / f"fold_{number}"
+        path.mkdir()
+        (path / "manifest.json").write_text(json.dumps({
+            "identity": {
+                "fold": 0,
+                "source": {"sha256": "source-digest", "source": source},
+            },
+            "sha256": "fold-digest",
+        }))
+        fold = FeatureSet(arrays, {}, path)
+        destinations.append(_population_destination(
+            tmp_path,
+            "session_a",
+            0,
+            fold,
+            np.array([1, 0]),
+        ))
+    assert destinations[0] == destinations[1]
+
+
+def test_plot_previews_share_population_windows_and_warn_unavailable(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    """One population rendering serves models and unavailable fits warn once."""
+    from experiments import preview_regeneration
+
+    cases = [
+        dict(name="case_a", population_scale=1.0),
+        dict(name="case_b", population_scale=1.0),
+    ]
+    manifest = preview_manifest(cases, ["complete", "failed"])
+    snapshots = preview_snapshots(tmp_path, cases)
+    Dataset, observed = preview_orchestration_fixture(tmp_path)
+    calls = {"preprocessing": [], "fitted": []}
+
+    monkeypatch.setattr(
+        preview_regeneration, "read_manifest", lambda root: manifest
+    )
+    monkeypatch.setattr(
+        preview_regeneration,
+        "_render_settings",
+        lambda settings, values: dict(
+            windows=3,
+            seconds=5,
+            channels=3,
+            seed=42,
+            context_samples=128,
+            presentation=STYLE,
+            adapter=None,
+        ),
+    )
+    monkeypatch.setattr(
+        preview_regeneration,
+        "plugin",
+        lambda reference, **kwargs: Dataset(kwargs["settings"]),
+    )
+
+    def preprocessing(*args):
+        calls["preprocessing"].append(args)
+
+    def fitted(*args):
+        calls["fitted"].append(args)
+
+    monkeypatch.setattr(
+        preview_regeneration, "preprocessing_previews", preprocessing
+    )
+    monkeypatch.setattr(preview_regeneration, "fitted_previews", fitted)
+    caplog.set_level("WARNING")
+    result = preview_regeneration.render_previews(snapshots, tmp_path)
+    assert result == {"preprocessing": 1, "fitted": 1}
+    assert observed["settings"]["cache_mode"] == "reuse"
+    assert observed["loads"] == ["session_a"]
+    assert observed["folds"] == [(0, True)]
+    assert len(calls["preprocessing"]) == 1
+    assert len(calls["fitted"]) == 1
+    preprocessing_windows = calls["preprocessing"][0][5]
+    fitted_windows = calls["fitted"][0][5]
+    assert preprocessing_windows is fitted_windows
+    destination = calls["preprocessing"][0][3]
+    assert destination.is_relative_to(
+        tmp_path / "cache" / "previews" / "preprocessing"
+    )
+    assert calls["preprocessing"][0][-1] is False
+    assert calls["fitted"][0][-1] is False
+    assert "case_b" in caplog.text
+    assert caplog.text.count("unavailable fitted preview") == 1
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "-1"
+
+
+def test_preview_rendering_continues_then_fails(tmp_path, monkeypatch):
+    """Independent population failures are collected after every attempt."""
+    from experiments import preview_regeneration
+
+    cases = [
+        dict(name="half", population_scale=0.5),
+        dict(name="full", population_scale=1.0),
+    ]
+    snapshots = preview_snapshots(tmp_path, [])
+    snapshots["plotting"]["previews"]["selection"]["cases"] = []
+    manifest = preview_manifest(cases, ["pending", "pending"])
+    Dataset, _ = preview_orchestration_fixture(tmp_path)
+    attempts = []
+
+    monkeypatch.setattr(
+        preview_regeneration, "read_manifest", lambda root: manifest
+    )
+    monkeypatch.setattr(
+        preview_regeneration,
+        "_render_settings",
+        lambda settings, values: dict(
+            windows=3,
+            seconds=5,
+            channels=2,
+            seed=42,
+            context_samples=128,
+            presentation=STYLE,
+            adapter=None,
+        ),
+    )
+    monkeypatch.setattr(
+        preview_regeneration,
+        "plugin",
+        lambda reference, **kwargs: Dataset(kwargs["settings"]),
+    )
+
+    def fail(*args):
+        attempts.append(args[3])
+        raise ValueError("injected preview failure")
+
+    monkeypatch.setattr(preview_regeneration, "preprocessing_previews", fail)
+    with pytest.raises(RuntimeError, match="independent selections"):
+        preview_regeneration.render_previews(snapshots, tmp_path)
+    assert len(attempts) == 2
+    assert attempts[0] != attempts[1]
+
+
+def test_preview_cache_failure_does_not_skip_later_fold(
+    tmp_path,
+    monkeypatch,
+):
+    """Aggregate one cache failure after independent folds are attempted."""
+    from experiments import preview_regeneration
+
+    case = dict(name="case_a", population_scale=1.0)
+    manifest = preview_manifest([case], ["pending"])
+    second = copy.deepcopy(next(iter(manifest["members"].values())))
+    second["fold"] = 1
+    manifest["members"]["case_a/session_a/fold_1"] = second
+    snapshots = preview_snapshots(tmp_path, [])
+    Dataset, _ = preview_orchestration_fixture(tmp_path)
+    attempts = []
+
+    class FailingDataset(Dataset):
+        def fold(self, source, number, velocity):
+            if number == 0:
+                raise ValueError("injected cache failure")
+            return super().fold(source, number, velocity)
+
+    monkeypatch.setattr(
+        preview_regeneration, "read_manifest", lambda root: manifest
+    )
+    monkeypatch.setattr(
+        preview_regeneration,
+        "_render_settings",
+        lambda settings, values: dict(
+            windows=3,
+            seconds=5,
+            channels=2,
+            seed=42,
+            context_samples=128,
+            presentation=STYLE,
+            adapter=None,
+        ),
+    )
+    monkeypatch.setattr(
+        preview_regeneration,
+        "plugin",
+        lambda reference, **kwargs: FailingDataset(kwargs["settings"]),
+    )
+    monkeypatch.setattr(
+        preview_regeneration,
+        "preprocessing_previews",
+        lambda *args: attempts.append(args[3]),
+    )
+    with pytest.raises(RuntimeError, match="injected cache failure"):
+        preview_regeneration.render_previews(snapshots, tmp_path)
+    assert len(attempts) == 1
+    assert "fold_1" in str(attempts[0])

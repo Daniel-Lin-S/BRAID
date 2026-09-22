@@ -17,6 +17,7 @@ from BRAID.tools.evaluation import evalPrediction
 
 from .analysis import read_manifest, validate_member
 from .cache import atomic_json
+from .outliers import OutlierRule, matching_rule
 
 LOGGER = logging.getLogger(__name__)
 METRICS = {"cc": "CC", "r2": "R2", "mse": "MSE"}
@@ -217,7 +218,33 @@ def collect_results(root: Path) -> list[dict]:
     return rows
 
 
-def aggregate_folds(rows: list[dict]) -> list[dict]:
+def metric_member(row: dict) -> str:
+    """Return the analysis member key owning one metric row."""
+    return (
+        f"{row['configuration']}/{row['session']}/fold_{row['fold']}"
+    )
+
+
+def _outlier_event(
+    member: str, value: float | None, rule: OutlierRule,
+) -> dict:
+    """Record one presentation-only exclusion without changing raw values."""
+    if value is None or not np.isfinite(value):
+        raise ValueError(
+            f"Configured outlier {member} has no finite metric value."
+        )
+    return dict(
+        member=member,
+        value=float(value),
+        reason=rule.reason,
+        aggregate_exclude=rule.aggregate_exclude,
+        session_zoom=rule.session_zoom,
+    )
+
+
+def aggregate_folds(
+    rows: list[dict], outliers: tuple[OutlierRule, ...] = (),
+) -> list[dict]:
     """Calculate per-session fold statistics for in-memory plotting.
 
     Parameters
@@ -237,6 +264,8 @@ def aggregate_folds(rows: list[dict]) -> list[dict]:
         "population_scale",
         "nx",
         "n1",
+        "n2",
+        "residual",
         "horizon",
         "evaluation_set",
         "target",
@@ -251,22 +280,42 @@ def aggregate_folds(rows: list[dict]) -> list[dict]:
                     row["population_scale"],
                     row["nx"],
                     row["n1"],
+                    row.get("n2", 0),
+                    row.get("residual", False),
                     row["horizon"],
                     row["evaluation_set"],
                     target,
                     metric,
                 )
-                groups.setdefault(key, []).append(
-                    row[target][f"mean_{metric}"]
-                )
+                groups.setdefault(key, []).append((
+                    metric_member(row),
+                    row[target][f"mean_{metric}"],
+                    matching_rule(outliers, row, target, metric),
+                ))
     summaries = []
     for key, values in sorted(groups.items()):
+        included = [
+            (member, value)
+            for member, value, rule in values
+            if not (rule is not None and rule.session_zoom)
+        ]
         finite = np.asarray(
-            [value for value in values if value is not None], dtype=float
+            [value for _, value in included if value is not None], dtype=float
         )
         if finite.size and not np.isfinite(finite).all():
             identity = dict(zip(names, key))
             raise ValueError(f"Nonfinite fold aggregate for {identity}.")
+        events = [
+            _outlier_event(member, value, rule)
+            for member, value, rule in values
+            if rule is not None and rule.session_zoom
+        ]
+        if events and not finite.size:
+            identity = dict(zip(names, key))
+            raise ValueError(
+                "No finite normal fold metrics remain after outlier exclusion "
+                f"for {identity}."
+            )
         summaries.append(
             dict(
                 zip(names, key),
@@ -277,12 +326,19 @@ def aggregate_folds(rows: list[dict]) -> list[dict]:
                     else None
                 ),
                 folds=int(finite.size),
+                missing_members=sorted(
+                    member for member, value in included if value is None
+                ),
+                outliers=events,
             )
         )
     return summaries
 
 
-def aggregate(rows: list[dict], destination: Path) -> list[dict]:
+def aggregate(
+    rows: list[dict], destination: Path,
+    outliers: tuple[OutlierRule, ...] = (),
+) -> list[dict]:
     """Average folds per session, then compute sample SEM across sessions."""
     if not rows:
         raise ValueError("Cannot aggregate empty evaluation rows.")
@@ -295,6 +351,8 @@ def aggregate(rows: list[dict], destination: Path) -> list[dict]:
                     row["population_scale"],
                     row["nx"],
                     row["n1"],
+                    row.get("n2", 0),
+                    row.get("residual", False),
                     row["horizon"],
                     row["evaluation_set"],
                     target,
@@ -302,31 +360,65 @@ def aggregate(rows: list[dict], destination: Path) -> list[dict]:
                 )
                 groups.setdefault(key, {}).setdefault(
                     row["session"], []
-                ).append(row[target][f"mean_{metric}"])
+                ).append((
+                    metric_member(row),
+                    row[target][f"mean_{metric}"],
+                    matching_rule(outliers, row, target, metric),
+                ))
     summaries = []
     names = (
         "configuration",
         "population_scale",
         "nx",
         "n1",
+        "n2",
+        "residual",
         "horizon",
         "evaluation_set",
         "target",
         "metric",
     )
     for key, sessions in sorted(groups.items()):
-        valid = all(
-            all(v is not None for v in values) for values in sessions.values()
-        )
-        means = (
-            np.array([np.mean(values) for values in sessions.values()])
-            if valid
-            else np.array([])
-        )
-        mean = float(means.mean()) if valid else None
+        session_means = []
+        missing_members = []
+        metric_counts = {}
+        excluded = []
+        for session, values in sessions.items():
+            included = [
+                (member, value)
+                for member, value, rule in values
+                if not (rule is not None and rule.aggregate_exclude)
+            ]
+            excluded.extend(
+                _outlier_event(member, value, rule)
+                for member, value, rule in values
+                if rule is not None and rule.aggregate_exclude
+            )
+            finite = [value for _, value in included if value is not None]
+            missing_members.extend(
+                member for member, value in included if value is None
+            )
+            metric_counts[session] = len(finite)
+            if finite:
+                session_means.append(np.mean(finite))
+        means = np.asarray(session_means, dtype=float)
+        if means.size and not np.isfinite(means).all():
+            identity = dict(zip(names, key))
+            raise ValueError(f"Nonfinite session aggregate for {identity}.")
+        if excluded:
+            identity = dict(zip(names, key))
+            LOGGER.warning(
+                "Excluding %d finite outlier contribution(s) from aggregate "
+                "%s; members=%s reasons=%s",
+                len(excluded),
+                identity,
+                sorted({item["member"] for item in excluded}),
+                sorted({item["reason"] for item in excluded}),
+            )
+        mean = float(means.mean()) if means.size else None
         sem = (
             float(means.std(ddof=1) / np.sqrt(len(means)))
-            if valid and len(means) > 1
+            if len(means) > 1
             else None
         )
         summaries.append(
@@ -335,7 +427,13 @@ def aggregate(rows: list[dict], destination: Path) -> list[dict]:
                 mean=mean,
                 sem=sem,
                 sessions=len(sessions),
+                contributing_sessions=len(means),
                 fold_counts={s: len(v) for s, v in sessions.items()},
+                metric_counts=metric_counts,
+                missing_members=sorted(missing_members),
+                excluded_members=sorted({item["member"] for item in excluded}),
+                excluded_contribution_count=len(excluded),
+                outlier_exclusions=excluded,
                 aggregation="mean_folds_then_sample_sem_sessions",
             )
         )
@@ -354,6 +452,8 @@ def aggregate(rows: list[dict], destination: Path) -> list[dict]:
             "population_scale",
             "nx",
             "n1",
+            "n2",
+            "residual",
             "horizon",
             "evaluation_set",
             "target",
@@ -363,7 +463,18 @@ def aggregate(rows: list[dict], destination: Path) -> list[dict]:
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
         for row in rows:
-            base = {key: row[key] for key in fields[:8]}
+            base = dict(
+                session=row["session"],
+                fold=row["fold"],
+                configuration=row["configuration"],
+                population_scale=row["population_scale"],
+                nx=row["nx"],
+                n1=row["n1"],
+                n2=row.get("n2", 0),
+                residual=row.get("residual", False),
+                horizon=row["horizon"],
+                evaluation_set=row["evaluation_set"],
+            )
             for target in ("neural", "behavior"):
                 for metric in METRICS:
                     writer.writerow(

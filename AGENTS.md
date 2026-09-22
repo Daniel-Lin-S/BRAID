@@ -1,5 +1,11 @@
 # Agent Instructions
 
+## FIRST PRINCIPLE -- GRILL ME
+
+You should always grill me on ALL technical details and design choices rather than making guessworks or silently setting default values by yourself.
+
+Anti-example: I asked you to redesign the artifact figures, and you silently designed the content of one or several figures without checking details like x-y axis meanings, axis ticks, legends, plot timing with me.
+
 ## Break-point restoration
 
 All experiments should store artifacts immediately after the results of one fit (the smallest unit of experiment, e.g., be one neural or non-neural fitting of a single random seed) are obtained to avoid losing results of already completed runs. However, failed, invalid, or interrupted run artifacts should be removed or quanrantined in the next invocation, starting a fresh experiment on that fit.

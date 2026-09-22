@@ -1,0 +1,24 @@
+extends: style.yaml
+enabled: true
+metrics: [cc, r2, mse]
+curves:
+- name: dimension_by_horizon
+  parameter: nx
+  group: horizon
+  branch: residual
+  panel: target
+  where:
+    target: [neural, behavior]
+    metric: cc
+    population_scale: 1.0
+    evaluation_set: full
+- name: horizon_by_dimension
+  parameter: horizon
+  group: nx
+  branch: residual
+  panel: target
+  where:
+    target: [neural, behavior]
+    metric: cc
+    population_scale: 1.0
+    evaluation_set: full

@@ -13,7 +13,6 @@ from experiments.presentation import presentation
 
 STYLE = presentation()
 
-
 def history_rows(
     output: str | None = None,
     horizons: tuple[int, ...] = tuple(range(1, 9)),
@@ -38,7 +37,6 @@ def history_rows(
         )
         for epoch in range(1, 5)
     ]
-
 
 def test_horizon_layout_colors_and_axes(tmp_path):
     rows = history_rows()
@@ -75,7 +73,6 @@ def test_horizon_layout_colors_and_axes(tmp_path):
     assert history.read_bytes() == original
     assert not list(tmp_path.rglob("stage_loss_summary.json"))
 
-
 def test_analysis_catalogue_and_undefined_gaps(tmp_path):
     specifications = []
     for name, count in (
@@ -102,13 +99,13 @@ def test_analysis_catalogue_and_undefined_gaps(tmp_path):
         dict(spec["where"], nx=nx, mean=value, sem=None)
         for nx, value in ((1, -1), (2, None), (4, 0.5))
     ]
-    figure = metric_curve(rows, spec, STYLE, partial=True)
+    figure = metric_curve(rows, spec, STYLE)
     try:
         axis = figure.axes[0]
         assert axis.get_xscale() == "log"
         assert "R²" in axis.get_ylabel()
         assert np.isnan(axis.lines[0].get_ydata()[1])
-        assert "partial" in figure._suptitle.get_text()
+        assert "partial" not in figure._suptitle.get_text()
         assert not axis.containers
     finally:
         plt.close(figure)
@@ -116,7 +113,6 @@ def test_analysis_catalogue_and_undefined_gaps(tmp_path):
     with pytest.raises(RuntimeError, match="No finite results"):
         plot_suite([], tmp_path, settings)
     assert not list(tmp_path.glob("*.png"))
-
 
 def test_preview_error_does_not_invalidate_scientific_work():
     from experiments.diagnostics import render_safely
@@ -128,7 +124,6 @@ def test_preview_error_does_not_invalidate_scientific_work():
 
     render_safely(failures, "preview", fail)
     assert failures == ["preview: ValueError: No valid preview window"]
-
 
 def test_component_monitor_observes_completion(tmp_path):
     """A spawned renderer reads only published components and reports errors."""
@@ -157,7 +152,6 @@ def test_component_monitor_observes_completion(tmp_path):
     assert not failures
     assert (component / "plots" / "attempt_1" / "total_loss.png").exists()
     assert history.read_bytes() == before
-
 
 def test_completed_indexed_component_repairs_only_missing_plots(tmp_path):
     """Resume an indexed-output component without redrawing existing PNGs."""
@@ -205,7 +199,6 @@ def test_completed_indexed_component_repairs_only_missing_plots(tmp_path):
         "total_loss.png"
     ]
 
-
 def test_all_comparison_files_are_generated(tmp_path):
     """Publish all 12 comparison figures using real plot configurations."""
     from itertools import product
@@ -240,7 +233,6 @@ def test_all_comparison_files_are_generated(tmp_path):
         plot_suite(rows, destination, settings)
         assert len(list(destination.glob("*.png"))) == count
         assert not (destination / "behavior_example.png").exists()
-
 
 def test_latent_comparisons_use_panels_and_redundant_group_styles():
     """Both latent views distinguish every series beyond color alone."""
@@ -313,6 +305,135 @@ def test_latent_comparisons_use_panels_and_redundant_group_styles():
             plt.close(figure)
 
 
+def _residual_plot_rows(
+    horizons: tuple[int, ...] = (1, 2),
+) -> list[dict]:
+    """Build complete residual-grid summaries for both target panels."""
+    splits = (
+        (1, 1, 0),
+        (2, 2, 0),
+        (4, 4, 0),
+        (8, 8, 0),
+        (16, 16, 0),
+        (32, 32, 0),
+        (64, 64, 0),
+        (8, 4, 4),
+        (16, 8, 8),
+        (32, 16, 16),
+        (64, 16, 48),
+    )
+    return [
+        dict(
+            nx=nx,
+            n1=n1,
+            n2=n2,
+            residual=n2 > 0,
+            horizon=horizon,
+            target=target,
+            metric="cc",
+            population_scale=1.0,
+            evaluation_set="full",
+            mean=0.5,
+            std=0.05,
+        )
+        for nx, n1, n2 in splits
+        for horizon in horizons
+        for target in ("neural", "behavior")
+    ]
+
+def test_residual_comparisons_branch_from_resolved_dimensions():
+    """Residual figure branches derive from n1/n2 without fixed thresholds."""
+    settings = read_yaml(
+        CONFIGURATION / "plotting" / "latent_dimension_residual_sweep.yaml"
+    )
+    specs = curve_specs(settings)
+    rows = _residual_plot_rows()
+    nx_spec = next(
+        spec for spec in specs
+        if spec["name"] == "cc_vs_nx_by_horizon"
+    )
+    horizon_spec = next(
+        spec for spec in specs
+        if spec["name"] == "cc_vs_horizon_by_nx"
+    )
+    nx_figure = metric_curve(rows, nx_spec, STYLE)
+    horizon_figure = metric_curve(rows, horizon_spec, STYLE)
+    try:
+        nx_lines = [
+            line for line in nx_figure.axes[0].lines
+            if not line.get_label().startswith("_")
+        ]
+        assert [line.get_label() for line in nx_lines] == [
+            "1 step, main only",
+            "1 step, residual",
+            "2 steps, main only",
+            "2 steps, residual",
+        ]
+        np.testing.assert_allclose(
+            nx_lines[1].get_xdata(), [4, 8, 16, 32, 64]
+        )
+        assert nx_lines[0].get_color() == nx_lines[1].get_color()
+        assert nx_lines[0].get_linestyle() != nx_lines[1].get_linestyle()
+        horizon_lines = [
+            line for line in horizon_figure.axes[0].lines
+            if not line.get_label().startswith("_")
+        ]
+        assert len(horizon_lines) == 11
+        assert "nx=8, n1=4, n2=4" in {
+            line.get_label() for line in horizon_lines
+        }
+    finally:
+        plt.close(nx_figure)
+        plt.close(horizon_figure)
+
+def test_residual_branching_adapts_to_grid_and_rejects_ambiguity():
+    """Branching follows rows and identifies conflicting residual members."""
+    settings = read_yaml(
+        CONFIGURATION / "plotting" / "latent_dimension_residual_sweep.yaml"
+    )
+    spec = next(
+        spec for spec in curve_specs(settings)
+        if spec["name"] == "cc_vs_nx_by_horizon"
+    )
+    rows = [
+        dict(
+            nx=nx,
+            n1=n1,
+            n2=n2,
+            residual=n2 > 0,
+            horizon=1,
+            target="neural",
+            metric="cc",
+            population_scale=1.0,
+            evaluation_set="full",
+            mean=0.5,
+            std=0.05,
+        )
+        for nx, n1, n2 in ((1, 1, 0), (2, 2, 0), (4, 2, 2))
+    ]
+    figure = metric_curve(rows, spec, STYLE)
+    try:
+        lines = [
+            line for line in figure.axes[0].lines
+            if not line.get_label().startswith("_")
+        ]
+        np.testing.assert_allclose(lines[1].get_xdata(), [2, 4])
+    finally:
+        plt.close(figure)
+    no_residual = [row for row in rows if row["n2"] == 0]
+    figure = metric_curve(no_residual, spec, STYLE)
+    try:
+        lines = [
+            line for line in figure.axes[0].lines
+            if not line.get_label().startswith("_")
+        ]
+        assert [line.get_label() for line in lines] == ["1 step, main only"]
+    finally:
+        plt.close(figure)
+    ambiguous = rows + [dict(rows[-1], n1=1, n2=3)]
+    with pytest.raises(ValueError, match="Ambiguous residual branch"):
+        metric_curve(ambiguous, spec, STYLE)
+
 def test_panel_curve_change_invalidates_existing_png(tmp_path):
     """Missing-only rendering replaces figures with changed semantics."""
     from copy import deepcopy
@@ -345,7 +466,6 @@ def test_panel_curve_change_invalidates_existing_png(tmp_path):
     changed["curves"][0]["where"]["target"].reverse()
     plot_suite(rows, tmp_path, changed)
     assert path.read_bytes() != original
-
 
 def test_panel_style_change_requires_full_regeneration(tmp_path):
     """Presentation changes redraw comprehensive figures only when explicit."""
@@ -382,7 +502,6 @@ def test_panel_style_change_requires_full_regeneration(tmp_path):
     plot_suite(rows, tmp_path, changed, regenerate=True)
     assert path.read_bytes() != original
 
-
 def test_panel_metric_error_does_not_block_other_metrics(
     tmp_path, monkeypatch,
 ):
@@ -414,10 +533,10 @@ def test_panel_metric_error_does_not_block_other_metrics(
     ]
     original = plots.metric_curve
 
-    def fail_r2(selected, spec, style, partial=False):
+    def fail_r2(selected, spec, style):
         if spec["where"]["metric"] == "r2":
             raise ValueError("synthetic R2 comparison failure")
-        return original(selected, spec, style, partial)
+        return original(selected, spec, style)
 
     monkeypatch.setattr(plots, "metric_curve", fail_r2)
     with pytest.raises(RuntimeError, match="synthetic R2 comparison failure"):
@@ -430,7 +549,6 @@ def test_panel_metric_error_does_not_block_other_metrics(
     }
 
 
-
 def evaluation_context() -> dict:
     """Return complete diagnostic identifiers for one synthetic evaluation."""
     return dict(
@@ -441,7 +559,6 @@ def evaluation_context() -> dict:
         evaluation_set="full",
         target="neural",
     )
-
 
 def test_flat_channels_are_ignored_with_context(caplog):
     """Flat truth is expected exclusion, distinct from invalid metric output."""
@@ -472,7 +589,6 @@ def test_flat_channels_are_ignored_with_context(caplog):
     assert "total_channels=2" in messages[0]
     assert "unit_flat" in messages[0]
 
-
 def test_nonfinite_nonflat_metric_has_distinct_warning(caplog, monkeypatch):
     """Unexpected metric failures identify their metric, value and channel."""
     from experiments import evaluation
@@ -496,7 +612,6 @@ def test_nonfinite_nonflat_metric_has_distinct_warning(caplog, monkeypatch):
     assert "unit_bad" in messages[0]
     assert "nan" in messages[0]
     assert "session=session_a" in messages[0]
-
 
 def test_per_session_fold_statistics_use_sample_standard_deviation():
     """Per-session plotting values remain in memory and vary across folds."""
@@ -527,6 +642,38 @@ def test_per_session_fold_statistics_use_sample_standard_deviation():
     assert neural_cc["mean"] == pytest.approx(3.0)
     assert neural_cc["std"] == pytest.approx(2.0)
     assert neural_cc["folds"] == 3
+
+
+def test_per_session_fold_statistics_report_missing_metric_member():
+    """Average defined folds while retaining the unavailable fold identity."""
+    from experiments.evaluation import aggregate_folds
+
+    rows = []
+    for fold, value in enumerate((1.0, None, 5.0)):
+        score = dict(mean_cc=value, mean_r2=0.5, mean_mse=0.25)
+        rows.append(dict(
+            session="session_a",
+            fold=fold,
+            configuration="BRAID_nx4_p1",
+            population_scale=1.0,
+            nx=4,
+            n1=4,
+            horizon=4,
+            evaluation_set="full",
+            neural=score,
+            behavior=score,
+        ))
+    summaries = aggregate_folds(rows)
+    neural_cc = next(
+        row for row in summaries
+        if row["target"] == "neural" and row["metric"] == "cc"
+    )
+    assert neural_cc["mean"] == pytest.approx(3.0)
+    assert neural_cc["std"] == pytest.approx(np.sqrt(8.0))
+    assert neural_cc["folds"] == 2
+    assert neural_cc["missing_members"] == [
+        "BRAID_nx4_p1/session_a/fold_1"
+    ]
 
 
 @pytest.fixture
@@ -589,7 +736,6 @@ def test_pending_contributors_silently_defer_figure(
     assert not caplog.records
 
 
-
 def test_session_readiness_does_not_wait_for_pending_sessions(
     tmp_path, comparison_design,
 ):
@@ -626,7 +772,6 @@ def test_session_readiness_does_not_wait_for_pending_sessions(
     assert len(list((tmp_path / "sessions" / "session").glob("*.png"))) == 1
     assert not (tmp_path / "sessions" / "later_session").exists()
 
-
 def test_failed_point_is_annotated_and_warned_once(
     tmp_path, caplog, comparison_design, monkeypatch,
 ):
@@ -653,16 +798,15 @@ def test_failed_point_is_annotated_and_warned_once(
     try:
         axis = figure.axes[0]
         assert np.isnan(axis.lines[0].get_ydata()[1])
-        assert any(line.get_marker() == "x" for line in axis.lines)
-        assert any("0/2 results" in text.get_text() for text in axis.texts)
-        assert "failed experiments" in figure._suptitle.get_text()
+        assert not any(line.get_marker() == "x" for line in axis.lines)
+        assert not axis.texts
+        assert "partial" not in figure._suptitle.get_text()
     finally:
         plt.close(figure)
     warnings = [r for r in caplog.records if r.levelname == "WARNING"]
     assert len(warnings) == 1
     assert "nx2/session/fold_0" in warnings[0].message
     assert "nx2/session/fold_1" in warnings[0].message
-
 
 
 def test_completed_reattempt_replaces_partial_comparison(
@@ -687,9 +831,8 @@ def test_completed_reattempt_replaces_partial_comparison(
     plot_suite(rows, tmp_path, settings, expected_comparisons(manifest))
     assert figure.read_bytes() == repaired
 
-
-def test_partial_aggregate_marks_reduced_contributions(comparison_design):
-    """A finite mean still exposes a failed fold in its aggregate."""
+def test_partial_aggregate_keeps_finite_contributions(comparison_design):
+    """A finite mean remains available when one fold failed."""
     from experiments import plots
     from experiments.reporting import expected_comparisons
 
@@ -699,15 +842,12 @@ def test_partial_aggregate_marks_reduced_contributions(comparison_design):
     selected = [row for row in expected if row["target"] == "neural"
                 and row["metric"] == "cc"]
     attached = plots.comparison_rows(rows, selected, "test")
-    figure = metric_curve(attached, curve_specs(settings)[0], STYLE, True)
+    figure = metric_curve(attached, curve_specs(settings)[0], STYLE)
     try:
-        assert any(
-            "1/2 results" in text.get_text() for text in figure.axes[0].texts
-        )
+        assert not figure.axes[0].texts
         assert np.isfinite(figure.axes[0].lines[0].get_ydata()).all()
     finally:
         plt.close(figure)
-
 
 def test_all_failed_warns_without_empty_figure(
     tmp_path, caplog, comparison_design,
@@ -721,7 +861,6 @@ def test_all_failed_warns_without_empty_figure(
     assert not list(tmp_path.glob("*.png"))
     assert len(caplog.records) == 1
     assert caplog.records[0].levelname == "WARNING"
-
 
 def test_unattempted_historical_failure_defers_until_retry(
     tmp_path, caplog, comparison_design,
@@ -745,7 +884,6 @@ def test_unattempted_historical_failure_defers_until_retry(
     assert len(list(tmp_path.glob("*.png"))) == 1
     assert not caplog.records
 
-
 def test_ready_figure_does_not_wait_for_unrelated_models(
     tmp_path, caplog, comparison_design,
 ):
@@ -764,17 +902,39 @@ def test_ready_figure_does_not_wait_for_unrelated_models(
     assert len(list(tmp_path.glob("*.png"))) == 1
     assert not caplog.records
 
-
-def test_unexplained_missing_metric_is_a_rendering_error(
-    tmp_path, comparison_design,
+def test_missing_completed_metric_is_annotated_and_warned(
+    tmp_path, caplog, comparison_design, monkeypatch,
 ):
+    """Keep finite points and mark a completed member's unavailable metric."""
+    from experiments import plots
     from experiments.reporting import expected_comparisons
 
     settings, manifest, rows = comparison_design
-    with pytest.raises(RuntimeError, match="Missing completed result"):
-        plot_suite(rows[:1], tmp_path, settings, expected_comparisons(manifest))
-    assert not list(tmp_path.glob("*.png"))
-
+    saved = []
+    monkeypatch.setattr(
+        plots,
+        "save_figure",
+        lambda figure, path, style, signature: saved.append(figure),
+    )
+    plot_suite(
+        rows[:1], tmp_path, settings, expected_comparisons(manifest)
+    )
+    assert len(saved) == 1
+    figure = saved[0]
+    try:
+        axis = figure.axes[0]
+        assert np.isnan(axis.lines[0].get_ydata()[1])
+        assert not any(line.get_marker() == "x" for line in axis.lines)
+        assert not axis.texts
+        assert "partial" not in figure._suptitle.get_text()
+    finally:
+        plt.close(figure)
+    warnings = [
+        record for record in caplog.records if record.levelname == "WARNING"
+    ]
+    assert len(warnings) == 1
+    assert "nx2/session/fold_0" in warnings[0].message
+    assert "nx2/session/fold_1" in warnings[0].message
 
 def canonical_history_rows(r2_values: tuple[float | None, ...]) -> list[dict]:
     """Build direct component metrics with configurable R2 history values."""
@@ -795,7 +955,6 @@ def canonical_history_rows(r2_values: tuple[float | None, ...]) -> list[dict]:
         }
         for epoch, r2 in enumerate(r2_values, 1)
     ]
-
 
 def test_all_gap_r2_is_recorded_without_suppressing_cc(tmp_path, caplog):
     """An intentionally omitted R2 plot does not block independent metrics."""
@@ -835,7 +994,6 @@ def test_all_gap_r2_is_recorded_without_suppressing_cc(tmp_path, caplog):
     render_component(component, STYLE)
     assert (plots / "r2.png").is_file()
 
-
 def test_metric_render_error_does_not_block_later_metrics(
     tmp_path,
     monkeypatch,
@@ -865,3 +1023,209 @@ def test_metric_render_error_does_not_block_later_metrics(
     assert (plots / "mse.png").is_file()
     assert (plots / "cc.png").is_file()
     assert not (plots / "r2.png").exists()
+
+
+def outlier_rows() -> list[dict]:
+    """Build completed rows with one selected finite R2/MSE outlier."""
+    rows = []
+    for fold, r2, mse in ((0, -1000.0, 10000.0), (2, 2.0, 4.0), (4, 4.0, 8.0)):
+        score = dict(mean_cc=0.5, mean_r2=r2, mean_mse=mse)
+        rows.append(dict(
+            session="indy_20160630_01",
+            fold=fold,
+            configuration="BRAID_nx4_p1",
+            population_scale=1.0,
+            nx=4,
+            n1=4,
+            horizon=32,
+            evaluation_set="full",
+            neural=dict(score),
+            behavior=dict(score),
+        ))
+    return rows
+
+
+def outlier_settings() -> dict:
+    """Provide the approved generic finite-outlier selector shape."""
+    return dict(
+        outliers=[dict(
+            member="BRAID_nx4_p1/indy_20160630_01/fold_0",
+            horizon=32,
+            evaluation_set="full",
+            targets=["neural", "behavior"],
+            metrics=["r2", "mse"],
+            aggregate_exclude=True,
+            session_zoom=True,
+            reason="Synthetic finite numerical outlier",
+        )]
+    )
+
+
+def test_outlier_policy_preserves_raw_rows_and_filters_only_selected_metrics(
+    tmp_path, caplog,
+):
+    """Aggregate/session values exclude only selected finite R2/MSE."""
+    from experiments.evaluation import aggregate, aggregate_folds
+    from experiments.outliers import resolve_outliers
+
+    rows = outlier_rows()
+    original = json.loads(json.dumps(rows))
+    rules = resolve_outliers(outlier_settings(), rows)
+    caplog.set_level("WARNING", logger="experiments.evaluation")
+    summaries = aggregate(rows, tmp_path, rules)
+    r2 = next(
+        row for row in summaries
+        if row["target"] == "neural" and row["metric"] == "r2"
+    )
+    cc = next(
+        row for row in summaries
+        if row["target"] == "neural" and row["metric"] == "cc"
+    )
+    assert r2["mean"] == pytest.approx(3.0)
+    assert r2["metric_counts"] == {"indy_20160630_01": 2}
+    assert r2["excluded_members"] == [
+        "BRAID_nx4_p1/indy_20160630_01/fold_0"
+    ]
+    assert r2["excluded_contribution_count"] == 1
+    assert cc["mean"] == pytest.approx(0.5)
+    assert not cc["outlier_exclusions"]
+    assert rows == original
+    assert json.loads((tmp_path / "raw_metrics.json").read_text()) == original
+    assert any("Excluding 1 finite outlier" in record.message
+               for record in caplog.records)
+    session = next(
+        row for row in aggregate_folds(rows, rules)
+        if row["target"] == "neural" and row["metric"] == "r2"
+    )
+    assert session["mean"] == pytest.approx(3.0)
+    assert session["std"] == pytest.approx(np.sqrt(2.0))
+    assert session["folds"] == 2
+    assert session["outliers"][0]["value"] == -1000.0
+
+
+def test_outlier_arrow_uses_normal_range_and_three_significant_figures():
+    """Session arrows retain the value while keeping normal values legible."""
+    spec = dict(
+        name="neural_r2_vs_horizon_nx4_full",
+        parameter="horizon",
+        where=dict(target="neural", metric="r2", nx=4,
+                   evaluation_set="full"),
+    )
+    rows = [
+        dict(horizon=4, nx=4, mean=1.0, std=0.1),
+        dict(
+            horizon=32,
+            nx=4,
+            mean=3.0,
+            std=np.sqrt(2.0),
+            outliers=[dict(
+                member="BRAID_nx4_p1/indy_20160630_01/fold_0",
+                value=-1000.0,
+                reason="Synthetic finite numerical outlier",
+            )],
+        ),
+    ]
+    figure = metric_curve(rows, spec, STYLE)
+    try:
+        axis = figure.axes[0]
+        assert axis.get_ylim()[0] > -1000.0
+        assert [item.get_text() for item in axis.texts] == ["↓ -1e+03"]
+    finally:
+        plt.close(figure)
+
+
+@pytest.mark.parametrize(
+    ("settings", "message"),
+    [
+        (dict(outliers=[outlier_settings()["outliers"][0]] * 2), "Duplicate"),
+        (dict(outliers=[dict(outlier_settings()["outliers"][0], horizon=4)]),
+         "Unmatched"),
+    ],
+)
+def test_outlier_selectors_reject_duplicate_and_unmatched_rules(
+    settings, message,
+):
+    """Explicit plotting selectors cannot silently miss or overlap raw rows."""
+    from experiments.outliers import resolve_outliers
+
+    with pytest.raises(ValueError, match=message):
+        resolve_outliers(settings, outlier_rows())
+
+
+def test_outlier_selectors_reject_malformed_and_overlapping_rules():
+    """Rules need a complete schema and must select disjoint metric values."""
+    from experiments.outliers import resolve_outliers
+
+    malformed = dict(outlier_settings()["outliers"][0])
+    malformed.pop("reason")
+    with pytest.raises(ValueError, match="fields are invalid"):
+        resolve_outliers(dict(outliers=[malformed]), outlier_rows())
+    first = dict(outlier_settings()["outliers"][0], targets=["neural"])
+    second = dict(
+        outlier_settings()["outliers"][0],
+        targets=["neural", "behavior"],
+    )
+    with pytest.raises(ValueError, match="Overlapping"):
+        resolve_outliers(dict(outliers=[first, second]), outlier_rows())
+
+
+def test_session_outlier_exclusion_requires_a_normal_fold_range():
+    """A session renderer cannot invent a range after excluding all folds."""
+    from experiments.evaluation import aggregate_folds
+    from experiments.outliers import resolve_outliers
+
+    rules = []
+    for fold in (0, 2, 4):
+        rules.append(dict(
+            member=f"BRAID_nx4_p1/indy_20160630_01/fold_{fold}",
+            horizon=32,
+            evaluation_set="full",
+            targets=["neural"],
+            metrics=["r2"],
+            aggregate_exclude=True,
+            session_zoom=True,
+            reason="Synthetic finite numerical outlier",
+        ))
+    rows = outlier_rows()
+    with pytest.raises(ValueError, match="No finite normal fold metrics"):
+        aggregate_folds(rows, resolve_outliers(dict(outliers=rules), rows))
+
+
+def test_outlier_arrows_stack_same_edge_labels_by_nx():
+    """Same-position finite outliers retain readable deterministic labels."""
+    spec = dict(
+        name="neural_r2_vs_horizon_by_nx",
+        parameter="horizon",
+        group="nx",
+        panel="target",
+        where=dict(target=["neural", "behavior"], metric="r2",
+                   horizon=[8], evaluation_set="full"),
+    )
+    rows = []
+    for nx, value in zip((1, 2, 4, 16, 64),
+                         (-1000.0, -2000.0, -3000.0, -4000.0, -5000.0)):
+        rows.append(dict(
+            horizon=8,
+            nx=nx,
+            target="neural",
+            mean=-0.02,
+            std=0.01,
+            outliers=[dict(
+                member=f"BRAID_nx{nx}_p1/session/fold_2",
+                value=value,
+                reason="Synthetic finite numerical outlier",
+            )],
+        ))
+    figure = metric_curve(rows, spec, STYLE)
+    try:
+        texts = figure.axes[0].texts
+        assert [item.get_text() for item in texts] == [
+            "↓ -1e+03",
+            "↓ -2e+03",
+            "↓ -3e+03",
+            "↓ -4e+03",
+            "↓ -5e+03",
+        ]
+        assert [item.xyann[1] for item in texts] == [8, 22, 36, 50, 64]
+    finally:
+        plt.close(figure)

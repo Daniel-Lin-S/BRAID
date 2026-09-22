@@ -19,6 +19,7 @@ from matplotlib.figure import Figure
 from .configuration import CONFIGURATION, read_yaml
 
 METRIC_LABELS = {"loss": "Loss", "mse": "MSE", "r2": "R²", "cc": "CC"}
+OUTLIER_STYLE_FIELDS = ("zoom_padding_fraction", "label_significant_figures")
 
 
 def presentation(settings: dict | None = None) -> dict:
@@ -60,6 +61,31 @@ def presentation(settings: dict | None = None) -> dict:
             raise ValueError(f"Expected valid colors in {key}.")
     if len(style["pair_colors"]) != 2:
         raise ValueError("Expected exactly two train/validation or x/y colors.")
+    return style
+
+
+def outlier_rendering(settings: dict | None = None) -> dict:
+    """Resolve global finite-outlier display defaults without writing files."""
+    style = settings or read_yaml(
+        CONFIGURATION / "plotting" / "style.yaml"
+    )["outlier_rendering"]
+    if set(style) != set(OUTLIER_STYLE_FIELDS):
+        raise ValueError(
+            "outlier_rendering must contain zoom_padding_fraction and "
+            "label_significant_figures."
+        )
+    padding = style["zoom_padding_fraction"]
+    if not isinstance(padding, (int, float)) or not 0 < padding < 1:
+        raise ValueError(
+            "Expected outlier_rendering.zoom_padding_fraction between 0 "
+            f"and 1, got {padding!r}."
+        )
+    digits = style["label_significant_figures"]
+    if type(digits) is not int or digits < 1:
+        raise ValueError(
+            "Expected positive integer "
+            "outlier_rendering.label_significant_figures."
+        )
     return style
 
 

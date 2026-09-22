@@ -16,23 +16,35 @@ before fitting. GPU selection is a point-in-time choice, not a reservation.
 
 `session_logging()` captures Python and native output in one session log.
 `lifecycle_scope()` writes fitting session, fold, and model events to
-`experiment.log`. `stage_scope()` records preprocessing preview counts and
-preview/plot completion separately. A model failure records its active phase,
+`experiment.log`. `stage_scope()` records preprocessing fold counts and plot
+completion separately. A model failure records its active phase,
 preserves valid artifacts, and allows independent models, folds, and sessions
 to continue. Interrupts and shared setup errors remain terminal.
 
 ## Previews and diagnostics
 
-`previews.py` selects one contiguous preview window per train, validation,
-and test split. Preprocessing previews are created before fitting; fitted
-previews run checkpoint inference only. Preview publication records checksums
-and selection metadata under the owning fit.
+Preview rendering is a preview-only mode of the `plot` stage. It requires
+selected sessions; folds default to the saved analysis folds, and exact
+analysis case names select fitted previews. With no cases, only preprocessing
+previews are produced. CLI selectors replace their corresponding YAML lists.
 
-`diagnostics.py` observes completed components and invokes rendering without
-adding training callbacks. Rendering failures are collected separately from
-scientific fit completion. `preview_regeneration.py`,
-`preview_publication.py`, `preview_rendering.py`, and
-`signal_previews.py` own saved-preview regeneration and display details.
+`previews.py` selects one train, validation, and test window using the largest
+context required by the saved analysis suite. Every distinct ordered neural
+population shares one preprocessing rendering under the cache root. Fitted
+previews remain under selected completed fits and load checkpoints on CPU.
+Missing scientific caches are built with reuse semantics; plotting never
+rebuilds an existing scientific cache.
+
+`runtime.preview_regeneration` accepts `incomplete` or `all`. Publication
+records source checksums, window indices, channel IDs, rendering settings, and
+implementation signatures. Independent rendering failures are collected and
+reported after the remaining selections finish.
+
+`diagnostics.py` observes completed components and invokes history rendering
+without adding training callbacks. Component PNGs and recovery artifacts are
+always retained. `runtime.tensorboard` defaults to false; `--tensorboard`
+enables event serialization only for newly fitted components and does not
+change fit identity or backfill completed fits.
 
 ## Parallel fitting
 

@@ -180,6 +180,19 @@ def create_dataset(root: Path) -> None:
         sync.create_dataset("ticks", data=np.arange(len(raw_t)))
 
 
+def preview_settings(dataset: NHPLFPDataset) -> dict:
+    """Resolve LFP preview settings from plotting and data modules."""
+    settings = copy.deepcopy(
+        read_yaml(CONFIGURATION / "plotting" / "style.yaml")["previews"]
+    )
+    settings.pop("enabled")
+    settings.pop("selection")
+    settings["adapter"] = dataset.settings["preview_adapter"]
+    settings["presentation"] = presentation()
+    settings["context_samples"] = 128
+    return settings
+
+
 def dataset_settings(root: Path, cache: Path) -> dict:
     """Resolve tracked LFP defaults against test-owned paths."""
     settings = read_yaml(CONFIGURATION / "data" / "lfp.yaml")
@@ -376,21 +389,21 @@ def test_lfp_session_requires_paired_task_file(tmp_path):
         dataset.sessions()
 
 
-def test_lfp_preprocessing_preview_is_automatic(lfp_session, tmp_path):
+def test_lfp_preprocessing_preview_is_cache_owned(lfp_session, tmp_path):
     """Publish native-versus-final LFP and task panels for every split."""
     dataset, session = lfp_session
     fold = dataset.fold(session, 0, True)
     assert fold.path is not None
     assert fold.path.parent.name == "lfp_fold"
-    settings = copy.deepcopy(dataset.settings["previews"])
-    assert settings["enabled"]
-    settings["presentation"] = presentation()
+    settings = preview_settings(dataset)
+    windows = preview_windows(fold, settings)
     output = preprocessing_previews(
         session,
         fold,
         settings,
-        tmp_path / "run",
+        tmp_path / "cache_preview",
         np.arange(CHANNEL_COUNT),
+        windows,
     )
     assert output is not None
     assert len(list(output.rglob("*.png"))) == 18
@@ -421,17 +434,17 @@ def test_lfp_preview_rejects_changed_source(tmp_path):
     source = root / "raw" / f"{SESSION}.nwb"
     stat = source.stat()
     os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1))
-    settings = copy.deepcopy(dataset.settings["previews"])
-    settings["presentation"] = presentation()
+    settings = preview_settings(dataset)
+    windows = preview_windows(fold, settings)
     with pytest.raises(ValueError, match="signature changed"):
         preprocessing_previews(
             session,
             fold,
             settings,
-            tmp_path / "run",
+            tmp_path / "cache_preview",
             np.arange(CHANNEL_COUNT),
+            windows,
         )
-    windows = preview_windows(fold, settings)
     fitted = [
         {
             "channel_ids": fold.arrays["ids"],
@@ -489,7 +502,11 @@ def _local_experiment(
 
 def test_lfp_manifest_and_scientific_identity_are_isolated(tmp_path):
     """Resolve the approved grid and separate every LFP model recipe."""
-    tracked = read_yaml(CONFIGURATION / "experiments" / "lfp_forecast.yaml")
+    tracked = read_yaml(
+        CONFIGURATION
+        / "experiments"
+        / "lfp_latent_dimension_sweep.yaml"
+    )
     assert tracked["selection"] == {"sessions": None, "folds": None}
     assert tracked["suite"]["n1_max"] == 16
     assert tracked["suite"]["n_pre"] == 150
@@ -507,16 +524,17 @@ def test_lfp_manifest_and_scientific_identity_are_isolated(tmp_path):
     ]
     lfp = _local_experiment(
         tmp_path,
-        "lfp_forecast.yaml",
+        "lfp_latent_dimension_sweep.yaml",
         {"sessions": selected_sessions, "folds": [0, 2, 4]},
     )
     spike = _local_experiment(tmp_path, "latent_dimension_sweep.yaml")
     experiment = lfp["experiment"]
-    assert experiment["name"] == "lfp_forecast"
+    assert experiment["name"] == "latent_dimension_sweep_lfp"
     assert experiment["selection"]["folds"] == [0, 2, 4]
     assert experiment["selection"]["sessions"] == selected_sessions
-    assert experiment["suite"]["nx_values"] == [1, 2, 4, 16, 64]
-    assert lfp["data"]["previews"]["enabled"]
+    assert experiment["suite"]["nx_values"] == [1, 2, 4, 16, 32, 64]
+    assert not lfp["plotting"]["previews"]["enabled"]
+    assert lfp["data"]["preview_adapter"].endswith("LFPPreviewAdapter")
     assert lfp["data"]["features"] == "lfp"
     case = {
         "name": "nx_16_population_1",
@@ -571,14 +589,15 @@ def test_real_lfp_preprocessing_and_preview_smoke(tmp_path):
     dataset = NHPLFPDataset(settings)
     features = dataset.load(session)
     fold = dataset.fold(features, 0, True)
-    previews = copy.deepcopy(settings["previews"])
-    previews["presentation"] = presentation()
+    previews = preview_settings(dataset)
+    windows = preview_windows(fold, previews)
     output = preprocessing_previews(
         features,
         fold,
         previews,
-        tmp_path / "run",
+        tmp_path / "cache_preview",
         np.arange(CHANNEL_COUNT),
+        windows,
     )
     assert output is not None
     assert (output / "manifest.json").is_file()

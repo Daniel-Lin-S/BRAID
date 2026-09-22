@@ -10,7 +10,6 @@ Paths printed to the console are always absolute.
 """
 
 import argparse
-import copy
 import json
 import logging
 import os
@@ -22,7 +21,6 @@ import numpy as np
 from .artifacts import fit_directory, prepare_model_settings, resolved_fit
 from .cache import file_digest, writer_lock
 from .contracts import Dataset, FeatureSet, plugin
-from .previews import preprocessing_previews
 from .runtime import (
     session_logging,
     lifecycle_scope,
@@ -134,7 +132,7 @@ def run_case(
     """Complete a shared fit and publish this analysis's scoring separately."""
     from .analysis import member_key, read_manifest
     from .fitting import canonical_horizons, ensure_fit, ensure_predictions
-    from .diagnostics import history_monitor, render_safely
+    from .diagnostics import history_monitor
     from .presentation import presentation
 
     progress = {} if progress is None else progress
@@ -148,26 +146,9 @@ def run_case(
     member = read_manifest(analysis_root)["members"][key]
     if member["fit_id"] != run.name:
         raise ValueError(f"Analysis fit provenance changed: {run}")
-    previews = copy.deepcopy(settings["previews"])
     style = presentation(snapshots["plotting"].get("presentation"))
-    previews["presentation"] = style
-    previews["context_samples"] = identity["resolved_fit"]["args_base"][
-        "sequence_length"
-    ]
-    if arguments.no_previews:
-        previews["enabled"] = False
     errors = [] if rendering_errors is None else rendering_errors
     prepare_model_settings(run.parents[2], identity)
-    render_safely(
-        errors,
-        f"Preprocessing previews {run.resolve()}",
-        preprocessing_previews,
-        session,
-        features,
-        previews,
-        run,
-        columns,
-    )
     progress["phase"] = "fit"
     with history_monitor(
         run,
@@ -182,20 +163,6 @@ def run_case(
         ),
     ):
         trained = ensure_fit(run, identity, features, columns, arguments, gpu)
-    from .previews import fitted_previews
-
-    if previews["enabled"]:
-        render_safely(
-            errors,
-            f"Fitted previews {run.resolve()}",
-            fitted_previews,
-            session,
-            features,
-            previews,
-            run,
-            snapshots["experiment"]["preview_model_plugin"],
-            columns,
-        )
     horizons = canonical_horizons(settings["horizons"])
     progress["phase"] = "prediction"
     predictions = ensure_predictions(
@@ -304,10 +271,7 @@ def run_session(
     The caller exclusively owns this session's log and supplies an optional
     shared cancellation event. Arrays remain local to the session worker.
     """
-    from .diagnostics import render_safely
-    from .presentation import presentation
-
-    data, plotting = snapshots["data"], snapshots["plotting"]
+    data = snapshots["data"]
     rendering_errors, model_errors, attempted = [], [], set()
     session_context = (
         stage_scope(
@@ -343,39 +307,8 @@ def run_session(
                             fold,
                             data["infer_velocity"],
                         )
-                        for case in cases:
-                            identity, columns = case_identity(
-                                features, fold, case, snapshots, shared
-                            )
-                            run = fit_directory(root, identity)
-                            prepare_model_settings(run.parents[2], identity)
-                            previews = dict(
-                                data["previews"],
-                                presentation=presentation(
-                                    plotting.get("presentation")
-                                ),
-                                context_samples=identity["resolved_fit"][
-                                    "args_base"
-                                ]["sequence_length"],
-                            )
-                            previous_errors = len(rendering_errors)
-                            render_safely(
-                                rendering_errors,
-                                str(run.resolve()),
-                                preprocessing_previews,
-                                source,
-                                features,
-                                previews,
-                                run,
-                                columns,
-                            )
-                            outcome = (
-                                "failed"
-                                if len(rendering_errors) > previous_errors
-                                else "completed"
-                            )
-                            fold_state[outcome] += 1
-                            session_state[outcome] += 1
+                        fold_state["completed"] = 1
+                        session_state["completed"] += 1
                         LOGGER.info(
                             "Cached fold %s at %s", fold, features.path
                         )
@@ -462,13 +395,6 @@ def main() -> None:
     runtime = snapshots["runtime"]
     arguments.log_level = runtime["log_level"]
     configure_logging(arguments.log_directory, arguments.log_level)
-    if arguments.stage == "preview":
-        from .preview_regeneration import regenerate_previews
-
-        with stage_scope(arguments.log_directory, "preview") as state:
-            regenerate_previews(snapshots)
-            state["completed"] = 1
-        return
     experiment = snapshots["experiment"]
     data = snapshots["data"]
     evaluation = snapshots["evaluation"]
@@ -490,17 +416,25 @@ def main() -> None:
             analysis_root = find_analysis(
                 root, snapshots, arguments.analysis_id
             )
-            plugin(
-                experiment["report_plugin"],
-                root=analysis_root,
-                settings=plotting,
-                sample_rate=data["sampling_rate_hz"],
-                regenerate=(
-                    runtime.get("figure_regeneration", "incomplete") == "all"
-                ),
-            )
-            state["completed"] = 1
+            if plotting["previews"]["enabled"]:
+                from .preview_regeneration import render_previews
+
+                result = render_previews(snapshots, analysis_root)
+                state["completed"] = sum(result.values())
+            else:
+                plugin(
+                    experiment["report_plugin"],
+                    root=analysis_root,
+                    settings=plotting,
+                    sample_rate=data["sampling_rate_hz"],
+                    regenerate=(
+                        runtime.get("figure_regeneration", "incomplete")
+                        == "all"
+                    ),
+                )
+                state["completed"] = 1
         return
+    arguments.tensorboard = runtime.get("tensorboard", False)
     if (arguments.stage == "fit"
             and runtime.get("parallel_workers", 1) > 1):
         from .parallel import run_parallel
@@ -531,7 +465,6 @@ def main() -> None:
         seed=experiment["seed"],
         model_plugin=experiment["model_plugin"],
         velocity=data["infer_velocity"],
-        previews=data["previews"],
     )
     folds = (
         arguments.fold

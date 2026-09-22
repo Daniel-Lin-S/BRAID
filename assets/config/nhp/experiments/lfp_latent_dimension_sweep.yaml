@@ -1,5 +1,5 @@
 extends: latent_dimension_sweep.yaml
-name: lfp_forecast
+name: latent_dimension_sweep_lfp
 modules:
   data: ../data/lfp.yaml
 suite:

@@ -1,8 +1,8 @@
-"""Select split-local excerpts and publish fit-owned data previews.
+"""Select shared split windows and publish preprocessing or fitted previews.
 
-Inputs are cached session/fold arrays and shared presentation settings.
-Outputs belong to data_preview/preprocessing or data_preview/fitted.
-Selection and rendering never contribute to numerical fitting identity.
+Inputs are cached session/fold arrays, ordered neural populations, and saved
+checkpoints. Preprocessing outputs belong to the preview cache; fitted outputs
+remain under their owning fit. Preview artifacts never affect fit identity.
 """
 
 from pathlib import Path
@@ -71,9 +71,11 @@ def preview_windows(features: FeatureSet, settings: dict) -> list[np.ndarray]:
         else:
             left, right = requested[role]
             matches = [
-                i
-                for i in candidates
-                if np.isclose(time[i], left, rtol=0, atol=TIME_TOLERANCE)
+                index
+                for index in candidates
+                if np.isclose(
+                    time[index], left, rtol=0, atol=TIME_TOLERANCE
+                )
             ]
             if len(matches) != 1 or not np.isclose(
                 right - left, settings["seconds"]
@@ -88,21 +90,86 @@ def preprocessing_previews(
     session: FeatureSet,
     fold: FeatureSet,
     settings: dict,
-    run: Path,
+    destination: Path,
     columns: np.ndarray,
-) -> Path | None:
-    """Publish preprocessing panels for the owning fit's ordered population."""
-    if not settings["enabled"]:
-        return None
+    windows: list[np.ndarray],
+    regenerate: bool = False,
+) -> Path:
+    """Publish preprocessing panels for one ordered neural population.
+
+    Parameters
+    ----------
+    session, fold : FeatureSet
+        Native session arrays and split-local processed arrays.
+    settings : dict
+        Rendering and excerpt settings without invocation selection fields.
+    destination : Path
+        Stable cache-owned rendering directory.
+    columns : ndarray, shape (C,)
+        Ordered neural population columns.
+    windows : list of ndarray
+        Canonical train, validation, and test indices, each shape (N,).
+    regenerate : bool, optional
+        Force replacement of a valid matching rendering, by default False.
+
+    Returns
+    -------
+    Path
+        Completed preprocessing preview directory.
+    """
     from .preview_publication import publish_previews
 
     return publish_previews(
         session,
         fold,
         settings,
-        run / "data_preview" / "preprocessing",
-        preview_windows(fold, settings),
+        destination,
+        windows,
         columns,
+        regenerate=regenerate,
+    )
+
+
+def _fitted_preview_columns(
+    features: FeatureSet,
+    fitted: list[dict],
+) -> np.ndarray:
+    """Map checkpoint-retained channel IDs to fold source columns."""
+    if not fitted or any("channel_ids" not in values for values in fitted):
+        raise ValueError(
+            "Fitted previews require channel IDs for every window."
+        )
+    expected = np.asarray(fitted[0]["channel_ids"])
+    if (
+        expected.ndim != 1
+        or not len(expected)
+        or len(set(expected)) != len(expected)
+    ):
+        raise ValueError(
+            "Fitted preview channel IDs must be nonempty and unique."
+        )
+    if any(
+        not np.array_equal(values["channel_ids"], expected)
+        for values in fitted[1:]
+    ):
+        raise ValueError(
+            "Fitted preview windows use inconsistent channel IDs."
+        )
+    identifiers = features.arrays["ids"]
+    if len(set(identifiers)) != len(identifiers):
+        raise ValueError("Fold preview channel IDs must be unique.")
+    locations = {
+        identifier: number for number, identifier in enumerate(identifiers)
+    }
+    missing = [
+        identifier for identifier in expected if identifier not in locations
+    ]
+    if missing:
+        raise ValueError(
+            f"Fitted preview channels are absent from the fold: {missing}."
+        )
+    return np.asarray(
+        [locations[identifier] for identifier in expected], dtype=int
     )
 
 
@@ -112,20 +179,40 @@ def fitted_previews(
     settings: dict,
     run: Path,
     model_plugin: str,
-    columns: np.ndarray,
-) -> Path | None:
-    """Infer checkpoint-derived stages and publish fitted-only panels."""
-    if not settings["enabled"]:
-        return None
+    windows: list[np.ndarray],
+    regenerate: bool = False,
+) -> Path:
+    """Infer saved checkpoint stages and publish fitted-only panels.
+
+    Parameters
+    ----------
+    session, fold : FeatureSet
+        Native session arrays and split-local processed arrays.
+    settings : dict
+        Rendering and excerpt settings without invocation selection fields.
+    run : Path
+        Completed fit that owns the destination and checkpoint.
+    model_plugin : str
+        Checkpoint preview plugin in ``module:function`` form.
+    windows : list of ndarray
+        Canonical train, validation, and test indices, each shape (N,).
+    regenerate : bool, optional
+        Force replacement of a valid matching rendering, by default False.
+
+    Returns
+    -------
+    Path
+        Completed fitted preview directory.
+    """
     from .preview_publication import publish_previews
 
-    windows = preview_windows(fold, settings)
     fitted = plugin(
         model_plugin,
         source_run=run,
         features=fold,
         windows=windows,
     )
+    columns = _fitted_preview_columns(fold, fitted)
     return publish_previews(
         session,
         fold,
@@ -135,4 +222,5 @@ def fitted_previews(
         columns,
         fitted,
         artifact_path(run, "model.p"),
+        regenerate=regenerate,
     )

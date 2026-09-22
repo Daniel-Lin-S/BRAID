@@ -10,7 +10,10 @@ from tensorboard.backend.event_processing.event_accumulator import (
 )
 from tensorboard.util.tensor_util import make_ndarray
 
-from BRAID.tools.tensorboard import ComponentTensorBoard, event_scope
+from BRAID.tools.tensorboard import (
+    ComponentTensorBoard, event_scope, tensorboard_enabled,
+    tensorboard_scope,
+)
 from experiments.cache import file_digest, writer_lock
 from experiments.restart import prepare_components
 
@@ -23,6 +26,27 @@ def events(path):
     return EventAccumulator(
         str(files[0]), size_guidance={"tensors": 0}
     ).Reload()
+
+
+def test_tensorboard_scope_disables_events_but_keeps_artifacts(tmp_path):
+    """Opt-out suppresses events without disabling component recovery data."""
+    from BRAID.RegressionModel import RegressionModel
+
+    directory = tmp_path / "component"
+    values = np.arange(8, dtype=float)[None, :] / 8
+    assert tensorboard_enabled()
+    with tensorboard_scope(False):
+        assert not tensorboard_enabled()
+        model = RegressionModel(1, 1, log_dir=str(directory))
+        model.fit(
+            values, values, epochs=1, batch_size=4, verbose=0,
+            epoch_artifacts=True,
+        )
+    assert tensorboard_enabled()
+    assert not list(directory.rglob("*tfevents*"))
+    assert (directory / "history.jsonl").is_file()
+    assert (directory / "completed.weights.h5").is_file()
+    assert (directory / "complete.json").is_file()
 
 
 def test_callback_has_no_per_batch_work():

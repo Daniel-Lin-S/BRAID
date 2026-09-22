@@ -2,7 +2,7 @@
 
 Input FeatureSet arrays are time-first; fitting uses dimension-first arrays.
 Each checkpoint directory contains fit_indices.npz, fit_arguments.json,
-component epoch artifacts, fitted-stage previews, and the native BRAID model.
+component epoch artifacts and the native BRAID model.
 Forecasts are returned as (horizon, time, output) arrays with explicit masks.
 """
 
@@ -20,15 +20,18 @@ from BRAID.sequence import window_shift
 from BRAID.tools.tensorboard import event_scope
 
 from .artifacts import artifact_path
-from .cache import atomic_json, file_digest, cached
+from .cache import atomic_json
 from .contracts import FeatureSet
 from .nhp import TRAIN, VALIDATION
-from .previews import preview_windows
 from .windows import window_indices
 
 LOGGER = logging.getLogger(__name__)
 
 MISSING_MARKER = -1000000.0
+LATENT_SPLIT_FIELDS = ("n1", "n2", "n3")
+ZERO_STAGE_THREE = 0
+CANONICAL_ZERO_STAGE_THREE = None
+CASE_NAME_PREFIX = "BRAID"
 
 
 class BRAIDBackend:
@@ -41,12 +44,10 @@ class BRAIDBackend:
         configuration: str,
         overrides: dict | None = None,
         seed: int = 42,
-        previews: dict | None = None,
     ) -> None:
         self.seed = seed
         self.configuration = yaml.safe_load(Path(configuration).read_text())
         self.overrides = overrides or {}
-        self.previews = previews
         self.arguments = self.resolve_fit_configuration(
             self.configuration, {}, self.overrides
         )
@@ -106,9 +107,6 @@ class BRAIDBackend:
         import tensorflow as tf
 
         tf.keras.utils.set_random_seed(self.seed)
-        self.feature_cache = features.path
-        self.run_directory = directory
-        self.preview_excerpts = []
         arguments = self.resolve_fit_configuration(
             self.configuration, dimensions, self.overrides, features
         )
@@ -158,54 +156,6 @@ class BRAIDBackend:
             UType="cont",
             **arguments,
         )
-        if self.previews and self.previews["enabled"]:
-            for indices in preview_windows(features, self.previews):
-                self._previews(features, columns, indices)
-
-    def _previews(
-        self,
-        features: FeatureSet,
-        columns: np.ndarray,
-        indices: np.ndarray,
-    ) -> None:
-        """Save checkpoint-specific transforms on the raw-preview time grid."""
-        arrays = features.arrays
-        segment = np.flatnonzero(
-            arrays["segment"] == arrays["segment"][indices[0]]
-        )
-        start = min(indices[0], segment[-1] + 1 - self.length)
-        if start < segment[0] or indices[-1] >= start + self.length:
-            raise ValueError("Preview must fit inside one model window.")
-        context = np.arange(start, start + self.length)
-        y, z, u = (
-            arrays["Y"][indices][:, columns],
-            arrays["Z"][indices],
-            arrays["U"][indices],
-        )
-        pre = self.model.sId_pre
-        normalized = dict(
-            Y=pre.YPrepMap.apply(y.T.copy()).T,
-            Z=pre.ZPrepMap.apply(z.T.copy()).T,
-            U=pre.UPrepMap.apply(u.T.copy()).T,
-        )
-        learned = pre.predict(
-            arrays["Y"][context][:, columns], arrays["U"][context]
-        )[0][indices - start]
-        for name, value in dict(normalized, learned_Z=learned).items():
-            if not np.isfinite(value).all():
-                raise FloatingPointError(f"Nonfinite fitted preview: {name}.")
-        self.preview_excerpts.append(
-            dict(
-                t=arrays["t"][indices],
-                channel_ids=arrays["ids"][columns],
-                source_indices=arrays["indices"][indices],
-                context_indices=arrays["indices"][context],
-                learned_Z=learned,
-                raw_Z=z,
-                **normalized,
-            )
-        )
-
     def predict(
         self, y: np.ndarray, u: np.ndarray, horizons: list[int]
     ) -> dict[str, np.ndarray]:
@@ -238,34 +188,6 @@ class BRAIDBackend:
         """Save all BRAID stages using its native reconstruction format."""
         self.model.saveToFile(str(path))
         self.model.restoreModels()
-        if self.preview_excerpts:
-            base = self.feature_cache or (self.run_directory / "data")
-            arrays = {
-                f"window_{i}_{key}": value
-                for i, excerpt in enumerate(self.preview_excerpts)
-                for key, value in excerpt.items()
-            }
-            identity = dict(checkpoint_sha256=file_digest(path), version=1)
-            entry = cached(
-                base / "fitted_previews" / identity["checkpoint_sha256"],
-                "excerpts",
-                identity,
-                "reuse",
-                lambda: FeatureSet(
-                    arrays, {"windows": len(self.preview_excerpts)}
-                ),
-            )
-            atomic_json(
-                artifact_path(self.run_directory, "fitted_excerpts.json"),
-                dict(
-                    directory=str(entry.path),
-                    identity=json.loads(
-                        (entry.path / "manifest.json").read_text()
-                    )["identity"],
-                    manifest_sha256=file_digest(entry.path / "manifest.json"),
-                ),
-            )
-            self.preview_excerpts = []
 
     def load(self, path: Path) -> None:
         """Restore all BRAID stages without fitting or changing parameters."""
@@ -278,38 +200,191 @@ def build_cases(settings: dict) -> list[dict]:
     Parameters
     ----------
     settings : dict
-        nx_values, n1_max, n_pre and population_scales for one experiment.
+        Legacy settings use nx_values and n1_max. Explicit settings use
+        latent_splits with n1, n2 and n3. Both use n_pre and
+        population_scales.
 
     Returns
     -------
     list of dict
         Unique named cases with dimensions and population selections.
     """
-    sizes = settings["nx_values"]
     populations = settings["population_scales"]
-    if not sizes or not populations or min(sizes) < 1:
-        raise ValueError("Expected nonempty positive latent/population grids.")
-    if len(set(sizes)) != len(sizes) or len(set(populations)) != len(
-        populations
-    ):
-        raise ValueError("Sweep values must be unique.")
+    if not populations:
+        raise ValueError("Expected a nonempty population grid.")
+    if len(set(populations)) != len(populations):
+        raise ValueError("Population scales must be unique.")
     if any(not 0 < value <= 1 for value in populations):
         raise ValueError("Population scales must be in (0, 1].")
+    n_pre = _positive_integer(settings.get("n_pre"), "n_pre")
+    splits = settings.get("latent_splits")
+    if splits is not None:
+        if (
+            settings.get("nx_values") is not None
+            or settings.get("n1_max") is not None
+        ):
+            raise ValueError(
+                "Explicit latent_splits cannot be combined with nx_values "
+                "or n1_max."
+            )
+        dimensions = _explicit_latent_splits(splits)
+    else:
+        dimensions = _legacy_latent_splits(settings)
     cases = []
     for population in populations:
-        for nx in sizes:
-            n1 = min(settings["n1_max"], nx)
+        for nx, n1, n2 in dimensions:
             cases.append(
                 dict(
-                    name=f"BRAID_nx{nx}_p{population:g}",
+                    name=_case_name(
+                        nx, n1, n2, population, splits is not None
+                    ),
                     population_scale=population,
                     dimensions=dict(
-                        nx=nx, n1=n1, n3=None, n_pre=settings["n_pre"]
+                        nx=nx,
+                        n1=n1,
+                        n3=CANONICAL_ZERO_STAGE_THREE,
+                        n_pre=n_pre,
                     ),
-                    summary_parameters=dict(nx=nx, n1=n1),
+                    summary_parameters=(
+                        dict(nx=nx, n1=n1, n2=n2, residual=n2 > 0)
+                        if splits is not None
+                        else dict(nx=nx, n1=n1)
+                    ),
                 )
             )
     return cases
+
+
+def _positive_integer(value: object, name: str) -> int:
+    """Return one strictly positive integer configuration value."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"Expected positive integer {name}, got {value!r}.")
+    return value
+
+
+def _nonnegative_integer(value: object, name: str) -> int:
+    """Return one nonnegative integer configuration value."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"Expected nonnegative integer {name}, got {value!r}."
+        )
+    return value
+
+
+def _legacy_latent_splits(settings: dict) -> list[tuple[int, int, int]]:
+    """Resolve the established one-dimensional latent sweep definition."""
+    sizes = settings.get("nx_values")
+    if not isinstance(sizes, list) or not sizes:
+        raise ValueError("Expected a nonempty nx_values list.")
+    if len(set(sizes)) != len(sizes):
+        raise ValueError("Latent dimensions must be unique.")
+    n1_max = _positive_integer(settings.get("n1_max"), "n1_max")
+    result = []
+    for value in sizes:
+        nx = _positive_integer(value, "nx_values entry")
+        n1 = min(n1_max, nx)
+        result.append((nx, n1, nx - n1))
+    return result
+
+
+def _explicit_latent_splits(
+    settings: object,
+) -> list[tuple[int, int, int]]:
+    """Validate explicit dimensions and derive total state size."""
+    if not isinstance(settings, list) or not settings:
+        raise ValueError("Expected a nonempty latent_splits list.")
+    result = []
+    seen = set()
+    for number, split in enumerate(settings):
+        location = f"latent_splits[{number}]"
+        if (
+            not isinstance(split, dict)
+            or set(split) != set(LATENT_SPLIT_FIELDS)
+        ):
+            received = sorted(split) if isinstance(split, dict) else split
+            raise ValueError(
+                f"Expected {location} keys {LATENT_SPLIT_FIELDS}, got "
+                f"{received!r}."
+            )
+        n1 = _positive_integer(split["n1"], f"{location}.n1")
+        n2 = _nonnegative_integer(split["n2"], f"{location}.n2")
+        n3 = _nonnegative_integer(split["n3"], f"{location}.n3")
+        if n3 != ZERO_STAGE_THREE:
+            raise ValueError(
+                f"Expected {location}.n3={ZERO_STAGE_THREE}, got {n3}."
+            )
+        dimensions = (n1 + n2 + n3, n1, n2)
+        if dimensions in seen:
+            raise ValueError(f"Duplicate latent split at {location}: {split}.")
+        seen.add(dimensions)
+        result.append(dimensions)
+    return result
+
+
+def _case_name(
+    nx: int,
+    n1: int,
+    n2: int,
+    population: float,
+    explicit: bool,
+) -> str:
+    """Return a readable membership name without affecting fit identity."""
+    if not explicit:
+        return f"{CASE_NAME_PREFIX}_nx{nx}_p{population:g}"
+    return f"{CASE_NAME_PREFIX}_nx{nx}_n1{n1}_n2{n2}_p{population:g}"
+
+
+def _retained_neural_indices(
+    mapping: object,
+    channel_count: int,
+    component: str,
+) -> np.ndarray:
+    """Return source neural dimensions retained by a saved linear mapping."""
+    weight = mapping.get_overall_W()
+    if weight is None:
+        return np.arange(channel_count)
+    weight = np.asarray(weight)
+    if weight.ndim != 2 or weight.shape[1] != channel_count:
+        raise ValueError(
+            f"Expected {component} neural preprocessing weight shape "
+            f"(*, {channel_count}), got {weight.shape}."
+        )
+    if weight.shape[0] == channel_count:
+        return np.arange(channel_count)
+    supports = [np.flatnonzero(row) for row in weight]
+    if (
+        not supports
+        or any(len(indices) != 1 for indices in supports)
+        or len({int(indices[0]) for indices in supports}) != len(supports)
+    ):
+        raise ValueError(
+            f"{component} neural preprocessing does not retain a direct "
+            "channel mapping for fitted previews."
+        )
+    return np.asarray([indices[0] for indices in supports], dtype=int)
+
+
+def _fitted_neural_indices(
+    model: BRAIDModel,
+    channel_count: int,
+) -> np.ndarray:
+    """Validate the shared channel projection used by fitted stages."""
+    retained = [
+        _retained_neural_indices(
+            component.YPrepMap,
+            channel_count,
+            name,
+        )
+        for name, component in (
+            ("pre", model.sId_pre),
+            ("main", model.sId),
+        )
+    ]
+    if not np.array_equal(*retained):
+        raise ValueError(
+            "Pre and main neural preprocessing retain different channels."
+        )
+    return retained[0]
 
 
 def checkpoint_preview_arrays(
@@ -348,6 +423,8 @@ def checkpoint_preview_arrays(
     arrays = features.arrays
     np.testing.assert_array_equal(arrays["ids"][columns], ids)
     np.testing.assert_array_equal(arrays["units"][columns], units)
+    retained = _fitted_neural_indices(model, len(columns))
+    preview_ids = ids[retained]
     output = []
     for indices in windows:
         segment = np.flatnonzero(
@@ -367,7 +444,7 @@ def checkpoint_preview_arrays(
             Y=arrays["Y"][indices][:, columns],
             Z=arrays["Z"][indices], U=arrays["U"][indices],
         )
-        result = dict(channel_ids=ids, learned_Z=learned)
+        result = dict(channel_ids=preview_ids, learned_Z=learned)
         for component, fitted in (("pre", model.sId_pre), ("main", model.sId)):
             for name in ("Y", "Z", "U"):
                 values = (
@@ -377,9 +454,14 @@ def checkpoint_preview_arrays(
                 normalized = getattr(fitted, f"{name}PrepMap").apply(
                     values.T.copy()
                 ).T
-                if normalized.shape != values.shape:
+                expected = (
+                    (len(indices), len(retained))
+                    if name == "Y"
+                    else values.shape
+                )
+                if normalized.shape != expected:
                     raise ValueError(
-                        f"Expected {component} {name} shape {values.shape}, "
+                        f"Expected {component} {name} shape {expected}, "
                         f"got {normalized.shape}."
                     )
                 result[f"{component}_{name}"] = normalized

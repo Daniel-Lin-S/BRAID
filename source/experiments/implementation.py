@@ -14,6 +14,12 @@ from .cache import file_digest, fingerprint
 
 SOURCE = Path(__file__).resolve().parents[1]
 FIT_ADAPTER_METHODS = {"resolve_fit_configuration", "fit", "save"}
+FIT_ADAPTER_IDENTITY_EXCLUDED_CONSTANTS = frozenset({
+    "CANONICAL_ZERO_STAGE_THREE",
+    "CASE_NAME_PREFIX",
+    "LATENT_SPLIT_FIELDS",
+    "ZERO_STAGE_THREE",
+})
 # Only certified numerical-equivalence pairs permit immutable bundle reuse.
 FITTING_REUSE = frozenset({
     (
@@ -23,6 +29,10 @@ FITTING_REUSE = frozenset({
     (
         "338ef3f4781672973338c3fa4ef934d2400a43b99d85d98d81b8be0ee23530b9",
         "042c67c49a52ec50c90bca7dee26b046cd996ef50b04f27a4403bb852467624d",
+    ),
+    (
+        "042c67c49a52ec50c90bca7dee26b046cd996ef50b04f27a4403bb852467624d",
+        "814f85ac160e622e4fc46e4244ca5688c1748431dc4957b15ed4f96faa8399c7",
     ),
 })
 INFERENCE_REUSE = frozenset({
@@ -37,6 +47,10 @@ INFERENCE_REUSE = frozenset({
     (
         "93dae4befe7f5e019312b38e868224c3dd3c219a808c585e25e5e2635cf22c0f",
         "d19d145d1d9596783bda90d19a3cd57d7037e9d019c322c94efdb5bfaac34e1f",
+    ),
+    (
+        "d19d145d1d9596783bda90d19a3cd57d7037e9d019c322c94efdb5bfaac34e1f",
+        "c70143ee942256d00f0b552d817271f442eeb8d6098b4ac34abda65d39be7339",
     ),
 })
 
@@ -74,7 +88,13 @@ def implementation_signatures() -> dict[str, str]:
         window_selection=file_digest(SOURCE / "experiments" / "windows.py"),
         constants=[
             ast.dump(node, include_attributes=False)
-            for node in tree.body if isinstance(node, ast.Assign)
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and not any(
+                isinstance(target, ast.Name)
+                and target.id in FIT_ADAPTER_IDENTITY_EXCLUDED_CONSTANTS
+                for target in node.targets
+            )
         ],
     )
     prediction_tree = ast.parse(

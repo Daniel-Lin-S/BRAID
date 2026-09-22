@@ -11,3 +11,5 @@ runtime:
   cpu_interop_threads: 1
   log_level: INFO
   figure_regeneration: incomplete  # Use all after changing figure styles.
+  preview_regeneration: incomplete
+  tensorboard: false

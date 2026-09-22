@@ -21,13 +21,14 @@ and `runtime` settings may be inherited through a local manifest.
 The LFP data module uses an ordered `preprocessing.steps` list. Each entry
 contains a step plugin and its parameter mapping. Common-average referencing
 is optional and is represented by a pipeline entry rather than a Boolean.
-The preview adapter is configured independently under `previews.adapter`, so
-rendering settings do not participate in fit identity.
+The data module exposes only `preview_adapter`; preview behavior and
+selection belong to `plotting.previews`. Neither participates in fit or
+analysis membership identity.
 
-The launcher accepts `fit`, `preprocess`, `preview`, `evaluate`, and
-`plot`. `evaluate` requires an existing completed fit. `plot` reads a
-saved analysis and does not load the dataset. CLI values override resolved
-runtime and cache settings for that invocation.
+The launcher accepts `fit`, `preprocess`, `evaluate`, and `plot`.
+`evaluate` requires an existing completed fit. Normal plotting reads saved
+metrics. Preview-enabled plotting additionally loads or builds selected
+scientific caches. CLI values override resolved settings for one invocation.
 
 ## BRAID adapter
 

@@ -47,8 +47,7 @@ LIFECYCLE_LOGGER = "experiments.lifecycle"
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 STAGE_ACTIVITY = {
     "plot": "reports",
-    "preview": "preview",
-    "preprocess": "previews",
+    "preprocess": "folds",
 }
 
 
@@ -188,7 +187,7 @@ def stage_scope(
     directory : Path
         Launch log directory.
     stage : str
-        One of preprocess, preview, or plot.
+        One of preprocess or plot.
     session : str, optional
         Session identifier for preprocessing; default None.
     fold : int, optional

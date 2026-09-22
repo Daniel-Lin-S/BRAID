@@ -43,7 +43,7 @@ def sweep(name: str) -> dict:
     result = dict(experiment=experiment)
     for key, path in experiment["modules"].items():
         result[key] = read_yaml(Path(path))
-    result["data"]["previews"]["enabled"] = False
+    result["plotting"]["previews"]["enabled"] = False
     result["plotting"]["enabled"] = False
     return result
 
@@ -112,7 +112,7 @@ def workflow(tmp_path, monkeypatch):
 
     monkeypatch.setattr(fitting, "plugin", lambda *a, **kw: Backend())
     arguments = SimpleNamespace(
-        no_previews=True, no_plots=True, stage="fit",
+        tensorboard=False, no_plots=True, stage="fit",
         log_level="INFO", log_directory=tmp_path / "logs",
     )
 
@@ -125,8 +125,8 @@ def workflow(tmp_path, monkeypatch):
 
     def run(config, case, directory):
         settings = dict(
-            config["evaluation"], velocity=config["data"]["infer_velocity"],
-            previews=config["data"]["previews"],
+            config["evaluation"],
+            velocity=config["data"]["infer_velocity"],
         )
         return run_case(
             dataset, features, 0, case, settings, arguments, ids,
@@ -228,38 +228,51 @@ def test_rendering_changes_reuse_analysis_and_fit(workflow):
     changed = copy.deepcopy(config)
     changed["plotting"]["presentation"]["title_font"] = 40
     changed["plotting"]["metrics"] = ["mse"]
-    changed["data"]["previews"]["seed"] = 99
+    changed["plotting"]["previews"]["seed"] = 99
     _, refreshed = workflow.prepare(changed)
     assert refreshed == analysis
     workflow.run(changed, cases[0], refreshed)
     assert workflow.calls == counts
     assert scientific == hashes(workflow.root / "experiments")
     rendering = read_manifest(analysis)["rendering"]
-    assert rendering["plotting"] == changed["plotting"]
+    expected_plotting = copy.deepcopy(changed["plotting"])
+    expected_plotting.pop("previews")
+    assert rendering["plotting"] == expected_plotting
 
 
-def test_rendering_failure_preserves_fit_and_evaluation(workflow, monkeypatch):
-    """A failed preview cannot invalidate a successfully completed fit."""
-    from experiments import runner
+def test_tensorboard_toggle_reuses_completed_fit_without_backfill(workflow):
+    """TensorBoard activation is invocation-only for completed fits."""
+    config = sweep("latent_dimension_sweep")
+    cases, analysis = workflow.prepare(config)
+    workflow.run(config, cases[0], analysis)
+    scientific = hashes(workflow.root / "experiments")
+    counts = dict(workflow.calls)
+
+    workflow.arguments.tensorboard = True
+    assert not workflow.run(config, cases[0], analysis)
+    assert workflow.calls == counts
+    assert hashes(workflow.root / "experiments") == scientific
+
+
+def test_fitting_does_not_invoke_preview_rendering(workflow, monkeypatch):
+    """Fit, prediction, and evaluation remain independent of previews."""
+    from experiments import previews
 
     config = sweep("latent_dimension_sweep")
+    config["plotting"]["previews"]["enabled"] = True
     cases, analysis = workflow.prepare(config)
 
     def fail(*args, **kwargs):
-        raise ValueError("injected renderer failure")
+        raise AssertionError("fit attempted preview rendering")
 
-    monkeypatch.setattr(runner, "preprocessing_previews", fail)
-    with pytest.raises(RuntimeError, match="Rendering failed"):
-        workflow.run(config, cases[0], analysis)
+    monkeypatch.setattr(previews, "preprocessing_previews", fail)
+    monkeypatch.setattr(previews, "fitted_previews", fail)
+    assert workflow.run(config, cases[0], analysis)
     assert workflow.calls["fit"] == 1
     assert any(
         member["state"] == "complete"
         for member in read_manifest(analysis)["members"].values()
     )
-    counts = dict(workflow.calls)
-    monkeypatch.setattr(runner, "preprocessing_previews", lambda *args: None)
-    assert not workflow.run(config, cases[0], analysis)
-    assert workflow.calls == counts
 
 
 def test_new_horizons_reuse_fit(workflow):
@@ -407,6 +420,159 @@ def test_reports_follow_manifest_membership_only(workflow):
     )
     assert not list((directory / "summaries").glob("session_summary.*"))
     assert workflow.calls == counts
+
+
+def test_report_attempts_session_rendering_after_aggregate_failure(
+    workflow, monkeypatch,
+):
+    """Defer renderer-local failure until aggregate and session suites run."""
+    from experiments import reporting
+    from experiments.plots import PlotRenderingError
+
+    config = sweep("latent_dimension_sweep")
+    cases, directory = workflow.prepare(config)
+    workflow.run(config, cases[0], directory)
+    calls = []
+
+    def render(*args, **kwargs):
+        calls.append((kwargs.get("namespace"), kwargs["regenerate"]))
+        if kwargs.get("namespace") is None:
+            raise PlotRenderingError("injected aggregate renderer failure")
+
+    monkeypatch.setattr(reporting, "plot_suite", render)
+    with pytest.raises(
+        PlotRenderingError,
+        match="after all suites were attempted",
+    ):
+        reporting.braid_report(
+            directory, config["plotting"], 20, regenerate=True,
+        )
+    assert calls == [(None, True), ("session/session_a", True)]
+
+
+def test_find_analysis_reports_missing_analysis_folder(workflow):
+    """Distinguish an absent saved analysis from incompatible settings."""
+    from experiments.analysis import find_analysis
+
+    config = sweep("latent_dimension_sweep")
+    with pytest.raises(
+        ValueError,
+        match="No saved analysis folders containing manifest.json",
+    ):
+        find_analysis(workflow.root, config)
+
+
+def test_find_analysis_accepts_implementation_mismatch(
+    workflow, caplog,
+):
+    """Plot historical metrics while preserving implementation provenance."""
+    from experiments.analysis import find_analysis
+
+    saved = sweep("latent_dimension_sweep")
+    saved["analysis_implementation"] = "saved-implementation"
+    _, directory = workflow.prepare(saved)
+    current = copy.deepcopy(saved)
+    current["analysis_implementation"] = "current-implementation"
+    caplog.set_level("WARNING", logger="experiments.analysis")
+    assert find_analysis(workflow.root, current) == directory
+    assert any(
+        directory.name in record.message
+        and "saved-implementation" in record.message
+        and "current-implementation" in record.message
+        and "will not be rescored" in record.message
+        for record in caplog.records
+    )
+
+
+def test_find_analysis_prefers_exact_implementation(workflow, caplog):
+    """Prefer exact provenance when a historical alternative also exists."""
+    from experiments.analysis import find_analysis
+
+    historical = sweep("latent_dimension_sweep")
+    historical["analysis_implementation"] = "historical"
+    workflow.prepare(historical)
+    current = copy.deepcopy(historical)
+    current["analysis_implementation"] = "current"
+    _, exact = workflow.prepare(current)
+    caplog.set_level("WARNING", logger="experiments.analysis")
+    assert find_analysis(workflow.root, current) == exact
+    assert not caplog.records
+
+
+def test_find_analysis_rejects_multiple_implementation_matches(workflow):
+    """Require an ID when implementation provenance cannot disambiguate."""
+    from experiments.analysis import find_analysis
+
+    config = sweep("latent_dimension_sweep")
+    identifiers = []
+    for implementation in ("first", "second"):
+        candidate = copy.deepcopy(config)
+        candidate["analysis_implementation"] = implementation
+        _, directory = workflow.prepare(candidate)
+        identifiers.append(directory.name)
+    current = copy.deepcopy(config)
+    current["analysis_implementation"] = "current"
+    with pytest.raises(ValueError) as error:
+        find_analysis(workflow.root, current)
+    message = str(error.value)
+    assert "Multiple plot-compatible saved analyses" in message
+    assert all(identifier in message for identifier in identifiers)
+    assert "--analysis-id" in message
+
+
+def test_find_analysis_reports_closest_setting_mismatch(workflow):
+    """Report parameter differences for the closest saved analysis."""
+    from experiments.analysis import find_analysis
+
+    config = sweep("latent_dimension_sweep")
+    _, closest = workflow.prepare(config)
+    farther = copy.deepcopy(config)
+    farther["experiment"]["suite"]["nx_values"] = [1]
+    farther["experiment"]["seed"] = 7
+    workflow.prepare(farther)
+    current = copy.deepcopy(config)
+    current["experiment"]["suite"]["nx_values"] = [1, 2, 8]
+    with pytest.raises(ValueError) as error:
+        find_analysis(workflow.root, current)
+    message = str(error.value)
+    assert "none match the current settings" in message
+    assert f"Closest analysis {closest.name}" in message
+    assert "suite.nx_values" in message
+    assert "saved=[1, 2, 4, 8, 16, 32, 64]" in message
+    assert "current=[1, 2, 8]" in message
+    assert "experiment.seed" not in message
+    assert f"--analysis-id {closest.name}" in message
+
+
+def test_find_analysis_explicit_id_reports_implementation_mismatch(
+    workflow, caplog,
+):
+    """Report provenance when explicitly selecting historical metrics."""
+    from experiments.analysis import find_analysis
+
+    saved = sweep("latent_dimension_sweep")
+    saved["analysis_implementation"] = "saved-implementation"
+    _, directory = workflow.prepare(saved)
+    current = copy.deepcopy(saved)
+    current["analysis_implementation"] = "current-implementation"
+    caplog.set_level("WARNING", logger="experiments.analysis")
+    assert find_analysis(workflow.root, current, directory.name) == directory
+    assert any(
+        directory.name in record.message
+        and "saved-implementation" in record.message
+        and "current-implementation" in record.message
+        for record in caplog.records
+    )
+
+
+def test_find_analysis_reports_unknown_explicit_id(workflow):
+    """Identify a requested saved analysis ID that does not exist."""
+    from experiments.analysis import find_analysis
+
+    config = sweep("latent_dimension_sweep")
+    workflow.prepare(config)
+    with pytest.raises(ValueError, match="--analysis-id 'missing'"):
+        find_analysis(workflow.root, config, "missing")
 
 
 def test_incomplete_prediction_bundle_is_quarantined(workflow):
@@ -819,7 +985,7 @@ def configure_main(workflow, monkeypatch, config):
 
 
 def test_preprocess_uses_stage_specific_lifecycle(workflow, monkeypatch):
-    """Preprocessing reports preview work without fitting counters."""
+    """Preprocessing reports cached folds without fitting counters."""
     runner = configure_main(
         workflow, monkeypatch, sweep("latent_dimension_sweep")
     )
@@ -857,12 +1023,12 @@ def test_preprocess_uses_stage_specific_lifecycle(workflow, monkeypatch):
         (session, fold, state["completed"], state["failed"])
         for session, fold, state in records
     } == {
-        ("session_a", None, 4, 0),
-        ("session_a", 0, 2, 0),
-        ("session_a", 1, 2, 0),
-        ("session_b", None, 4, 0),
-        ("session_b", 0, 2, 0),
-        ("session_b", 1, 2, 0),
+        ("session_a", None, 2, 0),
+        ("session_a", 0, 1, 0),
+        ("session_a", 1, 1, 0),
+        ("session_b", None, 2, 0),
+        ("session_b", 0, 1, 0),
+        ("session_b", 1, 1, 0),
     }
 
 
@@ -923,6 +1089,63 @@ def test_plot_uses_stage_specific_lifecycle(tmp_path, monkeypatch):
             {"completed": 1, "failed": 0},
         )
     ]
+
+
+def test_preview_plot_mode_skips_analysis_reporting(
+    tmp_path, monkeypatch,
+):
+    """Enabled previews make plot invocation preview-only."""
+    from experiments import analysis, preview_regeneration, runner
+
+    config = sweep("latent_dimension_sweep")
+    config["plotting"]["previews"].update(
+        enabled=True,
+        selection={"sessions": ["session_a"], "folds": None, "cases": None},
+    )
+    config.update(
+        paths={"artifact_root": str(tmp_path / "artifacts")},
+        runtime=dict(
+            log_level="INFO",
+            device="cpu",
+            cpu_threads=1,
+            cpu_interop_threads=1,
+            preview_regeneration="incomplete",
+        ),
+    )
+    states = []
+
+    @contextmanager
+    def record_stage(*args, **kwargs):
+        state = dict(completed=0, failed=0)
+        states.append(state)
+        yield state
+
+    monkeypatch.setattr(
+        runner, "resolve_configuration", lambda args: copy.deepcopy(config)
+    )
+    monkeypatch.setattr(runner, "configure_logging", lambda *args: None)
+    monkeypatch.setattr(
+        runner, "launch_directory", lambda *args: tmp_path / "logs"
+    )
+    monkeypatch.setattr(runner, "stage_scope", record_stage)
+    monkeypatch.setattr(analysis, "find_analysis", lambda *args: tmp_path)
+    monkeypatch.setattr(
+        preview_regeneration,
+        "render_previews",
+        lambda *args: {"preprocessing": 2, "fitted": 1},
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("preview-only plot invoked analysis report")
+
+    monkeypatch.setattr(runner, "plugin", forbidden)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["runner", "--experiment", "fixture.yaml", "--stage", "plot"],
+    )
+    runner.main()
+    assert states == [{"completed": 3, "failed": 0}]
 
 
 @pytest.mark.parametrize("phase", ["fit", "prediction", "evaluation"])

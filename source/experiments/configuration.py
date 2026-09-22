@@ -17,7 +17,7 @@ REPOSITORY = Path(__file__).resolve().parents[2]
 CONFIGURATION = REPOSITORY / "assets" / "config" / "nhp"
 MODULES = ("data", "model", "evaluation", "plotting")
 PATH_KEYS = ("dataset_root", "cache_root", "artifact_root", "log_root")
-STAGES = ("fit", "preprocess", "preview", "evaluate", "plot")
+STAGES = ("fit", "preprocess", "evaluate", "plot")
 
 
 def merge_settings(base: dict, override: dict) -> dict:
@@ -111,7 +111,20 @@ def argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--cache-mode", choices=["reuse", "rebuild", "off"])
     parser.add_argument("--no-plots", action="store_true")
-    parser.add_argument("--no-previews", action="store_true")
+    previews = parser.add_mutually_exclusive_group()
+    previews.add_argument(
+        "--previews", dest="previews", action="store_true",
+        help="Render selected data previews instead of analysis figures",
+    )
+    previews.add_argument(
+        "--no-previews", dest="previews", action="store_false",
+        help="Disable configured preview rendering for this invocation",
+    )
+    parser.set_defaults(previews=None)
+    parser.add_argument("--preview-session", action="append")
+    parser.add_argument("--preview-fold", type=int, action="append")
+    parser.add_argument("--preview-case", action="append")
+    parser.add_argument("--tensorboard", action="store_true", default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--analysis-id", help="Saved analysis revision for the plot stage"
@@ -152,9 +165,16 @@ def resolve_configuration(arguments: argparse.Namespace) -> dict:
             )
         paths[key] = str(Path(value).expanduser().resolve())
     resolved = dict(experiment=experiment, paths=paths, runtime=runtime)
+    plotting_overrides = experiment.pop("plotting_overrides", {})
+    if not isinstance(plotting_overrides, dict):
+        raise ValueError("plotting_overrides must be a mapping.")
     for module in MODULES:
         source = (path.parent / experiment["modules"][module]).resolve()
         resolved[module] = read_yaml(source)
+        if module == "plotting":
+            resolved[module] = merge_settings(
+                resolved[module], plotting_overrides
+            )
     if "neural_scoring_fraction" in resolved["evaluation"]:
         raise ValueError(
             "evaluation.neural_scoring_fraction is unsupported; common "
@@ -172,16 +192,79 @@ def resolve_configuration(arguments: argparse.Namespace) -> dict:
                 f"Expected evaluation_set full or common, got {scoring_set!r}."
             )
     data = resolved["data"]
-    if "presentation" in data.get("previews", {}):
-        raise ValueError("Configure figure style under plotting.presentation.")
+    previews = resolved["plotting"].get("previews")
+    if not isinstance(previews, dict):
+        raise ValueError("plotting.previews must be a mapping.")
+    selection = previews.get("selection")
+    if not isinstance(selection, dict):
+        raise ValueError("plotting.previews.selection must be a mapping.")
+    expected = {"sessions", "folds", "cases"}
+    if set(selection) != expected:
+        raise ValueError(
+            "plotting.previews.selection must contain sessions, folds, "
+            "and cases."
+        )
+    for key, values in selection.items():
+        if values is None:
+            continue
+        expected_type = int if key == "folds" else str
+        if (
+            not isinstance(values, list)
+            or any(type(value) is not expected_type for value in values)
+            or len(set(values)) != len(values)
+        ):
+            raise ValueError(
+                f"plotting.previews.selection.{key} must be a unique list "
+                f"of {expected_type.__name__} values or null."
+            )
+    for key in ("windows", "channels", "seed"):
+        value = previews.get(key)
+        minimum = 0 if key == "seed" else 1
+        if type(value) is not int or value < minimum:
+            raise ValueError(
+                f"plotting.previews.{key} must be an integer >= {minimum}."
+            )
+    seconds = previews.get("seconds")
+    if (
+        isinstance(seconds, bool)
+        or not isinstance(seconds, (int, float))
+        or seconds <= 0
+    ):
+        raise ValueError("plotting.previews.seconds must be positive.")
+    if type(previews.get("enabled")) is not bool:
+        raise ValueError("plotting.previews.enabled must be Boolean.")
+    if arguments.previews and arguments.stage != "plot":
+        raise ValueError("--previews is only valid with --stage plot.")
+    overrides = {
+        "sessions": arguments.preview_session,
+        "folds": arguments.preview_fold,
+        "cases": arguments.preview_case,
+    }
+    for key, values in overrides.items():
+        if values is not None:
+            selection[key] = values
+    if arguments.previews is not None:
+        previews["enabled"] = arguments.previews
+    selectors = any(values is not None for values in overrides.values())
+    if selectors and arguments.stage != "plot":
+        raise ValueError(
+            "Preview selectors are only valid with --stage plot."
+        )
+    if selectors and not previews["enabled"]:
+        raise ValueError(
+            "Preview selectors require --previews or "
+            "plotting.previews.enabled=true."
+        )
+    if previews["enabled"] and not selection["sessions"]:
+        raise ValueError(
+            "Preview rendering requires at least one selected session."
+        )
     data.update(
         root=paths["dataset_root"],
         cache_root=paths["cache_root"],
     )
     if arguments.cache_mode:
         data["cache_mode"] = arguments.cache_mode
-    if arguments.no_previews:
-        data["previews"]["enabled"] = False
     if arguments.no_plots:
         resolved["plotting"]["enabled"] = False
     for key in ("device", "log_level", "cpu_threads", "cpu_interop_threads"):
@@ -205,6 +288,16 @@ def resolve_configuration(arguments: argparse.Namespace) -> dict:
         raise ValueError(
             "runtime.figure_regeneration must be incomplete or all."
         )
+    runtime.setdefault("preview_regeneration", "incomplete")
+    if runtime["preview_regeneration"] not in ("incomplete", "all"):
+        raise ValueError(
+            "runtime.preview_regeneration must be incomplete or all."
+        )
+    if arguments.tensorboard:
+        runtime["tensorboard"] = True
+    runtime.setdefault("tensorboard", False)
+    if type(runtime["tensorboard"]) is not bool:
+        raise ValueError("runtime.tensorboard must be Boolean.")
     for key in ("cpu_threads", "cpu_interop_threads"):
         if type(runtime[key]) is not int or runtime[key] < 1:
             raise ValueError(f"runtime.{key} must be a positive integer.")
