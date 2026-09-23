@@ -88,6 +88,7 @@ def score_channels(
             _evaluation_context(context), len(affected), len(channel_ids),
             affected,
         )
+    flat_prediction = np.ptp(predicted, axis=0) == 0
     for name, measure in METRICS.items():
         values = np.asarray(evalPrediction(truth, predicted, measure))
         values = np.atleast_1d(values).astype(float)
@@ -98,8 +99,29 @@ def score_channels(
             )
         if name in ("cc", "r2"):
             values[flat] = np.nan
+        expected = (
+            flat.copy()
+            if name in ("cc", "r2")
+            else np.zeros(truth.shape[1], dtype=bool)
+        )
+        if name == "cc":
+            constant = flat_prediction & ~flat
+            if constant.any():
+                affected = [
+                    channel_ids[i] for i in np.flatnonzero(constant)
+                ]
+                LOGGER.warning(
+                    "Ignoring constant prediction channels for CC because "
+                    "zero prediction variance makes correlation undefined; "
+                    "%s affected_count=%d total_channels=%d "
+                    "affected_channels=%s",
+                    _evaluation_context(context), len(affected),
+                    len(channel_ids), affected,
+                )
+            values[constant] = np.nan
+            expected |= constant
         good = np.isfinite(values)
-        unexpected = ~good & (~flat if name in ("cc", "r2") else True)
+        unexpected = ~good & ~expected
         if np.any(unexpected):
             indices = np.flatnonzero(unexpected)
             LOGGER.warning(

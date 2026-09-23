@@ -59,7 +59,12 @@ def braid_report(
         for member in manifest["members"].values()
     )
     rows = collect_results(root) if completed else []
-    outliers = resolve_outliers(settings, rows) if rows else ()
+    outliers = (
+        resolve_outliers(
+            settings, rows, manifest["members"], attempted, rendered,
+        )
+        if rows else ()
+    )
     summaries = aggregate(rows, destination, outliers) if rows else []
     table = {}
     for row in summaries:

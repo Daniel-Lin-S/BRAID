@@ -1,28 +1,31 @@
-"""Validate explicit finite-metric display exclusions for plot reporting.
+"""Resolve finite-metric exclusions used by comparison reporting.
 
-Input rules live under ``plotting.outliers`` and select completed metric rows.
-The output rules are immutable descriptions used only while aggregating and
-rendering. Raw metric artifacts and member completion payloads are unchanged.
+Inputs are exact-member or session/fold slice selectors from
+``plotting.outliers``, completed metric rows, and optional analysis membership.
+Outputs are atomic member/target/metric rules that remain outside the normal
+per-session display range. Scientific metric artifacts are never modified.
 """
 
+import logging
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 
 import numpy as np
 
-
+LOGGER = logging.getLogger(__name__)
 TARGETS = frozenset(("neural", "behavior"))
 METRICS = frozenset(("cc", "r2", "mse"))
 EVALUATION_SETS = frozenset(("full", "common"))
-REQUIRED_FIELDS = frozenset((
-    "member", "horizon", "evaluation_set", "targets", "metrics",
+COMMON_FIELDS = frozenset((
+    "horizon", "evaluation_set", "targets", "metrics",
     "aggregate_exclude", "session_zoom", "reason",
 ))
+SLICE_FIELDS = frozenset(("session", "fold"))
 
 
 @dataclass(frozen=True)
 class OutlierRule:
-    """One immutable finite-metric selector used only for presentation."""
+    """One atomic finite-metric selector used only for presentation."""
 
     member: str
     horizon: int
@@ -34,27 +37,68 @@ class OutlierRule:
     reason: str
 
 
+@dataclass(frozen=True)
+class _ConfiguredRule:
+    """One validated exact-member or session/fold selector."""
+
+    member: str | None
+    session: str | None
+    fold: int | None
+    horizon: int
+    evaluation_set: str
+    targets: tuple[str, ...]
+    metrics: tuple[str, ...]
+    aggregate_exclude: bool
+    session_zoom: bool
+    reason: str
+
+
 def resolve_outliers(
-    settings: dict, rows: list[dict],
+    settings: dict,
+    rows: list[dict],
+    members: dict[str, dict] | None = None,
+    attempted: set[str] | None = None,
+    warned: set[str] | None = None,
 ) -> tuple[OutlierRule, ...]:
-    """Parse rules and require exactly one finite raw result per selection."""
+    """Resolve ready selectors and restore candidates in the normal range.
+
+    Parameters
+    ----------
+    settings : dict
+        Plotting settings containing optional ``outliers`` selectors.
+    rows : list of dict
+        Completed raw metric rows available to this report.
+    members : dict of str to dict, optional
+        Analysis membership used to expand slices and defer pending members.
+    attempted : set of str, optional
+        Members attempted in this invocation. Completed historical members
+        outside this set remain pending until a plot-only invocation.
+    warned : set of str, optional
+        Invocation-local diagnostic keys used to suppress repeated warnings.
+
+    Returns
+    -------
+    tuple of OutlierRule
+        Atomic effective exclusions with finite matching metric values.
+    """
     configured = settings.get("outliers", [])
     if configured is None:
         configured = []
     if not isinstance(configured, list):
         raise ValueError("plotting.outliers must be a list of mappings.")
-    rules = tuple(
+    selectors = tuple(
         _parse_rule(item, index) for index, item in enumerate(configured)
     )
-    _validate_unique_rules(rules)
+    _validate_unique_selectors(selectors)
+    rules = _expand_rules(selectors, rows, members, attempted)
     _validate_matches(rules, rows)
-    return rules
+    return _restore_normal_values(rules, rows, warned)
 
 
 def matching_rule(
     rules: Iterable[OutlierRule], row: dict, target: str, metric: str,
 ) -> OutlierRule | None:
-    """Return the sole matching rule for one raw target metric, if any."""
+    """Return the sole matching effective rule for one raw metric."""
     matches = [
         rule for rule in rules
         if rule.member == member_id(row)
@@ -76,26 +120,30 @@ def member_id(row: dict) -> str:
     return f"{row['configuration']}/{row['session']}/fold_{row['fold']}"
 
 
-def _parse_rule(value: object, index: int) -> OutlierRule:
-    """Validate one YAML rule without inspecting saved metric rows."""
+def _parse_rule(value: object, index: int) -> _ConfiguredRule:
+    """Validate one selector without inspecting saved metric rows."""
     label = f"plotting.outliers[{index}]"
     if not isinstance(value, dict):
         raise ValueError(f"{label} must be a mapping.")
-    if set(value) != REQUIRED_FIELDS:
-        missing = sorted(REQUIRED_FIELDS - set(value))
-        unknown = sorted(set(value) - REQUIRED_FIELDS)
+    has_member = "member" in value
+    has_slice = "slice" in value
+    if has_member == has_slice:
         raise ValueError(
-            f"{label} fields are invalid; missing={missing}, unknown={unknown}."
+            f"{label} must contain exactly one of member or slice."
         )
-    member = value["member"]
-    parts = member.split("/") if isinstance(member, str) else []
-    if len(parts) != 3 or not all(parts) or not parts[2].startswith("fold_"):
+    required = COMMON_FIELDS | ({"member"} if has_member else {"slice"})
+    if set(value) != required:
+        missing = sorted(required - set(value))
+        unknown = sorted(set(value) - required)
         raise ValueError(
-            f"{label}.member must be configuration/session/fold_number."
+            f"{label} fields are invalid; missing={missing}, "
+            f"unknown={unknown}."
         )
-    fold_text = parts[2].removeprefix("fold_")
-    if not fold_text.isdecimal():
-        raise ValueError(f"{label}.member fold must be a nonnegative integer.")
+    member = _parse_member(value["member"], label) if has_member else None
+    session, fold = (
+        (None, None)
+        if has_member else _parse_slice(value["slice"], label)
+    )
     horizon = value["horizon"]
     if type(horizon) is not int or horizon < 1:
         raise ValueError(f"{label}.horizon must be a positive integer.")
@@ -113,8 +161,10 @@ def _parse_rule(value: object, index: int) -> OutlierRule:
     reason = value["reason"]
     if not isinstance(reason, str) or not reason.strip():
         raise ValueError(f"{label}.reason must be a nonempty string.")
-    return OutlierRule(
+    return _ConfiguredRule(
         member=member,
+        session=session,
+        fold=fold,
         horizon=horizon,
         evaluation_set=evaluation_set,
         targets=targets,
@@ -125,10 +175,39 @@ def _parse_rule(value: object, index: int) -> OutlierRule:
     )
 
 
+def _parse_member(value: object, label: str) -> str:
+    """Validate one exact analysis member identifier."""
+    parts = value.split("/") if isinstance(value, str) else []
+    if len(parts) != 3 or not all(parts) or not parts[2].startswith("fold_"):
+        raise ValueError(
+            f"{label}.member must be configuration/session/fold_number."
+        )
+    if not parts[2].removeprefix("fold_").isdecimal():
+        raise ValueError(f"{label}.member fold must be a nonnegative integer.")
+    return value
+
+
+def _parse_slice(value: object, label: str) -> tuple[str, int]:
+    """Validate one selector spanning every case in a session and fold."""
+    if not isinstance(value, dict) or set(value) != SLICE_FIELDS:
+        raise ValueError(
+            f"{label}.slice must contain exactly session and fold."
+        )
+    session = value["session"]
+    fold = value["fold"]
+    if not isinstance(session, str) or not session.strip():
+        raise ValueError(f"{label}.slice.session must be a nonempty string.")
+    if type(fold) is not int or fold < 0:
+        raise ValueError(
+            f"{label}.slice.fold must be a nonnegative integer."
+        )
+    return session, fold
+
+
 def _choices(
     value: object, allowed: frozenset[str], label: str,
 ) -> tuple[str, ...]:
-    """Validate a nonempty unique list of supported selector choices."""
+    """Validate a nonempty unique list of supported choices."""
     if not isinstance(value, list) or not value:
         raise ValueError(f"{label} must be a nonempty list.")
     if any(item not in allowed for item in value):
@@ -138,57 +217,270 @@ def _choices(
     return tuple(value)
 
 
-def _validate_unique_rules(rules: tuple[OutlierRule, ...]) -> None:
-    """Reject repeated selectors before examining metric rows."""
+def _selector_key(rule: _ConfiguredRule) -> tuple:
+    """Return one immutable configured-selector identity."""
+    selector = (
+        ("member", rule.member)
+        if rule.member is not None
+        else ("slice", rule.session, rule.fold)
+    )
+    return (
+        selector,
+        rule.horizon,
+        rule.evaluation_set,
+        rule.targets,
+        rule.metrics,
+    )
+
+
+def _validate_unique_selectors(
+    rules: tuple[_ConfiguredRule, ...],
+) -> None:
+    """Reject repeated configured selectors before expansion."""
     seen = set()
     for rule in rules:
-        key = (
-            rule.member, rule.horizon, rule.evaluation_set,
-            rule.targets, rule.metrics,
-        )
+        key = _selector_key(rule)
         if key in seen:
             raise ValueError(f"Duplicate plotting.outliers selector: {key!r}.")
         seen.add(key)
 
 
-def _validate_matches(rules: tuple[OutlierRule, ...], rows: list[dict]) -> None:
-    """Require every selected raw result to be unique and finite."""
+def _candidate_members(
+    rule: _ConfiguredRule,
+    rows: list[dict],
+    members: dict[str, dict] | None,
+) -> list[str]:
+    """Return exact member keys selected before readiness filtering."""
+    if rule.member is not None:
+        if members is not None and rule.member not in members:
+            raise ValueError(
+                "Unknown plotting.outliers member selector: "
+                f"{rule.member}."
+            )
+        return [rule.member]
+    universe = members or {
+        member_id(row): {
+            "session": row["session"],
+            "fold": row["fold"],
+            "state": "complete",
+        }
+        for row in rows
+    }
+    selected = sorted(
+        key for key, value in universe.items()
+        if value["session"] == rule.session and value["fold"] == rule.fold
+    )
+    if not selected:
+        raise ValueError(
+            "Unmatched plotting.outliers slice selector: "
+            f"session={rule.session} fold={rule.fold}."
+        )
+    return selected
+
+
+def _member_ready(
+    key: str,
+    members: dict[str, dict] | None,
+    attempted: set[str] | None,
+) -> bool:
+    """Return whether a selected member can provide metrics in this report."""
+    if members is None:
+        return True
+    state = members[key]["state"]
+    if state == "failed":
+        return False
+    if state != "complete":
+        return False
+    return attempted is None or key in attempted
+
+
+def _expand_rules(
+    selectors: tuple[_ConfiguredRule, ...],
+    rows: list[dict],
+    members: dict[str, dict] | None,
+    attempted: set[str] | None,
+) -> tuple[OutlierRule, ...]:
+    """Expand ready selectors into atomic member/target/metric rules."""
+    result = []
+    for selector in selectors:
+        for member in _candidate_members(selector, rows, members):
+            if not _member_ready(member, members, attempted):
+                continue
+            for target in selector.targets:
+                for metric in selector.metrics:
+                    result.append(OutlierRule(
+                        member=member,
+                        horizon=selector.horizon,
+                        evaluation_set=selector.evaluation_set,
+                        targets=(target,),
+                        metrics=(metric,),
+                        aggregate_exclude=selector.aggregate_exclude,
+                        session_zoom=selector.session_zoom,
+                        reason=selector.reason,
+                    ))
+    return tuple(result)
+
+
+def _validate_matches(
+    rules: tuple[OutlierRule, ...], rows: list[dict],
+) -> None:
+    """Require each ready atomic selector to match one finite result."""
     claimed = set()
     for rule in rules:
-        for target in rule.targets:
-            for metric in rule.metrics:
-                matches = [
-                    row for row in rows
-                    if matching_rule((rule,), row, target, metric) is not None
-                ]
-                label = (
-                    f"{rule.member} horizon={rule.horizon} "
-                    f"evaluation_set={rule.evaluation_set} "
-                    f"target={target} metric={metric}"
+        target = rule.targets[0]
+        metric = rule.metrics[0]
+        matches = [
+            row for row in rows
+            if matching_rule((rule,), row, target, metric) is not None
+        ]
+        label = _rule_label(rule)
+        if not matches:
+            raise ValueError(
+                "Unmatched plotting.outliers selector: " + label + "."
+            )
+        if len(matches) != 1:
+            raise ValueError(
+                "Ambiguous plotting.outliers selector: " + label + "."
+            )
+        value = matches[0][target][f"mean_{metric}"]
+        if value is None or not np.isfinite(value):
+            raise ValueError(
+                "plotting.outliers requires a finite selected metric: "
+                + label + "."
+            )
+        if label in claimed:
+            raise ValueError(
+                "Overlapping plotting.outliers selector: " + label + "."
+            )
+        claimed.add(label)
+
+
+def _context_key(rule: OutlierRule, row: dict) -> tuple:
+    """Return the session metric panel used for range validation."""
+    return (
+        row["session"],
+        rule.horizon,
+        rule.evaluation_set,
+        rule.targets[0],
+        rule.metrics[0],
+    )
+
+
+def _reference_range(
+    rules: tuple[OutlierRule, ...], rows: list[dict], context: tuple,
+) -> tuple[float, float]:
+    """Calculate renderer-equivalent bounds from nonselected folds."""
+    session, horizon, evaluation_set, target, metric = context
+    excluded = {
+        _result_id_from_rule(rule)
+        for rule in rules
+        if (
+            rule.member.split("/")[1],
+            rule.horizon,
+            rule.evaluation_set,
+            rule.targets[0],
+            rule.metrics[0],
+        ) == context
+    }
+    groups: dict[str, list[float]] = {}
+    for row in rows:
+        if (
+            row["session"] != session
+            or row["horizon"] != horizon
+            or row["evaluation_set"] != evaluation_set
+        ):
+            continue
+        if _result_id(row, target, metric) in excluded:
+            continue
+        value = row[target][f"mean_{metric}"]
+        if value is not None and np.isfinite(value):
+            groups.setdefault(row["configuration"], []).append(float(value))
+    bounds = []
+    for values in groups.values():
+        array = np.asarray(values, dtype=float)
+        mean = float(array.mean())
+        spread = float(array.std(ddof=1)) if len(array) > 1 else 0.0
+        bounds.extend((mean - spread, mean + spread))
+    if not bounds:
+        raise ValueError(
+            "No finite nonselected fold metrics define the normal display "
+            f"range for session={session} horizon={horizon} "
+            f"evaluation_set={evaluation_set} target={target} "
+            f"metric={metric}."
+        )
+    return min(bounds), max(bounds)
+
+
+def _restore_normal_values(
+    rules: tuple[OutlierRule, ...],
+    rows: list[dict],
+    warned: set[str] | None,
+) -> tuple[OutlierRule, ...]:
+    """Restore configured values that fall inside the evolving normal range."""
+    active = list(rules)
+    values = {
+        _result_id(row, target, metric): row[target][f"mean_{metric}"]
+        for row in rows
+        for target in TARGETS
+        for metric in METRICS
+    }
+    while active:
+        restored = []
+        contexts = {}
+        for rule in active:
+            member_rows = [
+                row for row in rows if member_id(row) == rule.member
+                and row["horizon"] == rule.horizon
+                and row["evaluation_set"] == rule.evaluation_set
+            ]
+            context = _context_key(rule, member_rows[0])
+            if context not in contexts:
+                contexts[context] = _reference_range(
+                    tuple(active), rows, context
                 )
-                if not matches:
-                    raise ValueError(
-                        "Unmatched plotting.outliers selector: " + label + "."
+            lower, upper = contexts[context]
+            value = float(values[_result_id_from_rule(rule)])
+            if lower <= value <= upper:
+                warning_key = (
+                    "outlier-restored/" + _result_id_from_rule(rule)
+                )
+                if warned is None or warning_key not in warned:
+                    LOGGER.warning(
+                        "Configured outlier is within the normal display "
+                        "range and will be included and plotted normally; %s "
+                        "value=%r reference_range=[%r, %r]",
+                        _rule_label(rule), value, lower, upper,
                     )
-                if len(matches) != 1:
-                    raise ValueError(
-                        "Ambiguous plotting.outliers selector: " + label + "."
-                    )
-                metric_value = matches[0][target][f"mean_{metric}"]
-                if metric_value is None or not np.isfinite(metric_value):
-                    raise ValueError(
-                        "plotting.outliers requires a finite selected metric: "
-                        + label + "."
-                    )
-                if label in claimed:
-                    raise ValueError(
-                        "Overlapping plotting.outliers selector: " + label + "."
-                    )
-                claimed.add(label)
+                    if warned is not None:
+                        warned.add(warning_key)
+                restored.append(rule)
+        if not restored:
+            break
+        restored_set = set(restored)
+        active = [rule for rule in active if rule not in restored_set]
+    return tuple(active)
+
+
+def _rule_label(rule: OutlierRule) -> str:
+    """Format one atomic selector for diagnostics."""
+    return (
+        f"{rule.member} horizon={rule.horizon} "
+        f"evaluation_set={rule.evaluation_set} "
+        f"target={rule.targets[0]} metric={rule.metrics[0]}"
+    )
+
+
+def _result_id_from_rule(rule: OutlierRule) -> str:
+    """Return the selected raw-result identity for one atomic rule."""
+    return (
+        f"{rule.member} horizon={rule.horizon} "
+        f"evaluation_set={rule.evaluation_set} "
+        f"target={rule.targets[0]} metric={rule.metrics[0]}"
+    )
 
 
 def _result_id(row: dict, target: str, metric: str) -> str:
-    """Format a selected raw result for a validation error."""
+    """Format a selected raw result for validation and range filtering."""
     return (
         f"{member_id(row)} horizon={row['horizon']} "
         f"evaluation_set={row['evaluation_set']} target={target} "

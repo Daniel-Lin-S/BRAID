@@ -37,6 +37,12 @@ that names the failed members. A comparison with no finite results is skipped.
 Unexpected missing completed metrics are rendering errors. Comparison
 figures are replaced when their recorded dependency state changes.
 
+Local `plotting.outliers` rules may select one exact `member` or a `slice`
+containing `session` and `fold`, which applies to every resolved case.
+Pending selections are deferred. A finite selected value is excluded only when
+it lies outside the fold-summary range from nonselected folds; otherwise it is
+included normally with one diagnostic warning.
+
 `history.py` renders fit-owned component histories. `presentation.py` owns
 figure style, metric labels, and output formatting. Plotting does not fit or
 modify a completed checkpoint. Completed components are scanned on resume;

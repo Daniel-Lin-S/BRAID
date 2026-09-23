@@ -589,6 +589,27 @@ def test_flat_channels_are_ignored_with_context(caplog):
     assert "total_channels=2" in messages[0]
     assert "unit_flat" in messages[0]
 
+def test_constant_predictions_have_distinct_undefined_cc_warning(caplog):
+    """Constant forecasts keep MSE and R2 while making only CC undefined."""
+    from experiments.evaluation import score_channels
+
+    truth = np.array([[0.0, 1.0], [1.0, 2.0], [2.0, 4.0]])
+    predicted = np.array([[1.0, 1.0], [1.0, 2.0], [1.0, 3.0]])
+    scores = score_channels(
+        truth, predicted, ["unit_constant", "unit_varying"],
+        evaluation_context(),
+    )
+    assert scores["per_dimension_cc"][0] is None
+    assert scores["valid_cc_channels"] == 1
+    assert scores["valid_r2_channels"] == 2
+    assert scores["valid_mse_channels"] == 2
+    messages = [record.message for record in caplog.records]
+    assert len(messages) == 1
+    assert "zero prediction variance" in messages[0]
+    assert "unit_constant" in messages[0]
+    assert "Unexpected nonfinite" not in messages[0]
+
+
 def test_nonfinite_nonflat_metric_has_distinct_warning(caplog, monkeypatch):
     """Unexpected metric failures identify their metric, value and channel."""
     from experiments import evaluation
@@ -1152,6 +1173,120 @@ def test_outlier_selectors_reject_duplicate_and_unmatched_rules(
         resolve_outliers(settings, outlier_rows())
 
 
+def test_slice_selector_expands_ready_cases_and_defers_pending_members():
+    """A session/fold slice follows manifest cases without premature errors."""
+    from experiments.outliers import resolve_outliers
+
+    rows = []
+    for configuration, nx, candidate in (
+        ("BRAID_nx1_p1", 1, -1000.0),
+        ("BRAID_nx2_p1", 2, -2000.0),
+    ):
+        for fold, value in ((0, candidate), (2, 2.0), (4, 4.0)):
+            score = dict(mean_cc=0.5, mean_r2=value, mean_mse=1.0)
+            rows.append(dict(
+                session="session_a",
+                fold=fold,
+                configuration=configuration,
+                population_scale=1.0,
+                nx=nx,
+                n1=nx,
+                horizon=8,
+                evaluation_set="full",
+                neural=dict(score),
+                behavior=dict(score),
+            ))
+    members = {
+        f"{row['configuration']}/session_a/fold_{row['fold']}": {
+            "session": "session_a",
+            "fold": row["fold"],
+            "state": "complete",
+        }
+        for row in rows
+    }
+    pending = "BRAID_nx2_p1/session_a/fold_0"
+    members[pending]["state"] = "pending"
+    settings = dict(outliers=[dict(
+        slice=dict(session="session_a", fold=0),
+        horizon=8,
+        evaluation_set="full",
+        targets=["neural"],
+        metrics=["r2"],
+        aggregate_exclude=True,
+        session_zoom=True,
+        reason="Synthetic fold slice",
+    )])
+    available = [
+        row for row in rows
+        if not (
+            row["configuration"] == "BRAID_nx2_p1"
+            and row["fold"] == 0
+        )
+    ]
+    rules = resolve_outliers(settings, available, members)
+    assert [rule.member for rule in rules] == [
+        "BRAID_nx1_p1/session_a/fold_0"
+    ]
+
+    members[pending]["state"] = "failed"
+    rules = resolve_outliers(settings, available, members)
+    assert [rule.member for rule in rules] == [
+        "BRAID_nx1_p1/session_a/fold_0"
+    ]
+
+    members[pending]["state"] = "complete"
+    attempted = set(members) - {pending}
+    rules = resolve_outliers(
+        settings, available, members, attempted,
+    )
+    assert [rule.member for rule in rules] == [
+        "BRAID_nx1_p1/session_a/fold_0"
+    ]
+    with pytest.raises(ValueError, match="Unmatched"):
+        resolve_outliers(settings, available, members)
+
+    rules = resolve_outliers(settings, rows, members)
+    assert {rule.member for rule in rules} == {
+        "BRAID_nx1_p1/session_a/fold_0",
+        "BRAID_nx2_p1/session_a/fold_0",
+    }
+
+
+def test_inside_range_selector_is_restored_before_aggregation(
+    tmp_path, caplog,
+):
+    """A configured value inside the reference range remains ordinary data."""
+    from experiments.evaluation import aggregate
+    from experiments.outliers import resolve_outliers
+
+    rows = outlier_rows()
+    rows[0]["neural"]["mean_r2"] = 3.0
+    selector = dict(outlier_settings()["outliers"][0])
+    selector["targets"] = ["neural"]
+    selector["metrics"] = ["r2"]
+    caplog.set_level("WARNING", logger="experiments.outliers")
+    warned = set()
+    rules = resolve_outliers(
+        dict(outliers=[selector]), rows, warned=warned,
+    )
+    assert not rules
+    assert not resolve_outliers(
+        dict(outliers=[selector]), rows, warned=warned,
+    )
+    summary = next(
+        row for row in aggregate(rows, tmp_path, rules)
+        if row["target"] == "neural" and row["metric"] == "r2"
+    )
+    assert summary["mean"] == pytest.approx(3.0)
+    assert summary["metric_counts"] == {"indy_20160630_01": 3}
+    assert not summary["excluded_members"]
+    messages = [record.message for record in caplog.records]
+    assert len(messages) == 1
+    assert "included and plotted normally" in messages[0]
+    assert "value=3.0" in messages[0]
+    assert "reference_range=" in messages[0]
+
+
 def test_outlier_selectors_reject_malformed_and_overlapping_rules():
     """Rules need a complete schema and must select disjoint metric values."""
     from experiments.outliers import resolve_outliers
@@ -1187,7 +1322,9 @@ def test_session_outlier_exclusion_requires_a_normal_fold_range():
             reason="Synthetic finite numerical outlier",
         ))
     rows = outlier_rows()
-    with pytest.raises(ValueError, match="No finite normal fold metrics"):
+    with pytest.raises(
+        ValueError, match="No finite nonselected fold metrics",
+    ):
         aggregate_folds(rows, resolve_outliers(dict(outliers=rules), rows))
 
 
