@@ -18,6 +18,10 @@ CONFIGURATION = REPOSITORY / "assets" / "config" / "nhp"
 MODULES = ("data", "model", "evaluation", "plotting")
 PATH_KEYS = ("dataset_root", "cache_root", "artifact_root", "log_root")
 STAGES = ("fit", "preprocess", "evaluate", "plot")
+SHARED_FIT_RUNTIME_KEYS = (
+    "shared_fit_wait_timeout_seconds",
+    "shared_fit_poll_interval_seconds",
+)
 
 
 def merge_settings(base: dict, override: dict) -> dict:
@@ -282,6 +286,13 @@ def resolve_configuration(arguments: argparse.Namespace) -> dict:
         raise ValueError("runtime.parallel_workers must be positive integer.")
     if runtime["parallel_workers"] > 1 and runtime["device"] != "auto":
         raise ValueError("Multiple workers require device=auto.")
+    if arguments.stage == "fit":
+        for key in SHARED_FIT_RUNTIME_KEYS:
+            value = runtime.get(key)
+            if type(value) is not int or value < 1:
+                raise ValueError(
+                    f"runtime.{key} must be a positive integer for fitting."
+                )
     runtime.setdefault("cpu_interop_threads", 1)
     runtime.setdefault("figure_regeneration", "incomplete")
     if runtime["figure_regeneration"] not in ("incomplete", "all"):

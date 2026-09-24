@@ -39,6 +39,19 @@ def _fake_worker(*args):
 
     def session(name, dataset, folds, cases, settings, arguments, shared,
                 snapshots, gpu, artifact_root, analysis_root, stop):
+        marker = root / "a.deferred"
+        if (
+            mode in ("defer", "timeout") and name == "a"
+            and (mode == "timeout" or not marker.exists())
+        ):
+            marker.write_text(str(os.getpid()))
+            return dict(
+                attempted=set(), rendering_errors=[], model_errors={},
+                deferred=dict(
+                    session=name, key=name, fit_id="fit-a", phase="fit",
+                    lock_path=str(root / "active-fit.lock"),
+                ),
+            )
         with (root / f"{name}.owner").open("x") as stream:
             json.dump(dict(pid=os.getpid(), gpu=gpu["uuid"]), stream)
         with lifecycle_scope(arguments.log_directory, name):
@@ -54,8 +67,9 @@ def _fake_worker(*args):
                 time.sleep(0.05 if name == "a" else 0.15)
         return dict(
             attempted={name}, rendering_errors=[],
-            model_errors=["contained model failure"]
-            if mode == "model_fail" and name == "a" else [],
+            model_errors={name: "contained model failure"}
+            if mode == "model_fail" and name == "a" else {},
+            deferred=None,
         )
 
     parallel._plan = plan
@@ -70,10 +84,11 @@ def _fake_worker(*args):
 
     parallel.plugin = plugin
     runner.run_session = session
+    runner.reconcile_analysis = lambda *args: (set(), {})
     parallel._worker(*args)
 
 
-@pytest.mark.parametrize("mode", [None, "model_fail", "fatal", "crash",
+@pytest.mark.parametrize("mode", [None, "model_fail", "defer", "fatal", "crash",
                                   "crash_zero", "plan_fail", "interrupt"])
 def test_spawned_scheduler(tmp_path, monkeypatch, mode):
     """Use real processes to check assignment, collection and shutdown."""
@@ -87,7 +102,9 @@ def test_spawned_scheduler(tmp_path, monkeypatch, mode):
     configure_logging(tmp_path, "INFO")
     settings = dict(
         runtime=dict(parallel_workers=2, cpu_threads=1,
-                     cpu_interop_threads=1, log_level="INFO"),
+                     cpu_interop_threads=1, log_level="INFO",
+                     shared_fit_wait_timeout_seconds=7200,
+                     shared_fit_poll_interval_seconds=120),
         experiment=dict(report_plugin="fixture:report"),
         data=dict(plugin="fixture:data", sampling_rate_hz=20),
         plotting={}, test_mode=mode,
@@ -95,17 +112,23 @@ def test_spawned_scheduler(tmp_path, monkeypatch, mode):
     before = set(multiprocessing.active_children())
     expectation = (
         pytest.raises(KeyboardInterrupt) if mode == "interrupt"
-        else pytest.raises(RuntimeError) if mode else nullcontext()
+        else pytest.raises(RuntimeError)
+        if mode not in (None, "defer") else nullcontext()
     )
     with expectation:
         parallel.run_parallel(
             settings, argparse.Namespace(log_directory=tmp_path), tmp_path,
         )
     assert set(multiprocessing.active_children()) == before
-    if mode in (None, "model_fail"):
+    if mode in (None, "model_fail", "defer"):
         owners = [json.loads(p.read_text()) for p in tmp_path.glob("*.owner")]
         assert len(owners) == 5
-        assert len({x["pid"] for x in owners}) == 2
+        if mode == "defer":
+            deferred_pid = int((tmp_path / "a.deferred").read_text())
+            owner = json.loads((tmp_path / "a.owner").read_text())
+            assert owner["pid"] != deferred_pid
+        else:
+            assert len({x["pid"] for x in owners}) == 2
         assert {x["gpu"] for x in owners} == {"GPU-a", "GPU-b"}
         reports = [json.loads(line) for line in
                    (tmp_path / "reports.jsonl").read_text().splitlines()]
@@ -149,3 +172,40 @@ def test_coordinator_import_does_not_import_tensorflow():
          "import experiments.parallel; assert 'tensorflow' not in sys.modules"],
         check=True,
     )
+
+def test_spawned_scheduler_times_out_without_gpu_workers(
+    tmp_path, monkeypatch,
+):
+    """Only the CPU coordinator remains during a bounded shared wait."""
+    from experiments import runner
+
+    monkeypatch.setattr(parallel, "_worker", _fake_worker)
+    monkeypatch.setattr(
+        parallel, "select_gpus", lambda *args: [dict(uuid="GPU-a")]
+    )
+    monkeypatch.setattr(
+        parallel, "shared_writer_available", lambda path: False
+    )
+    monkeypatch.setattr(
+        runner, "record_wait_timeout",
+        lambda analysis, item: "SharedArtifactTimeout",
+    )
+    configure_logging(tmp_path, "INFO")
+    settings = dict(
+        runtime=dict(
+            parallel_workers=1, cpu_threads=1, cpu_interop_threads=1,
+            log_level="INFO", shared_fit_wait_timeout_seconds=1,
+            shared_fit_poll_interval_seconds=1,
+        ),
+        experiment=dict(report_plugin="fixture:report"),
+        data=dict(plugin="fixture:data", sampling_rate_hz=20),
+        plotting={}, test_mode="timeout",
+    )
+    before = set(multiprocessing.active_children())
+    with pytest.raises(RuntimeError, match="SharedArtifactTimeout"):
+        parallel.run_parallel(
+            settings, argparse.Namespace(log_directory=tmp_path), tmp_path
+        )
+    assert set(multiprocessing.active_children()) == before
+    assert not (tmp_path / "a.owner").exists()
+    assert (tmp_path / "a.deferred").exists()

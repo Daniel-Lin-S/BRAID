@@ -5,6 +5,8 @@ paths:
   artifact_root: null
   log_root: null
 runtime:
+  shared_fit_wait_timeout_seconds: 7200
+  shared_fit_poll_interval_seconds: 120
   python: null  # Optional: otherwise use the launcher's interpreter.
   device: auto  # Most free GPU memory; also accepts cpu or GPU index/UUID.
   cpu_threads: 4

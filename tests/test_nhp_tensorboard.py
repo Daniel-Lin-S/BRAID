@@ -190,3 +190,21 @@ def test_nonblocking_run_lock(tmp_path):
         with pytest.raises(RuntimeError, match="active writer"):
             with writer_lock(lock, blocking=False):
                 pytest.fail("Contended lock entered")
+
+def test_shared_artifact_lock_reports_contention(tmp_path):
+    """Shared fit locks defer immediately and become runnable on release."""
+    from experiments.coordination import (
+        SharedArtifactBusy,
+        shared_writer_available,
+        shared_writer_lock,
+    )
+
+    lock = tmp_path / "fit.lock"
+    with shared_writer_lock(lock, "fit-id", "fit"):
+        assert not shared_writer_available(lock)
+        with pytest.raises(SharedArtifactBusy) as raised:
+            with shared_writer_lock(lock, "fit-id", "fit"):
+                pytest.fail("Contended shared lock entered")
+        assert raised.value.fit_id == "fit-id"
+        assert raised.value.phase == "fit"
+    assert shared_writer_available(lock)

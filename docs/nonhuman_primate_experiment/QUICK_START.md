@@ -64,6 +64,9 @@ files for new fits. `--parallel-workers N` runs N sessions on
 distinct GPUs with `device: auto`; the default is one worker.
 `--dry-run` only resolves configuration.
 
+Experiments with overlapping model fits can be run concurrently, but runtime profiles must set `shared_fit_wait_timeout_seconds` and
+`shared_fit_poll_interval_seconds`. A session that encounters an active shared fit or prediction writer is deferred.
+
 On resume, incomplete figures are repaired automatically, including
 comparisons whose failed contributions later complete. Set
 `runtime.figure_regeneration: all` to redraw comparison and training-history

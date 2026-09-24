@@ -130,14 +130,18 @@ def lifecycle_scope(
     Yields
     ------
     dict
-        Outcome counts (completed/reused/failed) and active model phase.
+        Outcome counts (completed/reused/deferred/failed) and active
+        model phase.
         Set skipped=True for a reused model.
     """
     logger = logging.getLogger(LIFECYCLE_LOGGER)
     label = f"session={session}" + (f" fold={fold}" if fold is not None else "")
     if model is not None:
         label += f" model={model}"
-    state = dict(skipped=False, completed=0, reused=0, failed=0, phase="setup")
+    state = dict(
+        skipped=False, completed=0, reused=0, deferred=0, failed=0,
+        phase="setup",
+    )
     if fold is None and model is None:
         path = (directory / "sessions" / f"{session}.log").resolve()
         logger.info("Started %s; details: %s", label, path)
@@ -153,11 +157,14 @@ def lifecycle_scope(
     else:
         if state["failed"]:
             event = "Failed" if model else "Finished with failures"
+        elif state["deferred"]:
+            event = "Deferred" if model else "Finished with deferrals"
         else:
             event = "Reused" if state["skipped"] else "Finished"
-        counts = " ".join(
-            f"{key}={state[key]}" for key in ("completed", "reused", "failed")
-        )
+        keys = ["completed", "reused", "failed"]
+        if state["deferred"]:
+            keys.insert(2, "deferred")
+        counts = " ".join(f"{key}={state[key]}" for key in keys)
         detail = counts
         if model and state["failed"]:
             detail += f" phase={state['phase']}"

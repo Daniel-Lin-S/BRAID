@@ -9,18 +9,21 @@ Usage: python -m experiments.runner --experiment YAML --stage STAGE
 Paths printed to the console are always absolute.
 """
 
+from collections import deque
 import argparse
 import json
 import logging
 import os
 from pathlib import Path
 import random
+from time import monotonic, sleep
 
 import numpy as np
 
 from .artifacts import fit_directory, prepare_model_settings, resolved_fit
 from .cache import file_digest, writer_lock
 from .contracts import Dataset, FeatureSet, plugin
+from .coordination import shared_writer_available
 from .runtime import (
     session_logging,
     lifecycle_scope,
@@ -260,6 +263,101 @@ def score_member(
     return True
 
 
+def reconcile_analysis(
+    analysis_root: Path,
+    snapshots: dict,
+    root: Path,
+) -> tuple[set[str], dict[str, str]]:
+    """Complete current-analysis metrics from validated saved predictions."""
+    from .analysis import read_manifest, update_member
+    from .artifacts import artifact_path, validate_completion
+    from .fitting import (
+        canonical_horizons,
+        prediction_directory,
+        validate_predictions,
+    )
+
+    manifest = read_manifest(analysis_root)
+    horizons = canonical_horizons(
+        manifest["specification"]["settings"]["evaluation"]["horizons"]
+    )
+    completed = set()
+    errors = {}
+    for key, member in manifest["members"].items():
+        if member.get("state") == "complete":
+            continue
+        run = (root.resolve() / member["fit"]).resolve()
+        completion = artifact_path(run, "fit_complete.json")
+        if not completion.exists():
+            continue
+        try:
+            validate_completion(run)
+            recorded = json.loads(
+                artifact_path(run, "identity.json").read_text()
+            )["identity"]
+            if (
+                recorded["fold"] != member["fold"]
+                or recorded["source"]["session"] != member["session"]
+            ):
+                raise ValueError(
+                    f"Saved fit membership mismatch for {key}."
+                )
+            directory = prediction_directory(run, horizons)
+            expected = dict(
+                fit_id=run.name,
+                checkpoint_sha256=file_digest(
+                    artifact_path(run, "model.p")
+                ),
+                source=recorded["source"],
+                horizons=horizons,
+                inference_implementation=snapshots.get(
+                    "inference_implementation"
+                ),
+            )
+            predictions = validate_predictions(directory, expected)
+            if predictions is None:
+                continue
+            identity = dict(
+                case=member["case"], fold=member["fold"],
+                selected_ids=recorded["selected_ids"],
+            )
+            score_member(
+                analysis_root, key, run, predictions, identity, horizons, root
+            )
+            completed.add(key)
+            LOGGER.info("Reconciled saved analysis member %s", key)
+        except Exception as error:
+            message = f"{type(error).__name__}: {error}"
+            errors[key] = f"{key} [reconciliation]: {message}"
+            update_member(
+                analysis_root, key,
+                dict(
+                    state="failed", failure_phase="reconciliation",
+                    error_type=type(error).__name__, error=str(error),
+                ),
+            )
+            LOGGER.exception("Analysis reconciliation failed: %s", key)
+    return completed, errors
+
+
+def record_wait_timeout(analysis_root: Path, item: dict) -> str:
+    """Keep an expired shared dependency nonterminal and resumable."""
+    from .analysis import update_member
+
+    message = (
+        f"Timed out waiting for shared {item['phase']} writer "
+        f"for fit {item['fit_id']}."
+    )
+    update_member(
+        analysis_root, item["key"],
+        dict(
+            state="waiting", failure_phase=None,
+            error_type="SharedArtifactTimeout", error=message,
+        ),
+    )
+    return f"{item['key']} [waiting]: SharedArtifactTimeout: {message}"
+
+
 def run_session(
     session: str, dataset: Dataset, folds: list[int], cases: list[dict],
     settings: dict, arguments: argparse.Namespace, shared: list[str],
@@ -272,7 +370,8 @@ def run_session(
     shared cancellation event. Arrays remain local to the session worker.
     """
     data = snapshots["data"]
-    rendering_errors, model_errors, attempted = [], [], set()
+    rendering_errors, model_errors, attempted = [], {}, set()
+    deferred = None
     session_context = (
         stage_scope(
             arguments.log_directory,
@@ -316,6 +415,7 @@ def run_session(
                     from .analysis import (
                         member_key, read_manifest, update_member,
                     )
+                    from .coordination import SharedArtifactBusy
 
                     for case in cases:
                         if stop is not None and stop.is_set():
@@ -332,13 +432,34 @@ def run_session(
                                     root, analysis_root, rendering_errors,
                                     model_state,
                                 )
+                            except SharedArtifactBusy as busy:
+                                phase = model_state.get("phase", "fit")
+                                model_state["deferred"] = 1
+                                deferred = dict(
+                                    session=session, key=key,
+                                    fit_id=busy.fit_id, phase=busy.phase,
+                                    lock_path=str(busy.lock_path),
+                                )
+                                update_member(
+                                    analysis_root, key,
+                                    dict(
+                                        state="waiting",
+                                        failure_phase=None,
+                                        error_type="SharedArtifactBusy",
+                                        error=str(busy),
+                                    ),
+                                )
+                                LOGGER.info(
+                                    "Deferred %s at active shared %s writer",
+                                    key, busy.phase,
+                                )
                             except Exception as error:
                                 phase = model_state.get("phase", "setup")
                                 message = (
                                     f"{key} [{phase}]: "
                                     f"{type(error).__name__}: {error}"
                                 )
-                                model_errors.append(message)
+                                model_errors[key] = message
                                 model_state["failed"] = 1
                                 LOGGER.exception(
                                     "Model failed: %s", message
@@ -363,7 +484,8 @@ def run_session(
                                 )
                                 model_state[outcome] = 1
                             for outcome in (
-                                "completed", "reused", "failed"
+                                "completed", "reused", "deferred",
+                                "failed",
                             ):
                                 count = model_state.get(outcome, 0)
                                 fold_state[outcome] = (
@@ -372,10 +494,17 @@ def run_session(
                                 session_state[outcome] = (
                                     session_state.get(outcome, 0) + count
                                 )
-                        attempted.add(key)
+                        if deferred is None:
+                            attempted.add(key)
+                        else:
+                            break
+                    if deferred is not None:
+                        break
+                if deferred is not None:
+                    break
     return dict(
         attempted=attempted, model_errors=model_errors,
-        rendering_errors=rendering_errors,
+        rendering_errors=rendering_errors, deferred=deferred,
     )
 
 
@@ -475,39 +604,105 @@ def main() -> None:
     from .diagnostics import render_safely
 
     rendering_errors = []
-    model_errors = []
+    model_errors = {}
     attempted = set()
     rendered = set()
     if arguments.stage != "preprocess":
         analysis_root = plan_analysis(
             dataset, selected, folds, cases, snapshots, shared, root
         )
+        reconciled, errors = reconcile_analysis(
+            analysis_root, snapshots, root
+        )
+        model_errors.update(errors)
+        for key in reconciled:
+            model_errors.pop(key, None)
         LOGGER.info("Analysis artifacts: %s", analysis_root)
         from .model_summary import write_model_summary
 
         write_model_summary(analysis_root)
 
     def report(result: dict) -> None:
-        """Collect session outcomes and render newly eligible comparisons."""
+        """Collect outcomes, reconcile saved work and render reports."""
         attempted.update(result["attempted"])
-        model_errors.extend(result["model_errors"])
+        model_errors.update(result["model_errors"])
         rendering_errors.extend(result["rendering_errors"])
-        if arguments.stage != "preprocess":
-            render_safely(
-                rendering_errors, "Analysis report", plugin,
-                experiment["report_plugin"], root=analysis_root,
-                settings=plotting, sample_rate=data["sampling_rate_hz"],
-                attempted=attempted, rendered=rendered,
-                regenerate=runtime.get("figure_regeneration") == "all",
-            )
+        if arguments.stage == "preprocess":
+            return
+        reconciled, errors = reconcile_analysis(
+            analysis_root, snapshots, root
+        )
+        model_errors.update(errors)
+        attempted.update(reconciled)
+        for key in reconciled:
+            model_errors.pop(key, None)
+        render_safely(
+            rendering_errors, "Analysis report", plugin,
+            experiment["report_plugin"], root=analysis_root,
+            settings=plotting, sample_rate=data["sampling_rate_hz"],
+            attempted=attempted, rendered=rendered,
+            regenerate=runtime.get("figure_regeneration") == "all",
+        )
 
-    for session in selected:
-        report(run_session(
-            session, dataset, folds, cases, settings, arguments, shared,
-            snapshots, gpu, root, analysis_root,
+    if arguments.stage == "preprocess":
+        for session in selected:
+            report(run_session(
+                session, dataset, folds, cases, settings, arguments, shared,
+                snapshots, gpu, root, analysis_root,
+            ))
+    else:
+        ready = deque(selected)
+        deferred = {}
+        deadlines = {}
+        while ready or deferred:
+            while ready:
+                session = ready.popleft()
+                result = run_session(
+                    session, dataset, folds, cases, settings, arguments,
+                    shared, snapshots, gpu, root, analysis_root,
+                )
+                report(result)
+                item = result.get("deferred")
+                if item is not None:
+                    deferred[session] = item
+                    deadlines.setdefault(
+                        item["fit_id"],
+                        monotonic()
+                        + runtime["shared_fit_wait_timeout_seconds"],
+                    )
+            if not deferred:
+                break
+            now = monotonic()
+            for session, item in list(deferred.items()):
+                if now >= deadlines[item["fit_id"]]:
+                    model_errors[item["key"]] = record_wait_timeout(
+                        analysis_root, item
+                    )
+                    deferred.pop(session)
+                elif shared_writer_available(Path(item["lock_path"])):
+                    LOGGER.info(
+                        "Resuming session=%s after shared %s writer",
+                        session, item["phase"],
+                    )
+                    deferred.pop(session)
+                    ready.append(session)
+            if ready or not deferred:
+                continue
+            next_deadline = min(
+                deadlines[item["fit_id"]]
+                for item in deferred.values()
+            )
+            delay = min(
+                runtime["shared_fit_poll_interval_seconds"],
+                max(0.0, next_deadline - monotonic()),
+            )
+            sleep(delay)
+        report(dict(
+            attempted=set(), model_errors={}, rendering_errors=[],
+            deferred=None,
         ))
     if model_errors or rendering_errors:
-        details = model_errors + rendering_errors
+        details = [*model_errors.values(), *rendering_errors]
         raise RuntimeError(
             "Scientific results remain saved; experiment failures:\n"
             + "\n".join(details)

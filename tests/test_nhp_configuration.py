@@ -32,7 +32,10 @@ def local_settings(tmp_path: Path) -> Path:
                     )
                 },
                 runtime=dict(
-                    python=None, device="auto", cpu_threads=1, log_level="INFO"
+                    python=None, device="auto", cpu_threads=1,
+                    log_level="INFO",
+                    shared_fit_wait_timeout_seconds=7200,
+                    shared_fit_poll_interval_seconds=120,
                 ),
             )
         )
@@ -393,3 +396,19 @@ def test_plotting_overrides_are_resolved_without_experiment_identity(tmp_path):
         dict(member="case/session/fold_0")
     ]
     assert "plotting_overrides" not in resolved["experiment"]
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "shared_fit_wait_timeout_seconds",
+        "shared_fit_poll_interval_seconds",
+    ],
+)
+def test_fit_requires_shared_wait_settings(tmp_path, key):
+    """Fit orchestration requires explicit positive invocation controls."""
+    local = local_settings(tmp_path)
+    settings = read_yaml(local)
+    settings["runtime"].pop(key)
+    local.write_text(yaml.safe_dump(settings))
+    with pytest.raises(ValueError, match=key):
+        resolve("latent_dimension_sweep.yaml", local)

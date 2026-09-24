@@ -7,15 +7,18 @@ Runtime
 worker assignments and IO timings belong to launch logs, not fit identities.
 """
 
+from collections import deque
 import logging
 from logging.handlers import QueueHandler, QueueListener
 import multiprocessing
 import os
 from pathlib import Path
 from queue import Empty
+from time import monotonic
 import signal
 
 from .contracts import plugin
+from .coordination import shared_writer_available
 from .runtime import (
     LIFECYCLE_LOGGER, configure_device, select_gpus, thread_environment,
 )
@@ -45,6 +48,9 @@ def _plan(snapshots: dict, arguments: object, root: Path) -> dict:
     analysis = plan_analysis(
         dataset, sessions, folds, cases, snapshots, shared, root,
     )
+    from .runner import reconcile_analysis
+
+    reconcile_analysis(analysis, snapshots, root)
     write_model_summary(analysis)
     members = read_manifest(analysis)["members"].values()
     priorities = {}
@@ -98,6 +104,12 @@ def _worker(
                 attempted = tasks.get()
                 if attempted is None or stop.is_set():
                     return
+                from .runner import reconcile_analysis
+
+                reconciled, member_errors = reconcile_analysis(
+                    plan["analysis_root"], snapshots, root,
+                )
+                attempted = set(attempted) | reconciled
                 failures = []
                 render_safely(
                     failures, "Analysis report", plugin,
@@ -108,7 +120,14 @@ def _worker(
                     attempted=attempted, rendered=rendered,
                     regenerate=runtime.get("figure_regeneration") == "all",
                 )
-                events.put((index, "report", failures))
+                events.put((
+                    index, "report",
+                    dict(
+                        rendering_errors=failures,
+                        member_errors=member_errors,
+                        reconciled=reconciled,
+                    ),
+                ))
             return
         gpu = configure_device(
             device["uuid"], runtime["cpu_threads"],
@@ -183,26 +202,31 @@ def _shutdown(processes: list, stop: object) -> None:
             return
 
 
-def run_parallel(snapshots: dict, arguments: object, root: Path) -> None:
-    """Run a complete analysis with one persistent process per chosen GPU.
+def _release_worker(index: int, workers: dict) -> None:
+    """Stop one idle worker normally so its GPU context is released."""
+    process, queue = workers.pop(index)
+    queue.put(None)
+    process.join()
+    if process.exitcode:
+        raise RuntimeError(
+            f"Worker {process.pid} exited {process.exitcode}."
+        )
 
-    Parameters
-    ----------
-    snapshots : dict
-        Resolved configuration, signatures and numerical package versions.
-    arguments : Namespace
-        Invocation flags and absolute launch log directory.
-    root : Path
-        Shared artifact root. Completed artifacts remain immutable.
-    """
-    devices = select_gpus("auto", snapshots["runtime"]["parallel_workers"])
+
+def run_parallel(snapshots: dict, arguments: object, root: Path) -> None:
+    """Run session tasks while parking GPUs during shared-fit waits."""
+    from .runner import record_wait_timeout
+
+    runtime = snapshots["runtime"]
+    devices = select_gpus("auto", runtime["parallel_workers"])
     context = multiprocessing.get_context("spawn")
     events, logs, stop = context.Queue(), context.Queue(), context.Event()
     listener = QueueListener(
         logs, *logging.getLogger(LIFECYCLE_LOGGER).handlers,
     )
-    processes, queues = [], []
     report_tasks, report_events = context.Queue(), context.Queue()
+    workers = {}
+    all_processes, all_queues = [], []
     planner = None
     previous_term = signal.getsignal(signal.SIGTERM)
 
@@ -210,85 +234,161 @@ def run_parallel(snapshots: dict, arguments: object, root: Path) -> None:
         stop.set()
         raise KeyboardInterrupt
 
+    def start_worker(index: int) -> None:
+        tasks = context.Queue()
+        process = context.Process(
+            target=_worker,
+            args=(
+                index, devices[index], snapshots, arguments, root, tasks,
+                events, logs, stop,
+            ),
+        )
+        process.start()
+        workers[index] = (process, tasks)
+        all_processes.append(process)
+        all_queues.append(tasks)
+        LOGGER.info(
+            "Worker %d pid=%d GPU=%s", index, process.pid,
+            devices[index]["uuid"],
+        )
+
     signal.signal(signal.SIGTERM, interrupt)
     listener.start()
     try:
         planner = context.Process(
             target=_worker,
-            args=(-1, None, snapshots, arguments, root, report_tasks,
-                  report_events, logs, stop),
+            args=(
+                -1, None, snapshots, arguments, root, report_tasks,
+                report_events, logs, stop,
+            ),
         )
         planner.start()
         _, kind, plan = _event(report_events, [planner])
         if kind != "plan":
             raise RuntimeError(f"Analysis planning failed: {plan}")
         LOGGER.info("Analysis artifacts: %s", plan["analysis_root"])
-        sessions = plan.pop("sessions")
-        pending = iter(sessions)
-        # Do not allocate more devices than session tasks.
-        count = min(len(devices), len(sessions))
-        for index, device in enumerate(devices[:count]):
-            tasks = context.Queue()
-            queues.append(tasks)
-            process = context.Process(
-                target=_worker,
-                args=(index, device, snapshots, arguments, root, tasks,
-                      events, logs, stop),
-            )
-            process.start()
-            processes.append(process)
-            LOGGER.info("Worker %d pid=%d GPU=%s", index, process.pid,
-                        device["uuid"])
-        active = set(range(count))
-        attempted, failures = set(), []
+        ready = deque(plan.pop("sessions"))
+        deferred = {}
+        deadlines = {}
+        attempted = set()
+        member_errors = {}
+        rendering_errors = []
 
         def report() -> None:
             report_tasks.put(attempted.copy())
-            _, kind, result = _event(
-                report_events, [planner, *processes],
-            )
-            if kind != "report":
-                raise RuntimeError(f"Reporting process failed: {result}")
-            failures.extend(result)
+            processes = [planner, *(p for p, _ in workers.values())]
+            _, report_kind, result = _event(report_events, processes)
+            if report_kind != "report":
+                raise RuntimeError(
+                    f"Reporting process failed: {result}"
+                )
+            rendering_errors.extend(result["rendering_errors"])
+            member_errors.update(result["member_errors"])
+            attempted.update(result["reconciled"])
+            for key in result["reconciled"]:
+                member_errors.pop(key, None)
 
-        while active:
-            index, kind, result = _event(
-                events, [planner, *processes],
-            )
+        def launch_ready_workers() -> None:
+            needed = min(len(devices), len(ready))
+            available = [
+                index for index in range(len(devices))
+                if index not in workers
+            ]
+            for index in available[:max(0, needed - len(workers))]:
+                start_worker(index)
+
+        launch_ready_workers()
+        while ready or workers or deferred:
+            if not workers:
+                now = monotonic()
+                for session, item in list(deferred.items()):
+                    deadline = deadlines[item["fit_id"]]
+                    if now >= deadline:
+
+                        member_errors[item["key"]] = record_wait_timeout(
+                            plan["analysis_root"], item
+                        )
+                        deferred.pop(session)
+                    elif shared_writer_available(
+                        Path(item["lock_path"])
+                    ):
+                        LOGGER.info(
+                            "Resuming session=%s after shared %s writer",
+                            session, item["phase"],
+                        )
+                        deferred.pop(session)
+                        ready.append(session)
+                if ready:
+                    launch_ready_workers()
+                    continue
+                if not deferred:
+                    break
+                next_deadline = min(
+                    deadlines[item["fit_id"]]
+                    for item in deferred.values()
+                )
+                delay = min(
+                    runtime["shared_fit_poll_interval_seconds"],
+                    max(0.0, next_deadline - monotonic()),
+                )
+                stop.wait(delay)
+                if stop.is_set():
+                    raise KeyboardInterrupt
+                continue
+
+            processes = [planner, *(p for p, _ in workers.values())]
+            index, kind, result = _event(events, processes)
             if kind == "fatal" or stop.is_set():
                 raise RuntimeError(f"Worker {index} failed: {result}")
             if kind == "complete":
                 attempted.update(result["attempted"])
-                failures.extend(result["model_errors"])
-                failures.extend(result["rendering_errors"])
-            session = next(pending, None)
-            if session is None:
-                active.remove(index)
-            else:
-                queues[index].put((session, plan))
-            if kind == "complete":
+                member_errors.update(result["model_errors"])
+                rendering_errors.extend(result["rendering_errors"])
+                item = result.get("deferred")
+                if item is not None:
+                    deferred[item["session"]] = item
+                    deadlines.setdefault(
+                        item["fit_id"],
+                        monotonic()
+                        + runtime["shared_fit_wait_timeout_seconds"],
+                    )
                 report()
+            if kind not in ("ready", "complete"):
+                raise RuntimeError(f"Unexpected worker event: {kind}")
+            if ready:
+                workers[index][1].put((ready.popleft(), plan))
+            else:
+                _release_worker(index, workers)
+            launch_ready_workers()
+
         report()
         report_tasks.put(None)
         planner.join()
         if planner.exitcode:
-            raise RuntimeError(f"Reporting process exited {planner.exitcode}.")
-        for queue in queues:
-            queue.put(None)
-        for process in processes:
-            process.join()
-            if process.exitcode:
-                raise RuntimeError(f"Worker exited {process.exitcode}.")
-        if failures:
+            raise RuntimeError(
+                f"Reporting process exited {planner.exitcode}."
+            )
+        if member_errors or rendering_errors:
+            details = [
+                *member_errors.values(), *rendering_errors,
+            ]
             raise RuntimeError(
                 "Scientific results remain saved; experiment failures:\n"
-                + "\n".join(failures)
+                + "\n".join(details)
             )
     finally:
-        _shutdown(processes + ([planner] if planner is not None else []),
-                  stop)
+        live = [
+            process for process in all_processes
+            if process.is_alive()
+        ]
+        if planner is not None and planner.is_alive():
+            live.append(planner)
+        _shutdown(live, stop)
         listener.stop()
         signal.signal(signal.SIGTERM, previous_term)
-        for queue in [*queues, events, logs, report_tasks, report_events]:
+        queues = [
+            *all_queues, events, logs, report_tasks, report_events,
+        ]
+        for queue in queues:
             queue.cancel_join_thread()
             queue.close()

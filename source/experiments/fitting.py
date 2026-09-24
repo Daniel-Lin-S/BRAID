@@ -22,7 +22,8 @@ from .artifacts import (
     prepare_model_settings, validate_completion,
     completed_fit,
 )
-from .cache import atomic_json, file_digest, writer_lock
+from .cache import atomic_json, file_digest
+from .coordination import shared_writer_lock
 from .contracts import FeatureSet, Model, plugin
 from .windows import window_indices
 
@@ -82,7 +83,7 @@ def ensure_fit(
         raise ValueError(f"Evaluation requires a completed fit: {run}")
     prepare_model_settings(run.parents[2], identity)
     run.mkdir(parents=True, exist_ok=True)
-    with writer_lock(run / "fit.lock"):
+    with shared_writer_lock(run / "fit.lock", run.name, "fit"):
         if completed_fit(run, identity):
             LOGGER.info("Reusing completed fit %s", run)
             return False
@@ -292,7 +293,14 @@ def ensure_predictions(
             "inference_implementation"
         ),
     )
-    with writer_lock(directory.parent / f"{directory.name}.lock"):
+    path = validate_predictions(directory, expected)
+    if path is not None:
+        return path
+    with shared_writer_lock(
+        directory.parent / f"{directory.name}.lock",
+        run.name,
+        "prediction",
+    ):
         path = validate_predictions(directory, expected)
         if path is not None:
             return path

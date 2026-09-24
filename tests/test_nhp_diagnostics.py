@@ -234,6 +234,29 @@ def test_all_comparison_files_are_generated(tmp_path):
         assert len(list(destination.glob("*.png"))) == count
         assert not (destination / "behavior_example.png").exists()
 
+def test_curve_metrics_override_shared_metric_selection():
+    """A local curve can restrict its own metric and horizon selection."""
+    settings = dict(
+        metrics=["cc", "r2", "mse"],
+        curves=[dict(
+            parameter="nx",
+            group="horizon",
+            panel="target",
+            metrics=["r2"],
+            where=dict(
+                target=["neural", "behavior"],
+                metric="cc",
+                horizon=[1, 2, 4, 8, 16],
+                population_scale=1.0,
+                evaluation_set="full",
+            ),
+        )],
+    )
+    specs = curve_specs(settings)
+    assert len(specs) == 1
+    assert specs[0]["where"]["metric"] == "r2"
+    assert specs[0]["where"]["horizon"] == [1, 2, 4, 8, 16]
+
 def test_latent_comparisons_use_panels_and_redundant_group_styles():
     """Both latent views distinguish every series beyond color alone."""
     from itertools import product
@@ -1154,6 +1177,28 @@ def test_outlier_arrow_uses_normal_range_and_three_significant_figures():
     finally:
         plt.close(figure)
 
+
+def test_in_range_outlier_is_marked_at_its_observed_value():
+    """A selected value within the panel range keeps a visible callout."""
+    spec = dict(
+        name="neural_r2_vs_horizon_nx4_full",
+        parameter="horizon",
+        where=dict(target="neural", metric="r2", nx=4,
+                   evaluation_set="full"),
+    )
+    rows = [
+        dict(
+            horizon=4, nx=4, mean=1.0, std=0.1,
+            outliers=[dict(member="test", value=1.05, reason="test")],
+        ),
+    ]
+    figure = metric_curve(rows, spec, STYLE)
+    try:
+        axis = figure.axes[0]
+        assert [item.get_text() for item in axis.texts] == ["× 1.05"]
+        assert axis.lines[-1].get_marker() == "x"
+    finally:
+        plt.close(figure)
 
 @pytest.mark.parametrize(
     ("settings", "message"),

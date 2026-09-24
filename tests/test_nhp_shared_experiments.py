@@ -28,6 +28,7 @@ from experiments.braid_backend import build_cases
 from experiments.cache import file_digest, fingerprint
 from experiments.configuration import CONFIGURATION, read_yaml
 from experiments.contracts import FeatureSet
+from experiments.coordination import SharedArtifactBusy
 from experiments.evaluation import collect_results
 from experiments.populations import common_channels, scoring_indices
 from experiments.runner import case_identity, plan_analysis, run_case
@@ -335,9 +336,72 @@ def test_concurrent_analysis_requests_share_one_fit(workflow):
             executor.submit(workflow.run, conf, cases[0], directory)
             for conf, directory in ((first, left), (second, right))
         ]
-        assert all(job.result() for job in jobs)
+        deferred = []
+        requests = ((first, left), (second, right))
+        for job, request in zip(jobs, requests):
+            try:
+                assert job.result()
+            except SharedArtifactBusy:
+                deferred.append(request)
+    for config, directory in deferred:
+        assert workflow.run(config, cases[0], directory)
     assert workflow.calls["fit"] == 1
     assert workflow.calls["predict"] == 1
+
+
+def test_shared_wait_timeout_remains_resumable(workflow):
+    """Expired contention is waiting, not a scientific fit failure."""
+    from experiments.runner import record_wait_timeout
+
+    config = sweep("latent_dimension_sweep")
+    _, analysis = workflow.prepare(config)
+    key, member = next(iter(read_manifest(analysis)["members"].items()))
+    message = record_wait_timeout(
+        analysis,
+        dict(
+            key=key, fit_id=member["fit_id"], phase="fit",
+        ),
+    )
+    saved = read_manifest(analysis)["members"][key]
+    assert saved["state"] == "waiting"
+    assert saved["error_type"] == "SharedArtifactTimeout"
+    assert saved["failure_phase"] is None
+    assert "SharedArtifactTimeout" in message
+    assert not list(analysis.rglob("metrics.json"))
+
+
+def test_reconcile_failed_member_from_saved_shared_artifacts(workflow):
+    """Saved predictions heal only the current noncomplete analysis."""
+    from experiments.analysis import update_member
+    from experiments.runner import reconcile_analysis
+
+    source = sweep("latent_dimension_sweep")
+    other = copy.deepcopy(source)
+    other["experiment"]["name"] = "reconciliation_target"
+    cases, completed_analysis = workflow.prepare(source)
+    workflow.run(source, cases[0], completed_analysis)
+    _, target = workflow.prepare(other)
+    key = next(
+        key for key, member in read_manifest(target)["members"].items()
+        if member["case"]["name"] == cases[0]["name"]
+    )
+    update_member(
+        target, key,
+        dict(
+            state="failed", failure_phase="fit",
+            error_type="RuntimeError", error="old failure",
+        ),
+    )
+    protected = (completed_analysis / "manifest.json").read_bytes()
+    calls = dict(workflow.calls)
+
+    reconciled, errors = reconcile_analysis(target, other, workflow.root)
+
+    assert reconciled == {key}
+    assert not errors
+    assert read_manifest(target)["members"][key]["state"] == "complete"
+    assert workflow.calls == calls
+    assert (completed_analysis / "manifest.json").read_bytes() == protected
 
 
 def test_fit_identity_uses_training_not_analysis(workflow):
@@ -947,6 +1011,8 @@ def configure_main(workflow, monkeypatch, config):
         runtime=dict(
             log_level="INFO", device="cpu", cpu_threads=1,
             cpu_interop_threads=1,
+            shared_fit_wait_timeout_seconds=7200,
+            shared_fit_poll_interval_seconds=120,
         ),
     )
 
@@ -1148,6 +1214,44 @@ def test_preview_plot_mode_skips_analysis_reporting(
     assert states == [{"completed": 3, "failed": 0}]
 
 
+def test_contended_session_defers_then_resumes(workflow, monkeypatch, caplog):
+    """A busy shared fit yields the session without becoming a failure."""
+    from experiments import runner
+
+    configured = configure_main(
+        workflow, monkeypatch, sweep("latent_dimension_sweep")
+    )
+    original = runner.run_case
+    attempts = []
+
+    def contend_once(*args, **kwargs):
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise SharedArtifactBusy(
+                "shared-fit", "fit", workflow.root / "active-fit.lock"
+            )
+        return original(*args, **kwargs)
+
+    caplog.set_level("INFO", logger="experiments.lifecycle")
+    monkeypatch.setattr(runner, "run_case", contend_once)
+    configured.main()
+    manifest_path = next(
+        (workflow.root / "analysis").glob("*/*/manifest.json")
+    )
+    assert all(
+        member["state"] == "complete"
+        for member in read_manifest(manifest_path.parent)["members"].values()
+    )
+    assert any(
+        record.message.startswith("Deferred")
+        for record in caplog.records
+    )
+    assert not any(
+        record.message.startswith("Failed")
+        for record in caplog.records
+    )
+
+
 @pytest.mark.parametrize("phase", ["fit", "prediction", "evaluation"])
 def test_model_failure_continues_all_scopes_and_resumes(
     workflow, monkeypatch, caplog, phase,
@@ -1173,6 +1277,17 @@ def test_model_failure_continues_all_scopes_and_resumes(
         return original(*args, **kwargs)
 
     monkeypatch.setattr(*target, fail_once)
+    if phase == "evaluation":
+        runner.main()
+        path = next(
+            (workflow.root / "analysis").glob("*/*/manifest.json")
+        )
+        assert len(attempts) == 9
+        assert all(
+            member["state"] == "complete"
+            for member in read_manifest(path.parent)["members"].values()
+        )
+        return
     with pytest.raises(RuntimeError, match="experiment failures"):
         runner.main()
     path = next((workflow.root / "analysis").glob("*/*/manifest.json"))

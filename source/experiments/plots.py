@@ -45,7 +45,12 @@ def curve_specs(settings: dict) -> list[dict]:
     """Expand configured comparison designs into separate metric figures."""
     result = []
     for curve in settings.get("curves", []):
-        for metric in settings.get("metrics", [curve["where"]["metric"]]):
+        metrics = curve.get(
+            "metrics", settings.get("metrics", [curve["where"]["metric"]])
+        )
+        if not isinstance(metrics, list) or not metrics:
+            raise ValueError("Curve metrics must be a nonempty list.")
+        for metric in metrics:
             if metric not in ("cc", "r2", "mse"):
                 raise ValueError(f"Unsupported comparison metric: {metric}")
             where = dict(curve["where"], metric=metric)
@@ -206,7 +211,7 @@ def _metric_axis(
 def _render_outlier_arrows(
     axis: object, rows: list[dict], parameter: str, style: dict,
 ) -> None:
-    """Zoom to normal summaries and mark selected finite values at an edge."""
+    """Zoom to normal summaries and mark selected finite values."""
     events = [
         (row, event)
         for row in rows
@@ -248,10 +253,8 @@ def _render_outlier_arrows(
         elif value > upper:
             direction, edge = "↑", upper_edge
         else:
-            raise ValueError(
-                "Configured outlier is inside the normal display range: "
-                f"{event['member']} value={value!r}."
-            )
+            direction, edge = "×", value
+            axis.plot(x, value, marker="x", color="black", linestyle="")
         arrows.append((x, direction, edge, row, event))
     arrows.sort(key=lambda item: (
         item[0], item[1], item[3].get("nx", -1), item[4]["member"],
@@ -261,7 +264,7 @@ def _render_outlier_arrows(
         key = (x, direction)
         offset = offsets.get(key, 0)
         offsets[key] = offset + 1
-        sign = 1 if direction == "↓" else -1
+        sign = -1 if direction == "↑" else 1
         axis.annotate(
             f"{direction} {event['value']:.{digits}g}",
             xy=(x, edge),
