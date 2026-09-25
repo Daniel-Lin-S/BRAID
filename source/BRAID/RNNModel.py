@@ -808,7 +808,9 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
         self.observable_U_in_Cfw = observable_U_in_Cfw and nft>0 and enable_forward_pred
 
         self.linear_cell = linear_cell
-        self.LSTM_cell = LSTM_cell
+        self.LSTM_cell = (
+            LSTM_cell or state_transition_architecture == "lstm"
+        )
         self.state_transition_architecture = (
             state_transition_architecture
         )

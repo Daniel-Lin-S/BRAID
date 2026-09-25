@@ -19,7 +19,8 @@ import yaml
 
 from .artifacts import (
     ARTIFACT_PATHS, artifact_path, fit_identity, fit_seed, prepare_run,
-    prepare_model_settings, validate_completion,
+    prepare_model_settings, effective_model_configuration,
+    validate_completion,
     completed_fit,
 )
 from .cache import atomic_json, file_digest
@@ -94,12 +95,14 @@ def ensure_fit(
             artifact_path(run, "identity.json"),
             dict(fit_id=run.name, identity=fit_identity(identity)),
         )
+        effective = effective_model_configuration(identity)
         artifact_path(run, "model_configuration.yaml").write_text(
-            yaml.safe_dump(identity["configurations"]["model"])
+            yaml.safe_dump(effective)
         )
+        resolved = dict(identity["configurations"], model=effective)
         atomic_json(
             artifact_path(run, "resolved_configurations.json"),
-            identity["configurations"],
+            resolved,
         )
         atomic_json(
             artifact_path(run, "runtime.json"),

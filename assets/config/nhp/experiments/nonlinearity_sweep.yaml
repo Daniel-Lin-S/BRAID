@@ -1,3 +1,17 @@
+extends: latent_dimension_sweep.yaml
 name: nonlinearity_sweep
-enabled: false
-reason: Deferred; architecture variants and comparison controls are unspecified.
+suite_plugin: experiments.structure_sweep:build_cases
+report_plugin: experiments.structure_report:structure_report
+modules:
+  plotting: ../plotting/BRAID_structure_sweep.yaml
+suite:
+  nx_values: null
+  n1_max: null
+  latent_splits:
+    - n1: 16
+      n2: 16
+      n3: 0
+  n_pre: 150
+  population_scales:
+    - 1.0
+  nonlinear_hidden_size: 64

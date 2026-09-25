@@ -34,6 +34,14 @@ FITTING_REUSE = frozenset({
         "042c67c49a52ec50c90bca7dee26b046cd996ef50b04f27a4403bb852467624d",
         "814f85ac160e622e4fc46e4244ca5688c1748431dc4957b15ed4f96faa8399c7",
     ),
+    (
+        "814f85ac160e622e4fc46e4244ca5688c1748431dc4957b15ed4f96faa8399c7",
+        "c5dbd575ed067cd581cc14e9e8e2dfe4f7581c189b40c65eb4bb5c5ac97b5184",
+    ),
+    (
+        "c5dbd575ed067cd581cc14e9e8e2dfe4f7581c189b40c65eb4bb5c5ac97b5184",
+        "ad69a9feeccabcca1b324c2cec1cc391d4324d4b7e78e7fe3119493a01c29c5c",
+    ),
 })
 INFERENCE_REUSE = frozenset({
     (
@@ -51,6 +59,14 @@ INFERENCE_REUSE = frozenset({
     (
         "d19d145d1d9596783bda90d19a3cd57d7037e9d019c322c94efdb5bfaac34e1f",
         "c70143ee942256d00f0b552d817271f442eeb8d6098b4ac34abda65d39be7339",
+    ),
+    (
+        "c70143ee942256d00f0b552d817271f442eeb8d6098b4ac34abda65d39be7339",
+        "b1e58a3b0d274961e5710ec8366f46d08cd02c32cbf5a94618c1413d72b13c84",
+    ),
+    (
+        "b1e58a3b0d274961e5710ec8366f46d08cd02c32cbf5a94618c1413d72b13c84",
+        "ea27a870989f7ef6ee5d9baeacfda88dcf279ab6a12dd72e992108ecba817d87",
     ),
 })
 

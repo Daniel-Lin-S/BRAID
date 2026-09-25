@@ -6,6 +6,7 @@ that Cfw is created only for horizons that require an input-free decoder.
 
 import unittest
 
+import numpy as np
 import tensorflow as tf
 
 from BRAID.RNNModel import RNNModel
@@ -58,6 +59,29 @@ class ForecastDecoderTest(unittest.TestCase):
             with self.subTest(architecture=architecture):
                 model = _build_model(SINGLE_STEP_HORIZONS, architecture)
                 self.assertFalse(hasattr(model.rnn.cell, "Cfw"))
+
+    def test_lstm_prediction_uses_output_state_dimensions(self) -> None:
+        """Initial-state forecasting passes LSTM output to its decoder."""
+        model = RNNModel(
+            nx=2, ny=3, block_samples=8, batch_size=1, ny_out=1,
+            has_prior_pred=True, steps_ahead=(1, 2),
+            enable_forward_pred=True,
+            state_transition_architecture="lstm",
+            cell_args=dict(
+                ASettings={}, KSettings={}, CSettings={},
+            ),
+        )
+        observations = np.ones((3, 8), dtype=np.float32)
+        prior = [
+            np.zeros((1, 8), dtype=np.float32) for _ in range(2)
+        ]
+        forecasts = model.predict(
+            observations, prior_pred=prior,
+            prior_pred_shift_by_one=True,
+        )
+        self.assertTrue(model.LSTM_cell)
+        self.assertEqual(forecasts[0].shape, (2, 8))
+        self.assertEqual(forecasts[4].shape, (2,))
 
     def test_multi_step_forecast_cfw_has_gradients(self) -> None:
         """Ensure the multi-step loss is connected to Cfw variables."""

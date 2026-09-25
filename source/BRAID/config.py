@@ -242,6 +242,12 @@ def _deep_merge_mappings(
     for key, value in overrides.items():
         default_value = merged.get(key)
         if isinstance(default_value, Mapping) and isinstance(value, Mapping):
+            if (
+                "architecture" in value
+                and value["architecture"] != default_value.get("architecture")
+            ):
+                merged[key] = copy.deepcopy(value)
+                continue
             merged[key] = _deep_merge_mappings(default_value, value)
         else:
             merged[key] = copy.deepcopy(value)

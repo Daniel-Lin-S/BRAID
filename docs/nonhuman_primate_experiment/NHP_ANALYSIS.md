@@ -16,6 +16,13 @@ scores are the same across those neural scoring selections. Aggregation first
 averages folds within a session, then reports the cross-session mean and sample
 SEM.
 
+The structure sweep writes `structure_raw.csv` with one case/session/fold/
+horizon/target/metric row, including failed and pending members. Its
+`structure_summary.csv` retains the fold-then-session mean and SEM with
+member counts. Six aggregate horizon figures show the three dynamics choices
+in separate panels. Values beyond median ± 2 IQR are labeled at the plot
+boundary and remain unchanged in the tables.
+
 `model_summary.py` writes a status row for every analysis member. It preserves
 explicit pending and failed states and does not fabricate scores for them.
 

@@ -1,0 +1,8 @@
+extends: style.yaml
+enabled: true
+metrics: [cc, r2, mse]
+curves: []
+structure_horizons:
+  enabled: true
+  zoom_iqr_multiple: 2
+  show_milliseconds: true

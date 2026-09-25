@@ -294,9 +294,9 @@ def test_private_configuration_is_ignored():
     )
     assert len(result.stdout.splitlines()) == len(candidates)
 
-def test_deferred_experiment_fails_before_machine_setup(tmp_path):
-    """An unspecified nonlinearity design cannot accidentally start fitting."""
-    with pytest.raises(ValueError, match="deferred"):
+def test_structure_sweep_requires_explicit_local_paths(tmp_path):
+    """The enabled portable sweep resolves only with a local overlay."""
+    with pytest.raises(ValueError, match="paths.dataset_root"):
         args = argument_parser().parse_args(
             [
                 "--experiment",
@@ -304,6 +304,13 @@ def test_deferred_experiment_fails_before_machine_setup(tmp_path):
             ]
         )
         resolve_configuration(args)
+    settings = resolve(
+        "nonlinearity_sweep.yaml", local_settings(tmp_path)
+    )
+    assert settings["data"]["features"] == "spike"
+    assert settings["experiment"]["suite_plugin"] == (
+        "experiments.structure_sweep:build_cases"
+    )
 
 def test_missing_local_path_has_actionable_error(tmp_path):
     """Unconfigured roots must fail instead of using a developer's machine."""

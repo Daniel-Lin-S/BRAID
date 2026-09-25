@@ -88,12 +88,36 @@ def resolved_fit(identity: dict, features: FeatureSet | None = None) -> dict:
     if arguments is None:
         adapter = model_adapter(snapshots)
         arguments = adapter.resolve_fit_configuration(
-            snapshots["model"], identity["case"].get("dimensions", {}),
+            effective_model_configuration(identity),
+            identity["case"].get("dimensions", {}),
             identity.get("model_overrides"), features,
         )
     for key in PRESENTATION_KEYS:
         arguments.get("args_base", {}).pop(key, None)
     return arguments
+
+
+def effective_model_configuration(identity: dict) -> dict:
+    """Return the exact model YAML for one structural case.
+
+    Parameters
+    ----------
+    identity : dict
+        Resolved configurations and a case with optional structure settings.
+
+    Returns
+    -------
+    dict
+        Independent model mapping with both BRAID stages configured.
+    """
+    configuration = copy.deepcopy(identity["configurations"]["model"])
+    structure = identity["case"].get("structure")
+    if structure is None:
+        return configuration
+    from .structure_sweep import apply_structure
+
+    apply_structure(configuration, structure)
+    return configuration
 
 
 def artifact_path(run: Path, name: str) -> Path:

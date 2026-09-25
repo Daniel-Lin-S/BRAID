@@ -24,6 +24,7 @@ with `requirements.txt`; the validated lock file is
 | `latent_dimension_sweep.yaml` | Full M1 population over latent dimensions 1–64 |
 | `neural_population_sweep.yaml` | 25%, 50%, and 100% nested populations at dimensions 16 and 64 |
 | `lfp_latent_dimension_sweep.yaml` | Broadband LFP latent sweep; selection is local |
+| `nonlinearity_sweep.yaml` | Smoothed spikes, 16+16 latent split, and 12 structural cases |
 
 Create a local experiment YAML that inherits both the tracked manifest and
 `paths.local.yaml`:
