@@ -332,11 +332,17 @@ def aggregate_folds(
             for member, value, rule in values
             if rule is not None and rule.session_zoom
         ]
-        if events and not finite.size:
+        excluded_condition = bool(events and not finite.size)
+        excluded_members = sorted(
+            event["member"] for event in events
+        ) if excluded_condition else []
+        if excluded_condition:
             identity = dict(zip(names, key))
-            raise ValueError(
-                "No finite normal fold metrics remain after outlier exclusion "
-                f"for {identity}."
+            LOGGER.warning(
+                "Removing whole session/model condition from plots after "
+                "outlier screening: %s; excluded_members=%s",
+                identity,
+                ", ".join(excluded_members),
             )
         summaries.append(
             dict(
@@ -351,6 +357,8 @@ def aggregate_folds(
                 missing_members=sorted(
                     member for member, value in included if value is None
                 ),
+                excluded_condition=excluded_condition,
+                excluded_members=excluded_members,
                 outliers=events,
             )
         )

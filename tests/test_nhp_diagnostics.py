@@ -396,7 +396,24 @@ def test_residual_comparisons_branch_from_resolved_dimensions():
             nx_lines[1].get_xdata(), [4, 8, 16, 32, 64]
         )
         assert nx_lines[0].get_color() == nx_lines[1].get_color()
-        assert nx_lines[0].get_linestyle() != nx_lines[1].get_linestyle()
+        assert nx_lines[0].get_linestyle() == "-"
+        assert nx_lines[1].get_linestyle() == ":"
+        assert len(nx_figure.legends) == 2
+        assert nx_figure.legends[0].get_title().get_text() == "Model type"
+        assert [
+            text.get_text() for text in nx_figure.legends[0].get_texts()
+        ] == ["Main only", "Residual"]
+        assert (
+            nx_figure.legends[0].get_texts()[0].get_fontsize()
+            == STYLE["legend_font"]
+        )
+        assert (
+            nx_figure.legends[1].get_title().get_text()
+            == "Forecast horizon"
+        )
+        assert [
+            text.get_text() for text in nx_figure.legends[1].get_texts()
+        ] == ["1 step", "2 steps"]
         horizon_lines = [
             line for line in horizon_figure.axes[0].lines
             if not line.get_label().startswith("_")
@@ -405,6 +422,37 @@ def test_residual_comparisons_branch_from_resolved_dimensions():
         assert "nx=8, n1=4, n2=4" in {
             line.get_label() for line in horizon_lines
         }
+        assert len(horizon_figure.legends) == 2
+        assert [
+            text.get_text()
+            for text in horizon_figure.legends[0].get_texts()
+        ] == ["Main only", "Residual"]
+        assert (
+            horizon_figure.legends[1].get_title().get_text()
+            == "Latent split"
+        )
+        split_labels = [
+            text.get_text()
+            for text in horizon_figure.legends[1].get_texts()
+        ]
+        assert split_labels == [
+            "n1=1, n2=0",
+            "n1=2, n2=0",
+            "n1=4, n2=0",
+            "n1=8, n2=0",
+            "n1=4, n2=4",
+            "n1=16, n2=0",
+            "n1=8, n2=8",
+            "n1=32, n2=0",
+            "n1=16, n2=16",
+            "n1=64, n2=0",
+            "n1=16, n2=48",
+        ]
+        assert not any(
+            "nx=" in text.get_text()
+            for legend in horizon_figure.legends
+            for text in legend.get_texts()
+        )
     finally:
         plt.close(nx_figure)
         plt.close(horizon_figure)
@@ -1105,6 +1153,46 @@ def outlier_settings() -> dict:
     )
 
 
+def test_horizon_wise_outlier_screen_selects_only_threshold_crossings():
+    """The configured median screen produces exact presentation rules."""
+    from experiments.outliers import resolve_outliers
+
+    rows = []
+    for number in range(102):
+        value = {100: 100.0, 101: 1000.0}.get(number, 0.0)
+        score = dict(mean_cc=0.5, mean_r2=value, mean_mse=1.0)
+        rows.append(dict(
+            session="session_a",
+            fold=number,
+            configuration="case",
+            population_scale=1.0,
+            nx=1,
+            n1=1,
+            horizon=16,
+            evaluation_set="full",
+            neural=dict(score),
+            behavior=dict(score),
+        ))
+    settings = dict(outlier_screen=dict(
+        targets=["neural"],
+        metrics=["r2"],
+        horizons=[16],
+        evaluation_set="full",
+        standard_deviation_threshold=50,
+        standard_error_threshold=50,
+        aggregate_exclude=True,
+        session_zoom=True,
+        reason="Synthetic 50-SD-or-SE screen",
+    ))
+    rules = resolve_outliers(settings, rows)
+    assert [rule.member for rule in rules] == [
+        "case/session_a/fold_101",
+        "case/session_a/fold_100",
+    ]
+    assert all(rule.targets == ("neural",) for rule in rules)
+    assert all(rule.metrics == ("r2",) for rule in rules)
+
+
 def test_outlier_policy_preserves_raw_rows_and_filters_only_selected_metrics(
     tmp_path, caplog,
 ):
@@ -1199,6 +1287,7 @@ def test_in_range_outlier_is_marked_at_its_observed_value():
         assert axis.lines[-1].get_marker() == "x"
     finally:
         plt.close(figure)
+
 
 @pytest.mark.parametrize(
     ("settings", "message"),
@@ -1349,8 +1438,8 @@ def test_outlier_selectors_reject_malformed_and_overlapping_rules():
         resolve_outliers(dict(outliers=[first, second]), outlier_rows())
 
 
-def test_session_outlier_exclusion_requires_a_normal_fold_range():
-    """A session renderer cannot invent a range after excluding all folds."""
+def test_whole_session_model_outlier_exclusion_warns_and_marks_row(caplog):
+    """All selected folds remove one condition with a terminal warning."""
     from experiments.evaluation import aggregate_folds
     from experiments.outliers import resolve_outliers
 
@@ -1367,10 +1456,70 @@ def test_session_outlier_exclusion_requires_a_normal_fold_range():
             reason="Synthetic finite numerical outlier",
         ))
     rows = outlier_rows()
-    with pytest.raises(
-        ValueError, match="No finite nonselected fold metrics",
-    ):
-        aggregate_folds(rows, resolve_outliers(dict(outliers=rules), rows))
+    caplog.set_level("WARNING", logger="experiments.evaluation")
+    summaries = aggregate_folds(
+        rows, resolve_outliers(dict(outliers=rules), rows)
+    )
+    summary = next(
+        row for row in summaries
+        if row["target"] == "neural" and row["metric"] == "r2"
+    )
+    assert summary["mean"] is None
+    assert summary["folds"] == 0
+    assert summary["excluded_condition"] is True
+    assert summary["excluded_members"] == [
+        f"BRAID_nx4_p1/indy_20160630_01/fold_{fold}"
+        for fold in (0, 2, 4)
+    ]
+    assert len(caplog.records) == 1
+    assert "Removing whole session/model condition" in caplog.text
+
+
+def test_excluded_condition_notice_is_session_only_and_outside_data():
+    """Intentional gaps are listed above only the per-session axes."""
+    rows = [
+        dict(
+            horizon=4, nx=4, n1=4, n2=0, residual=False,
+            mean=0.2, std=0.01,
+        ),
+        dict(
+            horizon=8, nx=4, n1=4, n2=0, residual=False,
+            mean=None, std=None, excluded_condition=True,
+            excluded_members=["case/session/fold_0"],
+            outliers=[dict(
+                member="case/session/fold_0", value=-1000.0,
+                reason="Synthetic finite numerical outlier",
+            )],
+        ),
+    ]
+    spec = dict(
+        name="neural_r2_vs_horizon_nx4_full",
+        parameter="horizon",
+        where=dict(
+            target="neural", metric="r2", nx=4,
+            evaluation_set="full",
+        ),
+    )
+    aggregate_figure = metric_curve(rows, spec, STYLE)
+    session_figure = metric_curve(
+        rows, dict(spec, mark_excluded_conditions=True), STYLE
+    )
+    try:
+        assert not aggregate_figure.axes[0].texts
+        assert not session_figure.axes[0].texts
+        assert len(aggregate_figure.texts) == 1
+        assert session_figure.texts[-1].get_text() == (
+            "Whole-condition exclusions (not plotted):\n"
+            "Neural: nx=4, h=8, main"
+        )
+        assert session_figure.texts[-1].get_position()[1] < 0.1
+        assert not any(
+            line.get_marker() == "X"
+            for line in session_figure.axes[0].lines
+        )
+    finally:
+        plt.close(aggregate_figure)
+        plt.close(session_figure)
 
 
 def test_outlier_arrows_stack_same_edge_labels_by_nx():

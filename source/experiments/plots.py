@@ -9,6 +9,7 @@ import logging
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import numpy as np
 from PIL import Image
 
@@ -25,11 +26,17 @@ READINESS_FIELDS = {
 }
 RESIDUAL_BRANCH = "residual"
 MAIN_ONLY_STYLE = ("-", "o")
-RESIDUAL_STYLE = ("--", "s")
+RESIDUAL_STYLE = (":", "s")
 GROUP_LINESTYLES = ("-", "--", "-.", ":")
 GROUP_MARKERS = ("o", "s", "D", "^", "v", "P", "X", "*")
 OUTLIER_LABEL_OFFSET_POINTS = 8
 OUTLIER_LABEL_STACK_POINTS = 14
+EXCLUDED_CONDITIONS_PER_LINE = 2
+EXCLUDED_FOOTER_INCHES_PER_LINE = 0.24
+EXCLUDED_FOOTER_MINIMUM_INCHES = 0.65
+EXCLUDED_FOOTER_AXIS_GAP_INCHES = 0.8
+EXCLUDED_FOOTER_Y = 0.01
+COMPARISON_RENDERING_VERSION = 8
 PARAMETER_LABELS = {
     "horizon": "Forecast horizon (steps)",
     "nx": "Latent dimension (nx)",
@@ -130,7 +137,14 @@ def metric_curve(
     if context_label:
         title += f"\n{context_label}"
     figure.suptitle(title, fontsize=style["title_font"], wrap=True)
-    if panel:
+    footer_lines = []
+    if spec.get("mark_excluded_conditions", False):
+        footer_lines = _excluded_condition_footer(
+            rows, panel, panels, spec["where"]["target"]
+        )
+    if spec.get("branch") == RESIDUAL_BRANCH:
+        _add_residual_legends(figure, rows, spec, style)
+    elif panel:
         handles, labels = axes[0][0].get_legend_handles_labels()
         figure.legend(
             handles,
@@ -147,8 +161,99 @@ def metric_curve(
             frameon=False,
             fontsize=style["legend_font"],
         )
-    figure.tight_layout()
+    if footer_lines:
+        width, height = figure.get_size_inches()
+        footer_height = max(
+            EXCLUDED_FOOTER_MINIMUM_INCHES,
+            len(footer_lines) * EXCLUDED_FOOTER_INCHES_PER_LINE,
+        )
+        reserved_height = (
+            footer_height + EXCLUDED_FOOTER_AXIS_GAP_INCHES
+        )
+        total_height = height + reserved_height
+        figure.set_size_inches(width, total_height)
+        figure.text(
+            0.5,
+            EXCLUDED_FOOTER_Y,
+            "\n".join(footer_lines),
+            ha="center",
+            va="bottom",
+            fontsize=style["legend_font"],
+        )
+        figure.tight_layout(rect=(0, reserved_height / total_height, 1, 1))
+    else:
+        figure.tight_layout()
     return figure
+
+
+def _add_residual_legends(
+    figure: object, rows: list[dict], spec: dict, style: dict,
+) -> None:
+    """Render independent branch-style and optional horizon-color keys."""
+    legend_font = style["legend_font"]
+    branch_handles = [
+        Line2D(
+            [], [], color="black", linestyle=MAIN_ONLY_STYLE[0],
+            label="Main only",
+        ),
+        Line2D(
+            [], [], color="black", linestyle=RESIDUAL_STYLE[0],
+            label="Residual",
+        ),
+    ]
+    group = spec.get("group")
+    branch_y = 0.82 if group == "nx" else 0.72
+    figure.legend(
+        handles=branch_handles,
+        title="Model type",
+        loc="center left",
+        bbox_to_anchor=(0.99, branch_y),
+        frameon=False,
+        fontsize=legend_font,
+        title_fontsize=legend_font,
+    )
+    if group == "nx":
+        split_handles = []
+        for value, branch, selected, number in _comparison_series(rows, spec):
+            color, linestyle, marker = _group_style(
+                spec, value, number, style, branch
+            )
+            split = selected[-1]
+            split_handles.append(Line2D(
+                [], [], color=color, linestyle=linestyle, marker=marker,
+                label=f"n1={split['n1']}, n2={split['n2']}",
+            ))
+        figure.legend(
+            handles=split_handles,
+            title="Latent split",
+            loc="center left",
+            bbox_to_anchor=(0.99, 0.32),
+            frameon=False,
+            fontsize=legend_font,
+            title_fontsize=legend_font,
+        )
+        return
+    if group != "horizon":
+        return
+    values = sorted({row["horizon"] for row in rows})
+    color_handles = []
+    for number, value in enumerate(values):
+        color, _linestyle, _marker = _group_style(
+            spec, value, number, style, False
+        )
+        color_handles.append(Line2D(
+            [], [], color=color, linestyle="", marker="o",
+            label=_group_label("horizon", value),
+        ))
+    figure.legend(
+        handles=color_handles,
+        title="Forecast horizon",
+        loc="center left",
+        bbox_to_anchor=(0.99, 0.37),
+        frameon=False,
+        fontsize=legend_font,
+        title_fontsize=legend_font,
+    )
 
 
 def _metric_axis(
@@ -202,9 +307,9 @@ def _metric_axis(
             f"{METRIC_LABELS[metric]}"
         ),
     )
+    _render_outlier_arrows(axis, rows, parameter, outlier_style)
     if panel_value is not None:
         axis.set_title(str(panel_value).capitalize())
-    _render_outlier_arrows(axis, rows, parameter, outlier_style)
     style_axis(axis, style)
 
 
@@ -215,6 +320,7 @@ def _render_outlier_arrows(
     events = [
         (row, event)
         for row in rows
+        if not row.get("excluded_condition", False)
         for event in row.get("outliers", [])
     ]
     if not events:
@@ -278,6 +384,51 @@ def _render_outlier_arrows(
             arrowprops=dict(arrowstyle="->", color="black"),
             annotation_clip=False,
         )
+
+
+def _excluded_condition_labels(rows: list[dict]) -> list[str]:
+    """Describe whole outlier-excluded conditions in deterministic order."""
+    excluded = [
+        row for row in rows if row.get("excluded_condition", False)
+    ]
+    if not excluded:
+        return []
+    labels = []
+    for row in sorted(excluded, key=lambda item: (
+        item.get("nx", -1), item.get("horizon", -1),
+        item.get("residual", False),
+    )):
+        branch = "residual" if row.get("residual", False) else "main"
+        labels.append(
+            f"nx={row['nx']:g}, h={row['horizon']:g}, {branch}"
+        )
+    return labels
+
+
+def _excluded_condition_footer(
+    rows: list[dict], panel: str | None, panels: list[object],
+    target: object,
+) -> list[str]:
+    """Build a footer isolated from plotted data and outlier callouts."""
+    lines = ["Whole-condition exclusions (not plotted):"]
+    for panel_value in panels:
+        selected = (
+            [row for row in rows if row[panel] == panel_value]
+            if panel else rows
+        )
+        labels = _excluded_condition_labels(selected)
+        if not labels:
+            continue
+        name = (
+            str(panel_value).capitalize()
+            if panel_value is not None
+            else str(target).capitalize()
+        )
+        for start in range(0, len(labels), EXCLUDED_CONDITIONS_PER_LINE):
+            prefix = name if start == 0 else f"{name} continued"
+            chunk = labels[start:start + EXCLUDED_CONDITIONS_PER_LINE]
+            lines.append(f"{prefix}: {'; '.join(chunk)}")
+    return lines if len(lines) > 1 else []
 
 
 def _comparison_series(
@@ -568,6 +719,7 @@ def comparison_rows(
             row.get("mean") is None
             and not row["missing_members"]
             and not row.get("failed_members")
+            and not row.get("excluded_condition", False)
         ):
             row["missing_members"] = list(
                 row.get("completed_members", [f"unidentified:{name}"])
@@ -580,6 +732,7 @@ def _comparison_signature(
 ) -> str:
     """Fingerprint values, dependencies and semantic curve configuration."""
     return fingerprint(dict(
+        rendering_version=COMPARISON_RENDERING_VERSION,
         rows=sorted(rows, key=repr),
         dependencies=sorted(dependencies, key=repr),
         curve={
@@ -644,6 +797,8 @@ def plot_suite(
     warning_members = set()
     for configured_spec in curve_specs(settings):
         spec = dict(configured_spec)
+        if namespace and namespace.startswith("session/"):
+            spec["mark_excluded_conditions"] = True
         name = spec["name"]
         render_key = f"{namespace}/{name}" if namespace else name
         path = root / f"{name}.png"

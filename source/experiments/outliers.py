@@ -1,9 +1,10 @@
 """Resolve finite-metric exclusions used by comparison reporting.
 
 Inputs are exact-member or session/fold slice selectors from
-``plotting.outliers``, completed metric rows, and optional analysis membership.
-Outputs are atomic member/target/metric rules that remain outside the normal
-per-session display range. Scientific metric artifacts are never modified.
+``plotting.outliers``, an optional horizon-wise statistical screen, completed
+metric rows, and optional analysis membership. Outputs are atomic
+member/target/metric rules that remain outside the normal per-session display
+range. Scientific metric artifacts are never modified.
 """
 
 import logging
@@ -21,6 +22,11 @@ COMMON_FIELDS = frozenset((
     "aggregate_exclude", "session_zoom", "reason",
 ))
 SLICE_FIELDS = frozenset(("session", "fold"))
+SCREEN_FIELDS = frozenset((
+    "targets", "metrics", "horizons", "evaluation_set",
+    "standard_deviation_threshold", "standard_error_threshold",
+    "aggregate_exclude", "session_zoom", "reason",
+))
 
 
 @dataclass(frozen=True)
@@ -91,6 +97,7 @@ def resolve_outliers(
     )
     _validate_unique_selectors(selectors)
     rules = _expand_rules(selectors, rows, members, attempted)
+    rules += _screen_rules(settings.get("outlier_screen"), rows)
     _validate_matches(rules, rows)
     return _restore_normal_values(rules, rows, warned)
 
@@ -215,6 +222,137 @@ def _choices(
     if len(set(value)) != len(value):
         raise ValueError(f"{label} contains duplicate values: {value!r}.")
     return tuple(value)
+
+
+def _positive_threshold(value: object, label: str) -> float:
+    """Validate one positive finite statistical threshold."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not np.isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError(f"{label} must be a positive finite number.")
+    return float(value)
+
+
+def _screen_settings(value: object) -> dict | None:
+    """Validate the optional horizon-wise median-distance screen."""
+    if value is None:
+        return None
+    label = "plotting.outlier_screen"
+    if not isinstance(value, dict) or set(value) != SCREEN_FIELDS:
+        fields = set(value) if isinstance(value, dict) else set()
+        raise ValueError(
+            f"{label} fields are invalid; "
+            f"missing={sorted(SCREEN_FIELDS - fields)}, "
+            f"unknown={sorted(fields - SCREEN_FIELDS)}."
+        )
+    horizons = value["horizons"]
+    if (
+        not isinstance(horizons, list)
+        or not horizons
+        or any(type(item) is not int or item < 1 for item in horizons)
+        or len(set(horizons)) != len(horizons)
+    ):
+        raise ValueError(f"{label}.horizons must be unique positive integers.")
+    evaluation_set = value["evaluation_set"]
+    if evaluation_set not in EVALUATION_SETS:
+        raise ValueError(
+            f"{label}.evaluation_set must be full or common, got "
+            f"{evaluation_set!r}."
+        )
+    for field in ("aggregate_exclude", "session_zoom"):
+        if type(value[field]) is not bool:
+            raise ValueError(f"{label}.{field} must be true or false.")
+    reason = value["reason"]
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError(f"{label}.reason must be a nonempty string.")
+    return dict(
+        targets=_choices(value["targets"], TARGETS, f"{label}.targets"),
+        metrics=_choices(value["metrics"], METRICS, f"{label}.metrics"),
+        horizons=tuple(horizons),
+        evaluation_set=evaluation_set,
+        standard_deviation_threshold=_positive_threshold(
+            value["standard_deviation_threshold"],
+            f"{label}.standard_deviation_threshold",
+        ),
+        standard_error_threshold=_positive_threshold(
+            value["standard_error_threshold"],
+            f"{label}.standard_error_threshold",
+        ),
+        aggregate_exclude=value["aggregate_exclude"],
+        session_zoom=value["session_zoom"],
+        reason=reason,
+    )
+
+
+def _screen_rules(
+    value: object, rows: list[dict],
+) -> tuple[OutlierRule, ...]:
+    """Select finite values far from a horizon-wise metric median."""
+    settings = _screen_settings(value)
+    if settings is None:
+        return ()
+    groups: dict[tuple[str, str, int], list[tuple[dict, float]]] = {}
+    for row in rows:
+        if (
+            row["evaluation_set"] != settings["evaluation_set"]
+            or row["horizon"] not in settings["horizons"]
+        ):
+            continue
+        for target in settings["targets"]:
+            for metric in settings["metrics"]:
+                value = row[target][f"mean_{metric}"]
+                if value is not None and np.isfinite(value):
+                    groups.setdefault(
+                        (target, metric, row["horizon"]), []
+                    ).append((row, float(value)))
+    rules = []
+    for (target, metric, horizon), grouped_values in sorted(groups.items()):
+        values = list(grouped_values)
+        if len(values) < 2:
+            raise ValueError(
+                "plotting.outlier_screen requires at least two finite values "
+                f"for target={target} metric={metric} horizon={horizon}."
+            )
+        while len(values) >= 2:
+            array = np.asarray([item[1] for item in values], dtype=float)
+            median = float(np.median(array))
+            standard_deviation = float(array.std(ddof=1))
+            standard_error = standard_deviation / np.sqrt(len(array))
+            selected = [
+                (row, metric_value)
+                for row, metric_value in values
+                if (
+                    abs(metric_value - median)
+                    > settings["standard_deviation_threshold"]
+                    * standard_deviation
+                    or abs(metric_value - median)
+                    > settings["standard_error_threshold"] * standard_error
+                )
+            ]
+            if not selected:
+                break
+            selected_members = {
+                member_id(row) for row, _metric_value in selected
+            }
+            for row, _metric_value in selected:
+                rules.append(OutlierRule(
+                    member=member_id(row),
+                    horizon=horizon,
+                    evaluation_set=settings["evaluation_set"],
+                    targets=(target,),
+                    metrics=(metric,),
+                    aggregate_exclude=settings["aggregate_exclude"],
+                    session_zoom=settings["session_zoom"],
+                    reason=settings["reason"],
+                ))
+            values = [
+                item for item in values
+                if member_id(item[0]) not in selected_members
+            ]
+    return tuple(rules)
 
 
 def _selector_key(rule: _ConfiguredRule) -> tuple:
@@ -368,7 +506,7 @@ def _context_key(rule: OutlierRule, row: dict) -> tuple:
 
 def _reference_range(
     rules: tuple[OutlierRule, ...], rows: list[dict], context: tuple,
-) -> tuple[float, float]:
+) -> tuple[float, float] | None:
     """Calculate renderer-equivalent bounds from nonselected folds."""
     session, horizon, evaluation_set, target, metric = context
     excluded = {
@@ -402,12 +540,7 @@ def _reference_range(
         spread = float(array.std(ddof=1)) if len(array) > 1 else 0.0
         bounds.extend((mean - spread, mean + spread))
     if not bounds:
-        raise ValueError(
-            "No finite nonselected fold metrics define the normal display "
-            f"range for session={session} horizon={horizon} "
-            f"evaluation_set={evaluation_set} target={target} "
-            f"metric={metric}."
-        )
+        return None
     return min(bounds), max(bounds)
 
 
@@ -438,7 +571,10 @@ def _restore_normal_values(
                 contexts[context] = _reference_range(
                     tuple(active), rows, context
                 )
-            lower, upper = contexts[context]
+            reference_range = contexts[context]
+            if reference_range is None:
+                continue
+            lower, upper = reference_range
             value = float(values[_result_id_from_rule(rule)])
             if lower <= value <= upper:
                 warning_key = (
