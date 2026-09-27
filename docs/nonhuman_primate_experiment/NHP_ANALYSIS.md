@@ -23,6 +23,18 @@ member counts. Six aggregate horizon figures show the three dynamics choices
 in separate panels. Values beyond median ± 2 IQR are labeled at the plot
 boundary and remain unchanged in the tables.
 
+The same six horizon comparisons are written for every session under
+`plots/sessions/<session>`. Those curves average the requested folds within
+that session and use sample SD error bars across folds.
+
+`plotting.structure_horizons.dynamic_comparison` selects one encoder and
+paired-decoder mapping for a separate aggregate comparison. Its `encoder` and
+`decoder` values must each be `linear` or `nonlinear`. The six resulting
+figures compare the three dynamics structures with distinct colors and solid,
+dashed, or dotted lines. They are stored under
+`plots/dynamics_encoder_<encoder>_decoder_<decoder>/` and show cross-session
+mean ± SEM. This comparison does not produce per-session figures.
+
 `model_summary.py` writes a status row for every analysis member. It preserves
 explicit pending and failed states and does not fabricate scores for them.
 

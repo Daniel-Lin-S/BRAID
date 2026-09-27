@@ -6,3 +6,6 @@ structure_horizons:
   enabled: true
   zoom_iqr_multiple: 2
   show_milliseconds: true
+  dynamic_comparison:
+    encoder: linear
+    decoder: nonlinear

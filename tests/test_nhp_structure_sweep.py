@@ -3,16 +3,28 @@
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-
+import pytest
 from BRAID.config import resolve_braid_fit_arguments
 from experiments.artifacts import (
-    PRESENTATION_KEYS, effective_model_configuration, fit_identity,
+    PRESENTATION_KEYS,
+    effective_model_configuration,
+    fit_identity,
     resolved_fit,
 )
 from experiments.braid_backend import BRAIDBackend
 from experiments.configuration import read_yaml
-from experiments.structure_plots import _figure, zoom_limits
-from experiments.structure_report import _raw_rows, _summary_rows
+from experiments.structure_plots import (
+    _dynamic_figure,
+    _figure,
+    dynamic_comparison_directory,
+    dynamic_comparison_selector,
+    zoom_limits,
+)
+from experiments.structure_report import (
+    _raw_rows,
+    _session_summary_rows,
+    _summary_rows,
+)
 from experiments.structure_sweep import build_cases
 
 CONFIGURATION = Path(__file__).resolve().parents[1] / "assets/config/nhp"
@@ -139,6 +151,23 @@ def test_status_tables_keep_missing_members_and_metrics() -> None:
     assert cc["completed_members"] == 1
 
 
+def test_session_summary_uses_fold_mean_and_sample_sd() -> None:
+    """Session figures use a fold mean with sample-SD error bars."""
+    rows = [
+        dict(
+            session="first", configuration="case", dynamics="lstm",
+            encoder="linear", decoder="linear", horizon=4,
+            target="behavior", metric="cc", status="complete", value=value,
+        )
+        for value in (0.1, 0.3, 0.5)
+    ]
+    summary = _session_summary_rows(rows)
+    assert len(summary) == 1
+    assert summary[0]["mean"] == 0.3
+    assert summary[0]["std"] == 0.2
+    assert summary[0]["completed_folds"] == 3
+
+
 def test_zero_iqr_still_marks_values_outside_median() -> None:
     """A repeated central value cannot hide a finite outlier."""
     rows = [
@@ -190,5 +219,77 @@ def test_robust_horizon_figure_labels_clipped_metric() -> None:
             for annotation in axis.texts
         )
         assert "50" in figure.axes[0].get_xticklabels()[0].get_text()
+        assert figure.axes[0].title.get_size() == style["label_font"]
+        assert figure._supxlabel.get_size() == style["label_font"]
+        assert all(
+            annotation.get_fontsize() >= 16
+            for axis in figure.axes
+            for annotation in axis.texts
+        )
+    finally:
+        plt.close(figure)
+
+
+def test_dynamic_comparison_selector_validates_mapping() -> None:
+    """Selected encoder and decoder must be known structure choices."""
+    options = dict(
+        dynamic_comparison=dict(encoder="linear", decoder="nonlinear"),
+    )
+    assert dynamic_comparison_selector(options) == ("linear", "nonlinear")
+    assert (
+        dynamic_comparison_directory(options)
+        == "dynamics_encoder_linear_decoder_nonlinear"
+    )
+    with pytest.raises(ValueError, match="must contain exactly"):
+        dynamic_comparison_selector(dict(
+            dynamic_comparison=dict(encoder="linear"),
+        ))
+    with pytest.raises(ValueError, match="encoder"):
+        dynamic_comparison_selector(dict(
+            dynamic_comparison=dict(encoder="invalid", decoder="linear"),
+        ))
+
+
+def test_dynamic_figure_compares_three_dynamics_with_line_types() -> None:
+    """A mapping-selected figure has all dynamics with unique line types."""
+    _, cases = _configured_cases()
+    rows = []
+    for case in cases:
+        structure = case["structure"]
+        for horizon in HORIZONS:
+            rows.append(dict(
+                **{
+                    key: structure[key]
+                    for key in ("dynamics", "encoder", "decoder")
+                },
+                target="behavior", metric="cc", horizon=horizon,
+                mean=horizon / 100, sem=0.01,
+            ))
+    style = read_yaml(
+        CONFIGURATION / "plotting/style.yaml"
+    )["presentation"]
+    figure = _dynamic_figure(
+        rows, "behavior", "cc", style, 20, 2, True,
+        ("linear", "nonlinear"),
+    )
+    try:
+        axis = figure.axes[0]
+        lines = [
+            line for line in axis.lines
+            if line.get_label() != "_nolegend_"
+        ]
+        assert len(lines) == 3
+        assert {
+            line.get_label() for line in lines
+        } == {"Linear MLP", "ReLU MLP (1×64)", "LSTM"}
+        assert {
+            line.get_linestyle() for line in lines
+        } == {"-", "--", ":"}
+        assert len({line.get_color() for line in lines}) == 3
+        assert "50" in axis.get_xticklabels()[0].get_text()
+        assert figure._supxlabel.get_size() == style["label_font"]
+        assert "linear encoder" in figure._suptitle.get_text().lower()
+        title = figure._suptitle.get_text().lower()
+        assert "nonlinear paired decoders" in title
     finally:
         plt.close(figure)

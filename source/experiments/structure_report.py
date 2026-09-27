@@ -4,20 +4,27 @@ Inputs are validated analysis manifest members and their metrics.json rows.
 summaries/structure_raw.csv contains case, session, fold, horizon, target,
 metric, status and value. summaries/structure_summary.csv contains the same
 case/horizon/target/metric keys with cross-session mean, SEM and member counts.
-plots/structure_<target>_<metric>.png contains three dynamics panels.
+plots contains aggregate figures and per-session figures under
+plots/sessions/<session>.
 """
 
 import csv
 import json
 import os
-from pathlib import Path
 import tempfile
+from pathlib import Path
+
+import numpy as np
 
 from .analysis import read_manifest
 from .cache import writer_lock
 from .evaluation import collect_results
 from .reporting import braid_report
-from .structure_plots import render_structure_figures
+from .structure_plots import (
+    render_dynamic_comparison_figures,
+    render_session_structure_figures,
+    render_structure_figures,
+)
 
 METRICS = ("cc", "r2", "mse")
 TARGETS = ("behavior", "neural")
@@ -139,6 +146,54 @@ def _summary_rows(raw: list[dict], aggregates: list[dict]) -> list[dict]:
     return output
 
 
+def _session_summary_rows(raw: list[dict]) -> list[dict]:
+    """Average completed folds and calculate sample SD within each session.
+
+    Parameters
+    ----------
+    raw : list of dict
+        Per-fold structure rows, including missing and failed rows.
+
+    Returns
+    -------
+    list of dict
+        One row per session/case/horizon/target/metric with ``mean`` and
+        fold-level ``std``. Missing folds remain represented in the counts.
+    """
+    groups = {}
+    for row in raw:
+        key = (
+            row["session"], row["configuration"], row["dynamics"],
+            row["encoder"], row["decoder"], row["horizon"],
+            row["target"], row["metric"],
+        )
+        groups.setdefault(key, []).append(row)
+    summaries = []
+    for key, members in sorted(groups.items()):
+        values = np.asarray([
+            row["value"] for row in members
+            if row["value"] is not None
+        ], dtype=float)
+        if values.size and not np.isfinite(values).all():
+            raise ValueError(
+                f"Nonfinite structure fold metrics for {key[:6]}."
+            )
+        summaries.append(dict(
+            session=key[0], configuration=key[1], dynamics=key[2],
+            encoder=key[3], decoder=key[4], horizon=key[5],
+            target=key[6], metric=key[7],
+            mean=float(values.mean()) if values.size else None,
+            std=(float(values.std(ddof=1)) if values.size > 1 else None),
+            completed_folds=int(values.size),
+            failed_folds=sum(row["status"] == "failed" for row in members),
+            pending_folds=sum(
+                row["status"] not in ("complete", "failed")
+                for row in members
+            ),
+        ))
+    return summaries
+
+
 def structure_report(
     root: Path, settings: dict, sample_rate: float,
     attempted: set[str] | None = None, rendered: set[str] | None = None,
@@ -178,6 +233,7 @@ def structure_report(
         if has_complete else []
     )
     summaries = _summary_rows(raw, aggregates)
+    session_summaries = _session_summary_rows(raw)
     with writer_lock(root / "summaries" / "structure.lock"):
         _write_csv(root / "summaries" / "structure_raw.csv", RAW_FIELDS, raw)
         _write_csv(
@@ -195,4 +251,12 @@ def structure_report(
         render_structure_figures(
             root / "plots", summaries, settings, sample_rate,
             rendered=rendered,
+        )
+        render_dynamic_comparison_figures(
+            root / "plots", summaries, settings, sample_rate,
+            rendered=rendered,
+        )
+        render_session_structure_figures(
+            root / "plots" / "sessions", session_summaries, settings,
+            sample_rate, rendered=rendered,
         )
