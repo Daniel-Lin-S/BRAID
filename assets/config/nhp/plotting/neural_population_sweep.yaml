@@ -2,25 +2,53 @@ extends: style.yaml
 enabled: true
 metrics: [cc, r2, mse]
 curves:
-- name: neural_population
+- name: neural_population_by_horizon
   parameter: population_scale
+  group: horizon
+  panel: nx
+  zoom_iqr_multiple: 2.5
+  zoom_iqr_group: horizon
   where:
     target: neural
     metric: cc
-    horizon: 4
+    nx: [16, 64]
+    horizon: [1, 2, 4, 8, 16, 32]
     evaluation_set: common
-    nx:
-    - 16
-    - 64
-  group: nx
-- name: behavior_population
+- name: behavior_population_by_horizon
   parameter: population_scale
+  group: horizon
+  panel: nx
+  zoom_iqr_multiple: 2.5
+  zoom_iqr_group: horizon
   where:
     target: behavior
     metric: cc
-    horizon: 4
+    nx: [16, 64]
+    horizon: [1, 2, 4, 8, 16, 32]
     evaluation_set: common
-    nx:
-    - 16
-    - 64
-  group: nx
+- name: neural_horizon_by_population
+  parameter: horizon
+  group: population_scale
+  panel: nx
+  zoom_iqr_multiple: 2.5
+  zoom_iqr_group: horizon
+  where:
+    target: neural
+    metric: cc
+    nx: [16, 64]
+    population_scale: [0.25, 0.5, 1.0]
+    horizon: [1, 2, 4, 8, 16, 32]
+    evaluation_set: common
+- name: behavior_horizon_by_population
+  parameter: horizon
+  group: population_scale
+  panel: nx
+  zoom_iqr_multiple: 2.5
+  zoom_iqr_group: horizon
+  where:
+    target: behavior
+    metric: cc
+    nx: [16, 64]
+    population_scale: [0.25, 0.5, 1.0]
+    horizon: [1, 2, 4, 8, 16, 32]
+    evaluation_set: common

@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from .cache import fingerprint
+from .outliers import zoom_limits
 from .presentation import METRIC_LABELS, presentation, save_figure
 from .structure_sweep import DYNAMICS, MAPPING_LEVELS
 
@@ -35,7 +36,6 @@ DYNAMIC_COMPARISON_STYLES = {
 DYNAMIC_COMPARISON_WIDTH_INCHES = 12
 DYNAMIC_LAYOUT_RECT = (0.02, 0.09, 0.76, 0.91)
 LABEL_STACK_POINTS = 14
-BOUNDARY_PADDING = 0.05
 MARKERS = ("o", "s", "D", "^")
 MARKER_SIZE = 8
 ERROR_CAP_SIZE = 6
@@ -44,71 +44,6 @@ LEGEND_LEFT = 0.79
 SHARED_X_LABEL_X = 0.40
 SHARED_X_LABEL_Y = 0.02
 LAYOUT_RECT = (0.02, 0.09, 0.78, 0.91)
-
-
-def zoom_limits(
-    rows: list[dict], multiple: float, error_key: str = "sem",
-) -> tuple[float, float, float, float]:
-    """Find shared bounds using median ± multiple IQR.
-
-    Parameters
-    ----------
-    rows : list of dict
-        Finite or missing means with an optional uncertainty field.
-    multiple : float
-        Positive multiplier for the interquartile range.
-    error_key : str, optional
-        Row field containing the visible uncertainty; default is "sem".
-
-    Returns
-    -------
-    tuple of float
-        Visible low/high and raw robust low/high boundaries.
-    """
-    if not np.isfinite(multiple) or multiple <= 0:
-        raise ValueError(f"Expected positive IQR multiplier, got {multiple}.")
-    values = np.asarray([
-        row["mean"] for row in rows
-        if row["mean"] is not None and np.isfinite(row["mean"])
-    ], dtype=float)
-    if not values.size:
-        raise ValueError("Cannot plot structure metrics without finite means.")
-    median = float(np.median(values))
-    quartiles = np.percentile(values, [25, 75])
-    iqr = float(quartiles[1] - quartiles[0])
-    if iqr == 0:
-        LOGGER.warning(
-            "Structure figure has zero IQR; clipping means outside "
-            "the median."
-        )
-    robust_low = median - multiple * iqr
-    robust_high = median + multiple * iqr
-    inlier_bounds = []
-    for row in rows:
-        mean = row["mean"]
-        if mean is None or not np.isfinite(mean):
-            continue
-        if not robust_low <= mean <= robust_high:
-            continue
-        error_value = row.get(error_key)
-        error = (
-            error_value
-            if error_value is not None and np.isfinite(error_value)
-            else 0.0
-        )
-        inlier_bounds.extend((mean - error, mean + error))
-    if not inlier_bounds:
-        raise ValueError("Structure figure has no finite inlier means.")
-    lower = min(inlier_bounds)
-    upper = max(inlier_bounds)
-    if iqr:
-        lower = min(lower, robust_low)
-        upper = max(upper, robust_high)
-    span = upper - lower
-    if span == 0:
-        span = max(abs(median), 1.0) * BOUNDARY_PADDING
-    padding = span * BOUNDARY_PADDING
-    return lower - padding, upper + padding, robust_low, robust_high
 
 
 def _case_rows(

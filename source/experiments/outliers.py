@@ -27,6 +27,144 @@ SCREEN_FIELDS = frozenset((
     "standard_deviation_threshold", "standard_error_threshold",
     "aggregate_exclude", "session_zoom", "reason",
 ))
+BOUNDARY_PADDING = 0.05
+
+
+def iqr_outliers(
+    rows: list[dict], multiple: float, group_fields: str | list[str],
+) -> list[dict]:
+    """Return rows removed by repeated grouped IQR fences.
+
+    Parameters
+    ----------
+    rows : list of dict
+        Summary rows containing finite or missing means and group fields.
+    multiple : float
+        Positive multiplier for the interquartile range.
+    group_fields : str or list of str
+        Row fields that identify independent metric series.
+
+    Returns
+    -------
+    list of dict
+        Rows outside grouped IQR fences, including later passes after
+        earlier extremes are removed.
+    """
+    if not np.isfinite(multiple) or multiple <= 0:
+        raise ValueError(f"Expected positive IQR multiplier, got {multiple}.")
+    if isinstance(group_fields, str):
+        group_fields = [group_fields]
+    if (
+        not isinstance(group_fields, list)
+        or not group_fields
+        or any(
+            not isinstance(field, str) or not field
+            for field in group_fields
+        )
+    ):
+        raise ValueError("Expected one or more nonempty IQR group fields.")
+    for row in rows:
+        missing = [field for field in group_fields if field not in row]
+        if missing:
+            raise ValueError(
+                "Cannot group IQR outliers by missing fields "
+                f"{missing!r}."
+            )
+    active = [
+        row for row in rows
+        if row.get("mean") is not None and np.isfinite(row["mean"])
+    ]
+    excluded = []
+    while active:
+        groups = {}
+        for row in active:
+            key = tuple(row[field] for field in group_fields)
+            groups.setdefault(key, []).append(row)
+        new_exclusions = []
+        for group_rows in groups.values():
+            values = np.asarray(
+                [row["mean"] for row in group_rows], dtype=float
+            )
+            lower_quartile, upper_quartile = np.percentile(
+                values, [25, 75]
+            )
+            iqr = upper_quartile - lower_quartile
+            lower = lower_quartile - multiple * iqr
+            upper = upper_quartile + multiple * iqr
+            new_exclusions.extend(
+                row for row in group_rows
+                if row["mean"] < lower or row["mean"] > upper
+            )
+        if not new_exclusions:
+            break
+        excluded.extend(new_exclusions)
+        excluded_ids = {id(row) for row in new_exclusions}
+        active = [row for row in active if id(row) not in excluded_ids]
+    return excluded
+
+
+def zoom_limits(
+    rows: list[dict], multiple: float, error_key: str = "sem",
+) -> tuple[float, float, float, float]:
+    """Find visible bounds using median plus or minus a multiple of IQR.
+
+    Parameters
+    ----------
+    rows : list of dict
+        Finite or missing means with an optional uncertainty field.
+    multiple : float
+        Positive multiplier for the interquartile range.
+    error_key : str, optional
+        Row field containing visible uncertainty; default is "sem".
+
+    Returns
+    -------
+    tuple of float
+        Visible low/high and raw robust low/high boundaries.
+    """
+    if not np.isfinite(multiple) or multiple <= 0:
+        raise ValueError(f"Expected positive IQR multiplier, got {multiple}.")
+    values = np.asarray([
+        row["mean"] for row in rows
+        if row["mean"] is not None and np.isfinite(row["mean"])
+    ], dtype=float)
+    if not values.size:
+        raise ValueError("Cannot plot metrics without finite means.")
+    median = float(np.median(values))
+    quartiles = np.percentile(values, [25, 75])
+    iqr = float(quartiles[1] - quartiles[0])
+    if iqr == 0:
+        LOGGER.warning(
+            "Figure has zero IQR; clipping means outside the median."
+        )
+    robust_low = median - multiple * iqr
+    robust_high = median + multiple * iqr
+    inlier_bounds = []
+    for row in rows:
+        mean = row["mean"]
+        if mean is None or not np.isfinite(mean):
+            continue
+        if not robust_low <= mean <= robust_high:
+            continue
+        error_value = row.get(error_key)
+        error = (
+            error_value
+            if error_value is not None and np.isfinite(error_value)
+            else 0.0
+        )
+        inlier_bounds.extend((mean - error, mean + error))
+    if not inlier_bounds:
+        raise ValueError("Figure has no finite inlier means.")
+    lower = min(inlier_bounds)
+    upper = max(inlier_bounds)
+    if iqr:
+        lower = min(lower, robust_low)
+        upper = max(upper, robust_high)
+    span = upper - lower
+    if span == 0:
+        span = max(abs(median), 1.0) * BOUNDARY_PADDING
+    padding = span * BOUNDARY_PADDING
+    return lower - padding, upper + padding, robust_low, robust_high
 
 
 @dataclass(frozen=True)

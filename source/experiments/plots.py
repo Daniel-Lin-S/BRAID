@@ -14,6 +14,7 @@ import numpy as np
 from PIL import Image
 
 from .cache import fingerprint
+from .outliers import iqr_outliers
 from .presentation import (
     METRIC_LABELS, outlier_rendering, presentation, save_figure,
     style_axis,
@@ -27,16 +28,12 @@ READINESS_FIELDS = {
 RESIDUAL_BRANCH = "residual"
 MAIN_ONLY_STYLE = ("-", "o")
 RESIDUAL_STYLE = (":", "s")
-GROUP_LINESTYLES = ("-", "--", "-.", ":")
-GROUP_MARKERS = ("o", "s", "D", "^", "v", "P", "X", "*")
-OUTLIER_LABEL_OFFSET_POINTS = 8
-OUTLIER_LABEL_STACK_POINTS = 14
 EXCLUDED_CONDITIONS_PER_LINE = 2
 EXCLUDED_FOOTER_INCHES_PER_LINE = 0.24
 EXCLUDED_FOOTER_MINIMUM_INCHES = 0.65
 EXCLUDED_FOOTER_AXIS_GAP_INCHES = 0.8
 EXCLUDED_FOOTER_Y = 0.01
-COMPARISON_RENDERING_VERSION = 8
+COMPARISON_RENDERING_VERSION = 9
 PARAMETER_LABELS = {
     "horizon": "Forecast horizon (steps)",
     "nx": "Latent dimension (nx)",
@@ -61,6 +58,34 @@ def curve_specs(settings: dict) -> list[dict]:
             if metric not in ("cc", "r2", "mse"):
                 raise ValueError(f"Unsupported comparison metric: {metric}")
             where = dict(curve["where"], metric=metric)
+            zoom_multiple = curve.get("zoom_iqr_multiple")
+            zoom_group = curve.get("zoom_iqr_group")
+            if zoom_multiple is not None and (
+                isinstance(zoom_multiple, bool)
+                or not isinstance(zoom_multiple, (int, float))
+                or not np.isfinite(zoom_multiple)
+                or zoom_multiple <= 0
+            ):
+                raise ValueError(
+                    "Curve zoom_iqr_multiple must be a positive finite "
+                    "number."
+                )
+            valid_group = (
+                isinstance(zoom_group, str) and bool(zoom_group)
+            ) or (
+                isinstance(zoom_group, list)
+                and bool(zoom_group)
+                and all(
+                    isinstance(field, str) and field
+                    for field in zoom_group
+                )
+            )
+            if zoom_multiple is not None and not valid_group:
+                raise ValueError(
+                    "Curve zoom_iqr_group must contain nonempty field "
+                    "names when "
+                    "zoom_iqr_multiple is set."
+                )
             parameter = curve["parameter"]
             group = curve.get("group")
             panel = curve.get("panel")
@@ -76,7 +101,20 @@ def curve_specs(settings: dict) -> list[dict]:
                     raise ValueError(
                         f"Panel field {panel!r} requires a list selection."
                     )
-                name = f"{metric}_vs_{parameter}_by_{group}"
+                target = where.get("target")
+                if isinstance(target, str):
+                    axis = (
+                        "population"
+                        if parameter == "population_scale"
+                        else parameter
+                    )
+                    scoring = where.get("evaluation_set", "all")
+                    name = (
+                        f"{target}_{metric}_vs_{axis}_by_{group}_"
+                        f"{scoring}"
+                    )
+                else:
+                    name = f"{metric}_vs_{parameter}_by_{group}"
                 result.append(dict(curve, where=where, name=name))
                 continue
             selection = (
@@ -124,13 +162,24 @@ def metric_curve(
         figsize=(style["horizon_size"] if panel else style["single_size"]),
         squeeze=False,
     )
+    zoom_multiple = spec.get("zoom_iqr_multiple")
+    zoom_exclusions = (
+        iqr_outliers(rows, zoom_multiple, spec["zoom_iqr_group"])
+        if zoom_multiple is not None
+        else []
+    )
+    excluded_ids = {id(row) for row in zoom_exclusions}
     for axis, panel_value in zip(axes[0], panels):
         panel_rows = (
             [row for row in rows if row[panel] == panel_value]
             if panel else rows
         )
+        panel_exclusions = [
+            row for row in panel_rows if id(row) in excluded_ids
+        ]
         _metric_axis(
-            axis, panel_rows, spec, style, panel_value, outlier_style
+            axis, panel_rows, spec, style, panel_value, outlier_style,
+            panel_exclusions,
         )
     title = _metric_title(spec, metric)
     context_label = spec.get("context_label")
@@ -263,10 +312,12 @@ def _metric_axis(
     style: dict,
     panel_value: object,
     outlier_style: dict,
+    excluded_rows: list[dict],
 ) -> None:
     """Render grouped metric series for one target panel."""
     parameter = spec["parameter"]
     metric = spec["where"]["metric"]
+    excluded_ids = {id(row) for row in excluded_rows}
     for value, branch, selected, number in _comparison_series(rows, spec):
         x = np.array([row[parameter] for row in selected], dtype=float)
         if parameter == "population_scale":
@@ -280,6 +331,10 @@ def _metric_axis(
         )
         if not np.isfinite(y).all():
             y[~np.isfinite(y)] = np.nan
+        excluded = np.asarray([
+            id(row) in excluded_ids for row in selected
+        ], dtype=bool)
+        y[excluded] = np.nan
         color, linestyle, marker = _group_style(
             spec, value, number, style, branch
         )
@@ -302,31 +357,54 @@ def _metric_axis(
         xlabel=PARAMETER_LABELS[parameter],
         ylabel=(
             METRIC_LABELS[metric]
-            if panel_value is not None
+            if panel_value is not None and spec.get("panel") != "nx"
             else f"{spec['where']['target'].capitalize()} "
             f"{METRIC_LABELS[metric]}"
         ),
     )
-    _render_outlier_arrows(axis, rows, parameter, outlier_style)
+    _render_outlier_arrows(
+        axis, rows, parameter, outlier_style,
+        excluded_rows=excluded_rows,
+    )
     if panel_value is not None:
-        axis.set_title(str(panel_value).capitalize())
+        panel = spec.get("panel")
+        panel_title = (
+            f"nx={panel_value}" if panel == "nx"
+            else str(panel_value).capitalize()
+        )
+        axis.set_title(panel_title)
     style_axis(axis, style)
 
 
 def _render_outlier_arrows(
     axis: object, rows: list[dict], parameter: str, style: dict,
+    excluded_rows: list[dict] | None = None,
 ) -> None:
-    """Zoom to normal summaries and mark selected finite values."""
+    """Zoom to normal summaries and arrow-label excluded finite values."""
+    excluded_rows = excluded_rows or []
+    excluded_ids = {id(row) for row in excluded_rows}
     events = [
         (row, event)
         for row in rows
         if not row.get("excluded_condition", False)
         for event in row.get("outliers", [])
     ]
+    events.extend(
+        (row, dict(
+            value=row["mean"],
+            member=(
+                f"nx={row.get('nx')}, "
+                f"population={row.get('population_scale')}"
+            ),
+        ))
+        for row in excluded_rows
+    )
     if not events:
         return
     bounds = []
     for row in rows:
+        if id(row) in excluded_ids:
+            continue
         mean = row.get("mean")
         if mean is None or not np.isfinite(mean):
             continue
@@ -348,15 +426,16 @@ def _render_outlier_arrows(
         )
     padding = span * style["zoom_padding_fraction"]
     lower_edge, upper_edge = lower - padding, upper + padding
+    clip_low, clip_high = lower, upper
     axis.set_ylim(lower_edge, upper_edge)
     digits = style["label_significant_figures"]
     arrows = []
     for row, event in events:
         value = event["value"]
         x = row[parameter] * (100 if parameter == "population_scale" else 1)
-        if value < lower:
+        if value < clip_low:
             direction, edge = "↓", lower_edge
-        elif value > upper:
+        elif value > clip_high:
             direction, edge = "↑", upper_edge
         else:
             direction, edge = "×", value
@@ -375,8 +454,8 @@ def _render_outlier_arrows(
             f"{direction} {event['value']:.{digits}g}",
             xy=(x, edge),
             xytext=(0, sign * (
-                OUTLIER_LABEL_OFFSET_POINTS
-                + offset * OUTLIER_LABEL_STACK_POINTS
+                style["label_offset_points"]
+                + offset * style["label_stack_points"]
             )),
             textcoords="offset points",
             ha="center",
@@ -599,18 +678,17 @@ def _group_style(
         color = style["pair_colors"][color_index % len(style["pair_colors"])]
         return color, "-", "o"
     color_index = number
-    if (
-        not isinstance(color_index, int)
-        or color_index < 0
-        or color_index >= len(style["horizon_colors"])
+    if not isinstance(color_index, int) or color_index < 0 or (
+        color_index >= len(style["group_colors"])
     ):
         raise ValueError(
-            f"No configured comparison color for {group}={value}."
+            f"No configured comparison color for {group}={value}; "
+            "extend plotting.presentation.group_colors."
         )
     return (
-        style["horizon_colors"][color_index],
-        GROUP_LINESTYLES[number % len(GROUP_LINESTYLES)],
-        GROUP_MARKERS[number % len(GROUP_MARKERS)],
+        style["group_colors"][color_index],
+        style["group_linestyles"][number % len(style["group_linestyles"])],
+        style["group_markers"][number % len(style["group_markers"])],
     )
 
 
@@ -640,15 +718,22 @@ def _group_label(group: str | None, value: object) -> str:
         return f"{value} {suffix}"
     if group == "nx":
         return f"nx={value}"
+    if group == "population_scale":
+        return f"{100 * value:g}%"
     return "BRAID" if group is None else f"{group}={value}"
 
 
 def _metric_title(spec: dict, metric: str) -> str:
     """Describe fixed selections or the two varying comparison dimensions."""
     if spec.get("panel"):
+        target = spec["where"].get("target")
+        target_label = (
+            f"{target.capitalize()} " if isinstance(target, str) else ""
+        )
         title = (
-            f"{METRIC_LABELS[metric]} by {PARAMETER_LABELS[spec['parameter']]}"
-            f" and {PARAMETER_LABELS[spec['group']]}\n"
+            f"{target_label}{METRIC_LABELS[metric]} by "
+            f"{PARAMETER_LABELS[spec['parameter']]} and "
+            f"{PARAMETER_LABELS[spec['group']]}\n"
             f"{spec['where']['evaluation_set']} scoring"
         )
         if spec.get("branch") == RESIDUAL_BRANCH:

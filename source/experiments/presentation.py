@@ -19,7 +19,10 @@ from matplotlib.figure import Figure
 from .configuration import CONFIGURATION, read_yaml
 
 METRIC_LABELS = {"loss": "Loss", "mse": "MSE", "r2": "R²", "cc": "CC"}
-OUTLIER_STYLE_FIELDS = ("zoom_padding_fraction", "label_significant_figures")
+OUTLIER_STYLE_FIELDS = (
+    "zoom_padding_fraction", "label_significant_figures",
+    "label_offset_points", "label_stack_points",
+)
 
 
 def presentation(settings: dict | None = None) -> dict:
@@ -56,9 +59,15 @@ def presentation(settings: dict | None = None) -> dict:
             for value in dimensions
         ):
             raise ValueError(f"Expected two positive finite inches for {key}.")
-    for key in ("pair_colors", "horizon_colors"):
+    for key in ("pair_colors", "horizon_colors", "group_colors"):
         if not style[key] or not all(is_color_like(c) for c in style[key]):
             raise ValueError(f"Expected valid colors in {key}.")
+    for key in ("group_linestyles", "group_markers"):
+        if not style[key] or any(
+            not isinstance(value, str) or not value
+            for value in style[key]
+        ):
+            raise ValueError(f"Expected nonempty strings in {key}.")
     if len(style["pair_colors"]) != 2:
         raise ValueError("Expected exactly two train/validation or x/y colors.")
     return style
@@ -71,8 +80,8 @@ def outlier_rendering(settings: dict | None = None) -> dict:
     )["outlier_rendering"]
     if set(style) != set(OUTLIER_STYLE_FIELDS):
         raise ValueError(
-            "outlier_rendering must contain zoom_padding_fraction and "
-            "label_significant_figures."
+            "outlier_rendering must contain all supported display "
+            "settings."
         )
     padding = style["zoom_padding_fraction"]
     if not isinstance(padding, (int, float)) or not 0 < padding < 1:
@@ -86,6 +95,12 @@ def outlier_rendering(settings: dict | None = None) -> dict:
             "Expected positive integer "
             "outlier_rendering.label_significant_figures."
         )
+    for key in ("label_offset_points", "label_stack_points"):
+        if type(style[key]) is not int or style[key] < 0:
+            raise ValueError(
+                "Expected a nonnegative integer "
+                f"outlier_rendering.{key}."
+            )
     return style
 
 

@@ -8,7 +8,7 @@ import pytest
 
 from experiments.configuration import CONFIGURATION, read_yaml
 from experiments.history import history_figure, render_component
-from experiments.plots import curve_specs, metric_curve, plot_suite
+from experiments.plots import curve_specs, matches, metric_curve, plot_suite
 from experiments.presentation import presentation
 
 STYLE = presentation()
@@ -77,13 +77,13 @@ def test_analysis_catalogue_and_undefined_gaps(tmp_path):
     specifications = []
     for name, count in (
         ("latent_dimension_sweep", 6),
-        ("neural_population_sweep", 6),
+        ("neural_population_sweep", 12),
     ):
         settings = read_yaml(CONFIGURATION / "plotting" / f"{name}.yaml")
         specs = curve_specs(settings)
         assert len(specs) == count
         specifications.extend(specs)
-    assert len({spec["name"] for spec in specifications}) == 12
+    assert len({spec["name"] for spec in specifications}) == 18
     spec = dict(
         name="neural_r2_vs_nx_horizon4_full",
         parameter="nx",
@@ -205,14 +205,14 @@ def test_all_comparison_files_are_generated(tmp_path):
 
     for name, count in (
         ("latent_dimension_sweep", 6),
-        ("neural_population_sweep", 6),
+        ("neural_population_sweep", 12),
     ):
         settings = read_yaml(CONFIGURATION / "plotting" / f"{name}.yaml")
         rows = []
         for nx, scale, horizon, target, metric, scoring in product(
             [1, 2, 4, 8, 16, 32, 64],
             [0.25, 0.5, 1.0],
-            [1, 2, 4, 8],
+            [1, 2, 4, 8, 16, 32],
             ["neural", "behavior"],
             ["cc", "r2", "mse"],
             ["full", "common"],
@@ -233,6 +233,139 @@ def test_all_comparison_files_are_generated(tmp_path):
         plot_suite(rows, destination, settings)
         assert len(list(destination.glob("*.png"))) == count
         assert not (destination / "behavior_example.png").exists()
+
+def test_iqr_outliers_recheck_after_extreme_rows_are_removed():
+    """Repeated IQR fences reveal secondary extremes without cascades."""
+    from experiments.outliers import iqr_outliers
+
+    rows = [
+        dict(horizon=32, mean=value)
+        for value in (188000.0, 8300.0, 8200.0, 9800.0, 14800.0, 8600.0)
+    ]
+    rows.extend(
+        dict(horizon=16, mean=value)
+        for value in (4600.0, 3846.0, 3902.0, 3949.0, 4156.0)
+    )
+
+    excluded = iqr_outliers(rows, 2.5, "horizon")
+
+    assert {row["mean"] for row in excluded} == {188000.0, 14800.0}
+
+
+def test_neural_population_views_use_horizon_and_population_series():
+    """Render both configured population views with two nx panels."""
+    from itertools import product
+
+    settings = read_yaml(
+        CONFIGURATION / "plotting" / "neural_population_sweep.yaml"
+    )
+    specs = curve_specs(settings)
+    assert len(specs) == 12
+    assert len({spec["name"] for spec in specs}) == 12
+    assert {spec.get("zoom_iqr_multiple") for spec in specs} == {2.5}
+    assert {
+        tuple(spec["where"]["horizon"]) for spec in specs
+    } == {(1, 2, 4, 8, 16, 32)}
+    rows = [
+        dict(
+            nx=nx,
+            population_scale=scale,
+            horizon=horizon,
+            target=target,
+            metric=metric,
+            evaluation_set="common",
+            mean=(
+                1000.0
+                if nx == 16 and scale == 0.25 and horizon == 32
+                and target == "neural" and metric == "cc"
+                else 0.5 + 0.001 * horizon + 0.01 * scale
+            ),
+            sem=0.02,
+        )
+        for nx, scale, horizon, target, metric in product(
+            [16, 64],
+            [0.25, 0.5, 1.0],
+            [1, 2, 4, 8, 16, 32],
+            ["neural", "behavior"],
+            ["cc", "r2", "mse"],
+        )
+    ]
+    population_spec = next(
+        spec for spec in specs
+        if spec["parameter"] == "population_scale"
+        and spec["where"]["metric"] == "cc"
+        and spec["where"]["target"] == "neural"
+    )
+    population_rows = [
+        row for row in rows if matches(row, population_spec["where"])
+    ]
+    population_figure = metric_curve(
+        population_rows, population_spec, STYLE
+    )
+    try:
+        assert len(population_figure.axes) == 2
+        for axis, nx in zip(population_figure.axes, (16, 64)):
+            assert axis.get_title() == f"nx={nx}"
+            assert axis.get_xlabel() == "Neural population (%)"
+            assert axis.get_ylabel() == "Neural CC"
+            series = [
+                line for line in axis.lines
+                if not line.get_label().startswith("_")
+            ]
+            assert [line.get_label() for line in series] == [
+                "1 step", "2 steps", "4 steps", "8 steps", "16 steps",
+                "32 steps",
+            ]
+            np.testing.assert_allclose(
+                series[0].get_xdata(), [25, 50, 100]
+            )
+            if nx == 16:
+                assert np.isnan(series[5].get_ydata()[0])
+                assert any(
+                    text.arrow_patch is not None for text in axis.texts
+                )
+            assert axis.xaxis.label.get_size() == STYLE["label_font"]
+            assert axis.get_xticklabels()[0].get_fontsize() == (
+                STYLE["tick_font"]
+            )
+    finally:
+        plt.close(population_figure)
+
+    horizon_spec = next(
+        spec for spec in specs
+        if spec["parameter"] == "horizon"
+        and spec["where"]["metric"] == "cc"
+        and spec["where"]["target"] == "neural"
+    )
+    horizon_rows = [
+        row for row in rows if matches(row, horizon_spec["where"])
+    ]
+    horizon_figure = metric_curve(horizon_rows, horizon_spec, STYLE)
+    try:
+        assert len(horizon_figure.axes) == 2
+        for axis, nx in zip(horizon_figure.axes, (16, 64)):
+            assert axis.get_title() == f"nx={nx}"
+            assert axis.get_xlabel() == "Forecast horizon (steps)"
+            assert axis.get_ylabel() == "Neural CC"
+            series = [
+                line for line in axis.lines
+                if not line.get_label().startswith("_")
+            ]
+            assert [line.get_label() for line in series] == [
+                "25%", "50%", "100%",
+            ]
+            np.testing.assert_allclose(
+                series[0].get_xdata(), [1, 2, 4, 8, 16, 32]
+            )
+            assert len(series) == 3
+            if nx == 16:
+                assert np.isnan(series[0].get_ydata()[-1])
+                assert any(
+                    text.arrow_patch is not None for text in axis.texts
+                )
+    finally:
+        plt.close(horizon_figure)
+
 
 def test_curve_metrics_override_shared_metric_selection():
     """A local curve can restrict its own metric and horizon selection."""
