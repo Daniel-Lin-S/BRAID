@@ -80,11 +80,13 @@ def braid_report(
             row["nx"],
             row["n1"],
             row.get("n2", 0),
+            row.get("neural_decoder_width"),
         )
         item = table.setdefault(
             key,
             dict(
-                population_scale=key[0], nx=key[1], n1=key[2], n2=key[3],
+                population_scale=key[0], nx=key[1], n1=key[2],
+                n2=key[3], neural_decoder_width=key[4],
             ),
         )
         for field in ("mean", "sem"):

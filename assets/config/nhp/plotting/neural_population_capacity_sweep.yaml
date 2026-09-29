@@ -1,0 +1,632 @@
+extends: style.yaml
+enabled: true
+presentation:
+  title_font: 25
+  label_font: 21
+  tick_font: 18
+  legend_font: 18
+  horizon_size:
+  - 28
+  - 9
+  dpi: 180
+metrics:
+- cc
+- r2
+- mse
+curves:
+- name: neural_population_by_horizon
+  output_name: neural_population_by_horizon
+  subdirectory: nx64_splits
+  parameter: population_scale
+  group: horizon
+  panel: n1
+  figure_size:
+  - 30
+  - 9
+  share_y: true
+  zoom_iqr_multiple: 2.5
+  zoom_iqr_group: horizon
+  where:
+    target: neural
+    metric: cc
+    evaluation_set: common
+    horizon:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    population_scale:
+    - 0.25
+    - 0.5
+    - 1.0
+    nx: 64
+    n1: &id001
+    - 16
+    - 32
+    - 48
+    neural_decoder_width: 64
+- name: neural_horizon_by_population
+  output_name: neural_horizon_by_population
+  subdirectory: nx64_splits
+  parameter: horizon
+  group: population_scale
+  panel: n1
+  figure_size:
+  - 30
+  - 9
+  share_y: true
+  zoom_iqr_multiple: 2.5
+  zoom_iqr_group: horizon
+  where:
+    target: neural
+    metric: cc
+    evaluation_set: common
+    horizon:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    population_scale:
+    - 0.25
+    - 0.5
+    - 1.0
+    nx: 64
+    n1: *id001
+    neural_decoder_width: 64
+- name: behavior_population_by_horizon
+  output_name: behavior_population_by_horizon
+  subdirectory: nx64_splits
+  parameter: population_scale
+  group: horizon
+  panel: n1
+  figure_size:
+  - 30
+  - 9
+  share_y: true
+  zoom_iqr_multiple: 2.5
+  zoom_iqr_group: horizon
+  where:
+    target: behavior
+    metric: cc
+    evaluation_set: common
+    horizon:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    population_scale:
+    - 0.25
+    - 0.5
+    - 1.0
+    nx: 64
+    n1: *id001
+    neural_decoder_width: 64
+- name: behavior_horizon_by_population
+  output_name: behavior_horizon_by_population
+  subdirectory: nx64_splits
+  parameter: horizon
+  group: population_scale
+  panel: n1
+  figure_size:
+  - 30
+  - 9
+  share_y: true
+  zoom_iqr_multiple: 2.5
+  zoom_iqr_group: horizon
+  where:
+    target: behavior
+    metric: cc
+    evaluation_set: common
+    horizon:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    population_scale:
+    - 0.25
+    - 0.5
+    - 1.0
+    nx: 64
+    n1: *id001
+    neural_decoder_width: 64
+- name: neural_population_by_horizon
+  output_name: neural_population_by_horizon
+  subdirectory: nx128_splits
+  parameter: population_scale
+  group: horizon
+  panel: n1
+  figure_size:
+  - 30
+  - 9
+  share_y: true
+  zoom_iqr_multiple: 2.5
+  zoom_iqr_group: horizon
+  where:
+    target: neural
+    metric: cc
+    evaluation_set: common
+    horizon:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    population_scale:
+    - 0.25
+    - 0.5
+    - 1.0
+    nx: 128
+    n1: &id002
+    - 64
+    - 96
+    neural_decoder_width: 64
+- name: neural_horizon_by_population
+  output_name: neural_horizon_by_population
+  subdirectory: nx128_splits
+  parameter: horizon
+  group: population_scale
+  panel: n1
+  figure_size:
+  - 30
+  - 9
+  share_y: true
+  zoom_iqr_multiple: 2.5
+  zoom_iqr_group: horizon
+  where:
+    target: neural
+    metric: cc
+    evaluation_set: common
+    horizon:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    population_scale:
+    - 0.25
+    - 0.5
+    - 1.0
+    nx: 128
+    n1: *id002
+    neural_decoder_width: 64
+- name: behavior_population_by_horizon
+  output_name: behavior_population_by_horizon
+  subdirectory: nx128_splits
+  parameter: population_scale
+  group: horizon
+  panel: n1
+  figure_size:
+  - 30
+  - 9
+  share_y: true
+  zoom_iqr_multiple: 2.5
+  zoom_iqr_group: horizon
+  where:
+    target: behavior
+    metric: cc
+    evaluation_set: common
+    horizon:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    population_scale:
+    - 0.25
+    - 0.5
+    - 1.0
+    nx: 128
+    n1: *id002
+    neural_decoder_width: 64
+- name: behavior_horizon_by_population
+  output_name: behavior_horizon_by_population
+  subdirectory: nx128_splits
+  parameter: horizon
+  group: population_scale
+  panel: n1
+  figure_size:
+  - 30
+  - 9
+  share_y: true
+  zoom_iqr_multiple: 2.5
+  zoom_iqr_group: horizon
+  where:
+    target: behavior
+    metric: cc
+    evaluation_set: common
+    horizon:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    population_scale:
+    - 0.25
+    - 0.5
+    - 1.0
+    nx: 128
+    n1: *id002
+    neural_decoder_width: 64
+- name: neural_population_by_horizon
+  output_name: neural_population_by_horizon
+  subdirectory: cross_nx_equal_split
+  parameter: population_scale
+  group: horizon
+  panel: nx
+  figure_size:
+  - 28
+  - 9
+  share_y: true
+  zoom_iqr_multiple: 2.5
+  zoom_iqr_group: horizon
+  where:
+    target: neural
+    metric: cc
+    evaluation_set: common
+    horizon:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    population_scale:
+    - 0.25
+    - 0.5
+    - 1.0
+    nx: &id003
+    - 64
+    - 128
+    n1: &id004
+    - 32
+    - 64
+    neural_decoder_width: 64
+- name: neural_horizon_by_population
+  output_name: neural_horizon_by_population
+  subdirectory: cross_nx_equal_split
+  parameter: horizon
+  group: population_scale
+  panel: nx
+  figure_size:
+  - 28
+  - 9
+  share_y: true
+  zoom_iqr_multiple: 2.5
+  zoom_iqr_group: horizon
+  where:
+    target: neural
+    metric: cc
+    evaluation_set: common
+    horizon:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    population_scale:
+    - 0.25
+    - 0.5
+    - 1.0
+    nx: *id003
+    n1: *id004
+    neural_decoder_width: 64
+- name: behavior_population_by_horizon
+  output_name: behavior_population_by_horizon
+  subdirectory: cross_nx_equal_split
+  parameter: population_scale
+  group: horizon
+  panel: nx
+  figure_size:
+  - 28
+  - 9
+  share_y: true
+  zoom_iqr_multiple: 2.5
+  zoom_iqr_group: horizon
+  where:
+    target: behavior
+    metric: cc
+    evaluation_set: common
+    horizon:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    population_scale:
+    - 0.25
+    - 0.5
+    - 1.0
+    nx: *id003
+    n1: *id004
+    neural_decoder_width: 64
+- name: behavior_horizon_by_population
+  output_name: behavior_horizon_by_population
+  subdirectory: cross_nx_equal_split
+  parameter: horizon
+  group: population_scale
+  panel: nx
+  figure_size:
+  - 28
+  - 9
+  share_y: true
+  zoom_iqr_multiple: 2.5
+  zoom_iqr_group: horizon
+  where:
+    target: behavior
+    metric: cc
+    evaluation_set: common
+    horizon:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    population_scale:
+    - 0.25
+    - 0.5
+    - 1.0
+    nx: *id003
+    n1: *id004
+    neural_decoder_width: 64
+- name: neural_population_by_horizon
+  output_name: neural_population_by_horizon
+  subdirectory: cross_nx_three_to_one
+  parameter: population_scale
+  group: horizon
+  panel: nx
+  figure_size:
+  - 28
+  - 9
+  share_y: true
+  zoom_iqr_multiple: 2.5
+  zoom_iqr_group: horizon
+  where:
+    target: neural
+    metric: cc
+    evaluation_set: common
+    horizon:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    population_scale:
+    - 0.25
+    - 0.5
+    - 1.0
+    nx: &id005
+    - 64
+    - 128
+    n1: &id006
+    - 48
+    - 96
+    neural_decoder_width: 64
+- name: neural_horizon_by_population
+  output_name: neural_horizon_by_population
+  subdirectory: cross_nx_three_to_one
+  parameter: horizon
+  group: population_scale
+  panel: nx
+  figure_size:
+  - 28
+  - 9
+  share_y: true
+  zoom_iqr_multiple: 2.5
+  zoom_iqr_group: horizon
+  where:
+    target: neural
+    metric: cc
+    evaluation_set: common
+    horizon:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    population_scale:
+    - 0.25
+    - 0.5
+    - 1.0
+    nx: *id005
+    n1: *id006
+    neural_decoder_width: 64
+- name: behavior_population_by_horizon
+  output_name: behavior_population_by_horizon
+  subdirectory: cross_nx_three_to_one
+  parameter: population_scale
+  group: horizon
+  panel: nx
+  figure_size:
+  - 28
+  - 9
+  share_y: true
+  zoom_iqr_multiple: 2.5
+  zoom_iqr_group: horizon
+  where:
+    target: behavior
+    metric: cc
+    evaluation_set: common
+    horizon:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    population_scale:
+    - 0.25
+    - 0.5
+    - 1.0
+    nx: *id005
+    n1: *id006
+    neural_decoder_width: 64
+- name: behavior_horizon_by_population
+  output_name: behavior_horizon_by_population
+  subdirectory: cross_nx_three_to_one
+  parameter: horizon
+  group: population_scale
+  panel: nx
+  figure_size:
+  - 28
+  - 9
+  share_y: true
+  zoom_iqr_multiple: 2.5
+  zoom_iqr_group: horizon
+  where:
+    target: behavior
+    metric: cc
+    evaluation_set: common
+    horizon:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    population_scale:
+    - 0.25
+    - 0.5
+    - 1.0
+    nx: *id005
+    n1: *id006
+    neural_decoder_width: 64
+- name: neural_population_by_horizon
+  output_name: neural_population_by_horizon
+  subdirectory: decoder_width
+  parameter: population_scale
+  group: horizon
+  panel: neural_decoder_width
+  figure_size:
+  - 28
+  - 9
+  share_y: true
+  zoom_iqr_multiple: 2.5
+  zoom_iqr_group: horizon
+  where:
+    target: neural
+    metric: cc
+    evaluation_set: common
+    horizon:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    population_scale:
+    - 0.25
+    - 0.5
+    - 1.0
+    nx: 64
+    n1: 32
+    neural_decoder_width: &id007
+    - 64
+    - 128
+    - 256
+- name: neural_horizon_by_population
+  output_name: neural_horizon_by_population
+  subdirectory: decoder_width
+  parameter: horizon
+  group: population_scale
+  panel: neural_decoder_width
+  figure_size:
+  - 28
+  - 9
+  share_y: true
+  zoom_iqr_multiple: 2.5
+  zoom_iqr_group: horizon
+  where:
+    target: neural
+    metric: cc
+    evaluation_set: common
+    horizon:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    population_scale:
+    - 0.25
+    - 0.5
+    - 1.0
+    nx: 64
+    n1: 32
+    neural_decoder_width: *id007
+- name: behavior_population_by_horizon
+  output_name: behavior_population_by_horizon
+  subdirectory: decoder_width
+  parameter: population_scale
+  group: horizon
+  panel: neural_decoder_width
+  figure_size:
+  - 28
+  - 9
+  share_y: true
+  zoom_iqr_multiple: 2.5
+  zoom_iqr_group: horizon
+  where:
+    target: behavior
+    metric: cc
+    evaluation_set: common
+    horizon:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    population_scale:
+    - 0.25
+    - 0.5
+    - 1.0
+    nx: 64
+    n1: 32
+    neural_decoder_width: *id007
+- name: behavior_horizon_by_population
+  output_name: behavior_horizon_by_population
+  subdirectory: decoder_width
+  parameter: horizon
+  group: population_scale
+  panel: neural_decoder_width
+  figure_size:
+  - 28
+  - 9
+  share_y: true
+  zoom_iqr_multiple: 2.5
+  zoom_iqr_group: horizon
+  where:
+    target: behavior
+    metric: cc
+    evaluation_set: common
+    horizon:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    population_scale:
+    - 0.25
+    - 0.5
+    - 1.0
+    nx: 64
+    n1: 32
+    neural_decoder_width: *id007

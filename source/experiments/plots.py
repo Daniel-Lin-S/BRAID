@@ -7,6 +7,7 @@ module does not load checkpoints, fit models or produce individual-fold plots.
 
 import logging
 from pathlib import Path
+import re
 
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
@@ -33,7 +34,8 @@ EXCLUDED_FOOTER_INCHES_PER_LINE = 0.24
 EXCLUDED_FOOTER_MINIMUM_INCHES = 0.65
 EXCLUDED_FOOTER_AXIS_GAP_INCHES = 0.8
 EXCLUDED_FOOTER_Y = 0.01
-COMPARISON_RENDERING_VERSION = 9
+COMPARISON_RENDERING_VERSION = 10
+FIGURE_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 PARAMETER_LABELS = {
     "horizon": "Forecast horizon (steps)",
     "nx": "Latent dimension (nx)",
@@ -130,6 +132,33 @@ def curve_specs(settings: dict) -> list[dict]:
                 f"{where['evaluation_set']}"
             )
             result.append(dict(curve, where=where, name=name))
+    destinations = set()
+    for spec in result:
+        directory = spec.get("subdirectory", "")
+        if directory and (
+            not isinstance(directory, str)
+            or FIGURE_COMPONENT.fullmatch(directory) is None
+        ):
+            raise ValueError(
+                f"Invalid curve subdirectory {directory!r}; expected one "
+                "safe folder name."
+            )
+        output_name = spec.get("output_name")
+        if output_name is not None:
+            if (
+                not isinstance(output_name, str)
+                or FIGURE_COMPONENT.fullmatch(output_name) is None
+            ):
+                raise ValueError(
+                    f"Invalid curve output_name {output_name!r}."
+                )
+            spec["name"] = f"{output_name}_{spec['where']['metric']}"
+        destination = (directory, spec["name"])
+        if destination in destinations:
+            raise ValueError(
+                f"Duplicate comparison destination: {destination!r}."
+            )
+        destinations.add(destination)
     return result
 
 
@@ -159,7 +188,11 @@ def metric_curve(
     figure, axes = plt.subplots(
         1,
         len(panels),
-        figsize=(style["horizon_size"] if panel else style["single_size"]),
+        figsize=spec.get(
+            "figure_size",
+            style["horizon_size"] if panel else style["single_size"],
+        ),
+        sharey=spec.get("share_y", False),
         squeeze=False,
     )
     zoom_multiple = spec.get("zoom_iqr_multiple")
@@ -368,10 +401,20 @@ def _metric_axis(
     )
     if panel_value is not None:
         panel = spec.get("panel")
-        panel_title = (
-            f"nx={panel_value}" if panel == "nx"
-            else str(panel_value).capitalize()
-        )
+        if panel == "n1":
+            splits = {(row["n1"], row["n2"]) for row in rows}
+            if len(splits) != 1:
+                raise ValueError(
+                    f"Expected one latent split in n1={panel_value} panel."
+                )
+            n1, n2 = splits.pop()
+            panel_title = f"nx={n1 + n2}; n1={n1}, n2={n2}"
+        elif panel == "neural_decoder_width":
+            panel_title = f"Neural decoder width={panel_value}"
+        elif panel == "nx":
+            panel_title = f"nx={panel_value}"
+        else:
+            panel_title = str(panel_value).capitalize()
         axis.set_title(panel_title)
     style_axis(axis, style)
 
@@ -885,8 +928,12 @@ def plot_suite(
         if namespace and namespace.startswith("session/"):
             spec["mark_excluded_conditions"] = True
         name = spec["name"]
-        render_key = f"{namespace}/{name}" if namespace else name
-        path = root / f"{name}.png"
+        directory = spec.get("subdirectory", "")
+        relative = Path(directory) / f"{name}.png"
+        render_key = (
+            f"{namespace}/{relative}" if namespace else str(relative)
+        )
+        path = root / relative
         if rendered is not None and render_key in rendered:
             continue
         dependencies = [

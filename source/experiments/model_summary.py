@@ -17,6 +17,7 @@ from .cache import writer_lock
 
 FIELDS = (
     "configuration", "session", "fold", "fit_id", "status", "horizon",
+    "nx", "n1", "n2", "split_label", "neural_decoder_width",
     "evaluation_set", "target", "cc", "r2", "mse", "baseline_mse", "samples",
     "valid_cc_channels", "valid_r2_channels", "valid_mse_channels",
     "metrics_defined", "details",
@@ -40,6 +41,13 @@ def completed_rows(directory: Path, member: dict) -> list[dict]:
                 configuration=item["configuration"],
                 session=item["session"], fold=item["fold"],
                 fit_id=member["fit_id"], status="complete",
+                **{
+                    field: item.get(field)
+                    for field in (
+                        "nx", "n1", "n2", "split_label",
+                        "neural_decoder_width",
+                    )
+                },
                 horizon=item["horizon"], evaluation_set=item["evaluation_set"],
                 target=target, baseline_mse=float(baseline.mean()),
                 samples=item["samples"], details=str(path),
@@ -74,6 +82,15 @@ def write_model_summary(directory: Path) -> None:
                     configuration=member["case"]["name"],
                     session=member["session"], fold=member["fold"],
                     fit_id=member["fit_id"], status=member["state"],
+                    **{
+                        field: member["case"].get(
+                            "summary_parameters", {}
+                        ).get(field)
+                        for field in (
+                            "nx", "n1", "n2", "split_label",
+                            "neural_decoder_width",
+                        )
+                    },
                     details=member.get("error"),
                 ))
         if not rows:

@@ -1,0 +1,28 @@
+extends: neural_population_sweep.yaml
+name: neural_population_capacity_sweep
+modules:
+  plotting: ../plotting/neural_population_capacity_sweep.yaml
+suite_plugin: experiments.neural_capacity:build_capacity_cases
+suite:
+  nx_values: null
+  n1_max: null
+  latent_splits:
+  - n1: 16
+    n2: 48
+    n3: 0
+  - n1: 32
+    n2: 32
+    n3: 0
+  - n1: 48
+    n2: 16
+    n3: 0
+  - n1: 64
+    n2: 64
+    n3: 0
+  - n1: 96
+    n2: 32
+    n3: 0
+  decoder_widths:
+  - 64
+  - 128
+  - 256

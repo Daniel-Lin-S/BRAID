@@ -112,11 +112,21 @@ def effective_model_configuration(identity: dict) -> dict:
     """
     configuration = copy.deepcopy(identity["configurations"]["model"])
     structure = identity["case"].get("structure")
-    if structure is None:
-        return configuration
-    from .structure_sweep import apply_structure
+    if structure is not None:
+        from .structure_sweep import apply_structure
 
-    apply_structure(configuration, structure)
+        apply_structure(configuration, structure)
+    width = identity["case"].get("neural_decoder_width")
+    if width is not None:
+        if type(width) is not int or width < 1:
+            raise ValueError(
+                "Expected positive integer neural_decoder_width, "
+                f"got {width!r}."
+            )
+        for stage in ("stage_1", "stage_2"):
+            configuration["model"][stage]["neural_decoder"]["hidden_size"] = (
+                width
+            )
     return configuration
 
 
