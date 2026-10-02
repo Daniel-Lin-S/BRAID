@@ -1,10 +1,10 @@
 extends: style.yaml
 enabled: true
 presentation:
-  title_font: 25
-  label_font: 21
-  tick_font: 18
-  legend_font: 18
+  title_font: 36
+  label_font: 32
+  tick_font: 28
+  legend_font: 28
   horizon_size:
   - 28
   - 9
@@ -265,6 +265,7 @@ curves:
   parameter: population_scale
   group: horizon
   panel: nx
+  show_latent_split: true
   figure_size:
   - 28
   - 9
@@ -299,6 +300,7 @@ curves:
   parameter: horizon
   group: population_scale
   panel: nx
+  show_latent_split: true
   figure_size:
   - 28
   - 9
@@ -329,6 +331,7 @@ curves:
   parameter: population_scale
   group: horizon
   panel: nx
+  show_latent_split: true
   figure_size:
   - 28
   - 9
@@ -359,6 +362,7 @@ curves:
   parameter: horizon
   group: population_scale
   panel: nx
+  show_latent_split: true
   figure_size:
   - 28
   - 9
@@ -389,6 +393,7 @@ curves:
   parameter: population_scale
   group: horizon
   panel: nx
+  show_latent_split: true
   figure_size:
   - 28
   - 9
@@ -423,6 +428,7 @@ curves:
   parameter: horizon
   group: population_scale
   panel: nx
+  show_latent_split: true
   figure_size:
   - 28
   - 9
@@ -453,6 +459,7 @@ curves:
   parameter: population_scale
   group: horizon
   panel: nx
+  show_latent_split: true
   figure_size:
   - 28
   - 9
@@ -483,6 +490,7 @@ curves:
   parameter: horizon
   group: population_scale
   panel: nx
+  show_latent_split: true
   figure_size:
   - 28
   - 9

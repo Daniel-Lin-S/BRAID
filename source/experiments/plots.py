@@ -17,8 +17,12 @@ from PIL import Image
 from .cache import fingerprint
 from .outliers import iqr_outliers
 from .presentation import (
-    METRIC_LABELS, outlier_rendering, presentation, save_figure,
-    style_axis,
+    METRIC_LABELS, configure_metric_axis, metric_axes,
+    metric_axis_settings,
+    outlier_rendering, parameter_axes, plot_metric_uncertainty,
+    presentation,
+    r2_display_limits,
+    save_figure, style_axis,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -34,7 +38,7 @@ EXCLUDED_FOOTER_INCHES_PER_LINE = 0.24
 EXCLUDED_FOOTER_MINIMUM_INCHES = 0.65
 EXCLUDED_FOOTER_AXIS_GAP_INCHES = 0.8
 EXCLUDED_FOOTER_Y = 0.01
-COMPARISON_RENDERING_VERSION = 10
+COMPARISON_RENDERING_VERSION = 11
 FIGURE_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 PARAMETER_LABELS = {
     "horizon": "Forecast horizon (steps)",
@@ -213,7 +217,18 @@ def metric_curve(
         _metric_axis(
             axis, panel_rows, spec, style, panel_value, outlier_style,
             panel_exclusions,
+            rows if spec.get("share_y", False) else panel_rows,
+            zoom_exclusions if spec.get("share_y", False)
+            else panel_exclusions,
         )
+    if spec.get("share_y", False):
+        settings = style.get("metric_axes", {})
+        configure_metric_axis(axes[0][0], metric, settings)
+        configuration = metric_axis_settings(settings, metric)
+        if configuration:
+            for axis in axes[0][1:]:
+                axis.set_ylabel(configuration["label"])
+                style_axis(axis, style)
     title = _metric_title(spec, metric)
     context_label = spec.get("context_label")
     if context_label:
@@ -346,11 +361,28 @@ def _metric_axis(
     panel_value: object,
     outlier_style: dict,
     excluded_rows: list[dict],
+    range_rows: list[dict],
+    range_exclusions: list[dict],
 ) -> None:
     """Render grouped metric series for one target panel."""
     parameter = spec["parameter"]
     metric = spec["where"]["metric"]
     excluded_ids = {id(row) for row in excluded_rows}
+    axis_settings = metric_axis_settings(style.get("metric_axes", {}), metric)
+    ceiling = axis_settings.get("uncertainty_ceiling")
+    lower_fraction = axis_settings.get("uncertainty_lower_fraction")
+    range_excluded_ids = {id(row) for row in range_exclusions}
+    display_limits = (
+        r2_display_limits(
+            [
+                row for row in range_rows
+                if id(row) not in range_excluded_ids
+                and not row.get("excluded_condition", False)
+            ],
+            style["metric_axes"],
+        )
+        if metric == "r2" and axis_settings else None
+    )
     for value, branch, selected, number in _comparison_series(rows, spec):
         x = np.array([row[parameter] for row in selected], dtype=float)
         if parameter == "population_scale":
@@ -379,11 +411,18 @@ def _metric_axis(
             label=_series_label(spec, value, branch, selected),
             color=color,
         )
-        _plot_uncertainty(axis, selected, x, y, color)
+        _plot_uncertainty(
+            axis, selected, x, y, color, metric, style,
+        )
     ticks = sorted({row[parameter] for row in rows})
-    if parameter == "nx":
-        axis.set_xscale("log", base=2)
-    elif parameter == "population_scale":
+    axis_configuration = parameter_axes(style)[parameter]
+    if axis_configuration["scale"] == "log":
+        if any(value <= 0 for value in ticks):
+            raise ValueError(
+                f"Log {parameter} axis requires positive ticks."
+            )
+        axis.set_xscale("log", base=axis_configuration["base"])
+    if parameter == "population_scale":
         ticks = [100 * value for value in ticks]
     axis.set_xticks(ticks, labels=[f"{value:g}" for value in ticks])
     axis.set(
@@ -398,17 +437,32 @@ def _metric_axis(
     _render_outlier_arrows(
         axis, rows, parameter, outlier_style,
         excluded_rows=excluded_rows,
+        range_rows=range_rows,
+        range_exclusions=range_exclusions,
+        upper_ceiling=ceiling,
+        lower_fraction=lower_fraction,
+        display_limits=display_limits,
     )
+    if display_limits is not None:
+        axis.set_ylim(display_limits)
     if panel_value is not None:
         panel = spec.get("panel")
-        if panel == "n1":
+        if panel == "n1" or (
+            panel == "nx" and spec.get("show_latent_split", False)
+        ):
             splits = {(row["n1"], row["n2"]) for row in rows}
             if len(splits) != 1:
                 raise ValueError(
-                    f"Expected one latent split in n1={panel_value} panel."
+                    "Expected one latent split in panel "
+                    f"{panel}={panel_value}, got {sorted(splits)}."
                 )
             n1, n2 = splits.pop()
-            panel_title = f"nx={n1 + n2}; n1={n1}, n2={n2}"
+            nx = n1 + n2
+            if panel == "nx" and nx != panel_value:
+                raise ValueError(
+                    f"Panel nx={panel_value} has n1+n2={nx}."
+                )
+            panel_title = f"nx={nx}; n1={n1}, n2={n2}"
         elif panel == "neural_decoder_width":
             panel_title = f"Neural decoder width={panel_value}"
         elif panel == "nx":
@@ -416,16 +470,27 @@ def _metric_axis(
         else:
             panel_title = str(panel_value).capitalize()
         axis.set_title(panel_title)
+    if not spec.get("share_y", False):
+        configure_metric_axis(axis, metric, style.get("metric_axes", {}))
     style_axis(axis, style)
 
 
 def _render_outlier_arrows(
     axis: object, rows: list[dict], parameter: str, style: dict,
     excluded_rows: list[dict] | None = None,
+    range_rows: list[dict] | None = None,
+    range_exclusions: list[dict] | None = None,
+    upper_ceiling: float | None = None,
+    lower_fraction: float | None = None,
+    display_limits: tuple[float, float] | None = None,
 ) -> None:
     """Zoom to normal summaries and arrow-label excluded finite values."""
     excluded_rows = excluded_rows or []
-    excluded_ids = {id(row) for row in excluded_rows}
+    range_rows = rows if range_rows is None else range_rows
+    range_exclusions = (
+        excluded_rows if range_exclusions is None else range_exclusions
+    )
+    excluded_ids = {id(row) for row in range_exclusions}
     events = [
         (row, event)
         for row in rows
@@ -445,7 +510,7 @@ def _render_outlier_arrows(
     if not events:
         return
     bounds = []
-    for row in rows:
+    for row in range_rows:
         if id(row) in excluded_ids:
             continue
         mean = row.get("mean")
@@ -461,6 +526,13 @@ def _render_outlier_arrows(
             "normal observations."
         )
     lower, upper = min(bounds), max(bounds)
+    if lower_fraction is not None and lower <= 0:
+        positive = [value for value in bounds if value > 0]
+        if not positive:
+            raise ValueError("Log MSE axis has no positive normal values.")
+        lower = min(positive) * lower_fraction
+    if upper_ceiling is not None:
+        upper = min(upper, upper_ceiling)
     span = upper - lower
     if not np.isfinite(span) or span <= 0:
         raise ValueError(
@@ -469,7 +541,15 @@ def _render_outlier_arrows(
         )
     padding = span * style["zoom_padding_fraction"]
     lower_edge, upper_edge = lower - padding, upper + padding
+    if lower_fraction is not None:
+        lower_edge = max(lower_edge, lower * lower_fraction)
+    if upper_ceiling is not None:
+        upper_edge = min(upper_edge, upper_ceiling)
     clip_low, clip_high = lower, upper
+    if display_limits is not None:
+        lower_edge, upper_edge = display_limits
+        clip_low = max(clip_low, lower_edge)
+        clip_high = min(clip_high, upper_edge)
     axis.set_ylim(lower_edge, upper_edge)
     digits = style["label_significant_figures"]
     arrows = []
@@ -505,6 +585,7 @@ def _render_outlier_arrows(
             va="bottom" if direction == "↓" else "top",
             arrowprops=dict(arrowstyle="->", color="black"),
             annotation_clip=False,
+            fontsize=style["annotation_font"],
         )
 
 
@@ -676,31 +757,25 @@ def _add_shared_predecessor(
 
 
 def _plot_uncertainty(
-    axis: object,
-    selected: list[dict],
-    x: np.ndarray,
-    y: np.ndarray,
-    color: str,
+    axis: object, selected: list[dict], x: np.ndarray,
+    y: np.ndarray, color: str, metric: str, style: dict,
 ) -> None:
-    """Render finite fold standard deviations or session standard errors."""
+    """Render finite fold deviations or session errors on the metric axis."""
     uncertainty = "std" if any("std" in row for row in selected) else "sem"
     valid = [
-        index
-        for index, row in enumerate(selected)
+        index for index, row in enumerate(selected)
         if np.isfinite(y[index])
         and row.get(uncertainty) is not None
         and np.isfinite(row[uncertainty])
     ]
-    if valid:
-        axis.errorbar(
-            x[valid],
-            y[valid],
-            yerr=[selected[index][uncertainty] for index in valid],
-            fmt="none",
-            color=color,
-            capsize=4,
-        )
-
+    if not valid:
+        return
+    plot_metric_uncertainty(
+        axis, x[valid], y[valid],
+        np.asarray([selected[index][uncertainty] for index in valid]),
+        color, metric, style.get("metric_axes", {}),
+        4, style["tick_font"],
+    )
 
 def _group_style(
     spec: dict,
@@ -856,9 +931,9 @@ def comparison_rows(
 
 def _comparison_signature(
     rows: list[dict], dependencies: list[dict], spec: dict,
-    outlier_style: dict,
+    outlier_style: dict, presentation_style: dict,
 ) -> str:
-    """Fingerprint values, dependencies and semantic curve configuration."""
+    """Fingerprint values, dependencies and rendering configuration."""
     return fingerprint(dict(
         rendering_version=COMPARISON_RENDERING_VERSION,
         rows=sorted(rows, key=repr),
@@ -868,6 +943,7 @@ def _comparison_signature(
             if key != "context_label"
         },
         outlier_rendering=outlier_style,
+        presentation=presentation_style,
     ))
 
 
@@ -877,7 +953,7 @@ def _current_figure(path: Path, signature: str) -> bool:
         with Image.open(path) as saved:
             recorded = saved.info.get("BRAID-rendering")
             saved.verify()
-    except OSError:
+    except (OSError, Image.DecompressionBombError):
         LOGGER.warning("Redrawing damaged comparison PNG: %s", path)
         return False
     return recorded == signature
@@ -919,7 +995,12 @@ def plot_suite(
         return
     style = presentation(settings.get("presentation"))
     outlier_style = outlier_rendering(settings.get("outlier_rendering"))
-    rendering_style = dict(style, outlier_rendering=outlier_style)
+    rendering_style = dict(
+        style,
+        outlier_rendering=outlier_style,
+        metric_axes=metric_axes(settings),
+        parameter_axes=parameter_axes(settings),
+    )
     errors = []
     warning_details = []
     warning_members = set()
@@ -947,7 +1028,8 @@ def plot_suite(
         try:
             rows = comparison_rows(chosen, dependencies, name)
             signature = _comparison_signature(
-                rows, dependencies, spec, outlier_style
+                rows, dependencies, spec, outlier_style,
+                rendering_style,
             )
             if path.exists() and not regenerate and _current_figure(
                 path, signature

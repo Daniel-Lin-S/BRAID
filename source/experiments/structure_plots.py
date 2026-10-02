@@ -13,7 +13,12 @@ import numpy as np
 
 from .cache import fingerprint
 from .outliers import zoom_limits
-from .presentation import METRIC_LABELS, presentation, save_figure
+from .presentation import (
+    METRIC_LABELS, configure_metric_axis, metric_axes,
+    metric_axis_settings,
+    plot_metric_uncertainty, presentation, r2_display_limits,
+    save_figure,
+)
 from .structure_sweep import DYNAMICS, MAPPING_LEVELS
 
 LOGGER = logging.getLogger(__name__)
@@ -46,6 +51,45 @@ SHARED_X_LABEL_Y = 0.02
 LAYOUT_RECT = (0.02, 0.09, 0.78, 0.91)
 
 
+def _metric_limits(
+    limits: tuple[float, float, float, float],
+    rows: list[dict], metric: str, settings: dict,
+) -> tuple[float, float, float, float]:
+    """Keep structural zoom boundaries inside metric-scale domains."""
+    configuration = metric_axis_settings(settings, metric)
+    lower, upper, robust_low, robust_high = limits
+    if metric == "r2" and configuration:
+        inliers = [
+            row for row in rows
+            if row["mean"] is not None
+            and np.isfinite(row["mean"])
+            and robust_low <= row["mean"] <= robust_high
+        ]
+        display_lower, display_upper = r2_display_limits(
+            inliers, settings
+        )
+        lower = max(lower, display_lower)
+        upper = min(upper, display_upper)
+    if metric == "mse" and configuration and lower <= 0:
+        positive = [
+            row["mean"] for row in rows
+            if row["mean"] is not None
+            and np.isfinite(row["mean"])
+            and row["mean"] > 0
+            and robust_low <= row["mean"] <= robust_high
+        ]
+        if not positive:
+            raise ValueError("Log MSE figure has no positive inlier means.")
+        lower = min(positive) * configuration[
+            "uncertainty_lower_fraction"
+        ]
+    if lower >= upper:
+        raise ValueError(
+            f"No visible {metric} range inside metric-scale domain."
+        )
+    return lower, upper, robust_low, robust_high
+
+
 def _case_rows(
     rows: list[dict], dynamics: str, encoder: str, decoder: str,
 ) -> list[dict]:
@@ -66,7 +110,7 @@ def _draw_curve(
     linestyle: str, label: str,
     limits: tuple[float, float, float, float],
     series_number: int, series_count: int, style: dict,
-    error_key: str,
+    error_key: str, metric: str,
 ) -> None:
     """Draw inlier means, uncertainty, and labeled boundary markers."""
     lower, upper, robust_low, robust_high = limits
@@ -87,10 +131,11 @@ def _draw_curve(
         and np.isfinite(row[error_key])
     ]
     if error_indices:
-        axis.errorbar(
-            x[error_indices], y[error_indices],
-            yerr=[rows[index][error_key] for index in error_indices],
-            fmt="none", ecolor=color, capsize=ERROR_CAP_SIZE,
+        plot_metric_uncertainty(
+            axis, x[error_indices], y[error_indices],
+            np.asarray([rows[index][error_key] for index in error_indices]),
+            color, metric, style.get("metric_axes", {}),
+            ERROR_CAP_SIZE, style["tick_font"],
         )
     for index in np.flatnonzero(np.isfinite(y) & ~inlier):
         high = y[index] > robust_high
@@ -148,7 +193,10 @@ def _figure(
         row for row in rows
         if row["target"] == target and row["metric"] == metric
     ]
-    limits = zoom_limits(selected, multiple, error_key)
+    limits = _metric_limits(
+        zoom_limits(selected, multiple, error_key),
+        selected, metric, style.get("metric_axes", {}),
+    )
     horizons = sorted({row["horizon"] for row in selected})
     figure, axes = plt.subplots(
         1, len(DYNAMICS), sharey=True,
@@ -171,7 +219,7 @@ def _figure(
             _draw_curve(
                 axis, curve, style["horizon_colors"][number],
                 MARKERS[number], "-", label, limits, number, len(pairs),
-                style, error_key,
+                style, error_key, metric,
             )
         labels = [
             f"{step}\n{step * MILLISECONDS_PER_SECOND / sample_rate:g}"
@@ -187,10 +235,16 @@ def _figure(
         )
         axis.grid(alpha=0.2)
         axis.tick_params(labelsize=style["tick_font"])
+    configure_metric_axis(axes[0], metric, style.get("metric_axes", {}))
+    metric_label = metric_axis_settings(
+        style.get("metric_axes", {}), metric
+    ).get("label", METRIC_LABELS[metric])
     axes[0].set_ylabel(
-        f"{target.capitalize()} {METRIC_LABELS[metric]}",
+        f"{target.capitalize()} {metric_label}",
         fontsize=style["label_font"],
     )
+    for axis in axes[1:]:
+        axis.set_ylabel("")
     figure.supxlabel(
         "Forecast horizon (steps / ms)", x=SHARED_X_LABEL_X,
         y=SHARED_X_LABEL_Y, fontsize=style["label_font"],
@@ -287,7 +341,10 @@ def _dynamic_figure(
         if row["target"] == target and row["metric"] == metric
         and row["encoder"] == encoder and row["decoder"] == decoder
     ]
-    limits = zoom_limits(selected, multiple)
+    limits = _metric_limits(
+        zoom_limits(selected, multiple),
+        selected, metric, style.get("metric_axes", {}),
+    )
     horizons = sorted({row["horizon"] for row in selected})
     figure, axis = plt.subplots(
         figsize=(DYNAMIC_COMPARISON_WIDTH_INCHES, FIGURE_HEIGHT_INCHES),
@@ -303,7 +360,7 @@ def _dynamic_figure(
         _draw_curve(
             axis, curve, style["horizon_colors"][number], marker, linestyle,
             PANEL_TITLES[dynamics], limits, number, len(DYNAMICS), style,
-            "sem",
+            "sem", metric,
         )
     labels = [
         f"{step}\n{step * MILLISECONDS_PER_SECOND / sample_rate:g}"
@@ -314,8 +371,12 @@ def _dynamic_figure(
     axis.set_xticks(horizons, labels)
     axis.set_xlim(min(horizons) / 1.2, max(horizons) * 1.2)
     axis.set_ylim(limits[:2])
+    configure_metric_axis(axis, metric, style.get("metric_axes", {}))
+    metric_label = metric_axis_settings(
+        style.get("metric_axes", {}), metric
+    ).get("label", METRIC_LABELS[metric])
     axis.set_ylabel(
-        f"{target.capitalize()} {METRIC_LABELS[metric]}",
+        f"{target.capitalize()} {metric_label}",
         fontsize=style["label_font"],
     )
     axis.tick_params(labelsize=style["tick_font"])
@@ -351,7 +412,10 @@ def render_dynamic_comparison_figures(
     options = settings["structure_horizons"]
     selector = dynamic_comparison_selector(options)
     directory = dynamic_comparison_directory(options)
-    style = presentation(settings["presentation"])
+    style = dict(
+        presentation(settings["presentation"]),
+        metric_axes=metric_axes(settings),
+    )
     for target in TARGETS:
         for metric in METRICS:
             name = f"dynamics_{target}_{metric}"
@@ -378,6 +442,7 @@ def render_dynamic_comparison_figures(
                 "dynamic_styles": DYNAMIC_COMPARISON_STYLES,
                 "sample_rate": sample_rate,
                 "options": options,
+                "style": style,
             })
             save_figure(
                 figure, destination / directory / f"{name}.png", style,
@@ -457,7 +522,10 @@ def _render_figures(
     """Render a six-figure suite using one shared uncertainty definition."""
     options = settings["structure_horizons"]
     multiple = options["zoom_iqr_multiple"]
-    style = presentation(settings["presentation"])
+    style = dict(
+        presentation(settings["presentation"]),
+        metric_axes=metric_axes(settings),
+    )
     for target in TARGETS:
         for metric in METRICS:
             name = f"structure_{target}_{metric}"
@@ -481,6 +549,7 @@ def _render_figures(
                 sample_rate=sample_rate, error_key=error_key,
                 uncertainty_label=uncertainty_label,
                 context_label=context_label,
+                style=style,
             ))
             save_figure(
                 figure, destination / f"{name}.png", style, signature,

@@ -8,6 +8,7 @@ presentation:
   single_size: [12, 7]
   horizon_size: [20, 7]
   dpi: 200
+  max_canvas_pixels: 100000000
   pair_colors: ['#1764a0', '#d55e00']
   horizon_colors:
     - '#1f77b4'
@@ -29,11 +30,32 @@ presentation:
     - '#7f7f7f'
   group_linestyles: ['-', '--', '-.', ':']
   group_markers: ['o', 's', 'D', '^', 'v', 'P', 'X', '*']
+parameter_axes:
+  horizon:
+    scale: log
+    base: 2
+  nx:
+    scale: log
+    base: 2
+  population_scale:
+    scale: linear
+metric_axes:
+  r2:
+    scale: log_one_minus
+    uncertainty_ceiling: 0.99
+    padding_fraction: 0.05
+    ticks: [-1000, -100, -10, -1, 0, 0.25, 0.5, 0.75, 0.9, 0.99]
+    label: R² [−log(1−R²) scale]
+  mse:
+    scale: log
+    uncertainty_lower_fraction: 0.5
+    label: MSE (log scale)
 outlier_rendering:
   zoom_padding_fraction: 0.05
   label_significant_figures: 3
-  label_offset_points: 8
-  label_stack_points: 14
+  label_offset_points: 12
+  label_stack_points: 24
+  annotation_font: 20
 previews:
   enabled: false
   windows: 3
