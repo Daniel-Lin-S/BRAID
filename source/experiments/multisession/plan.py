@@ -18,9 +18,17 @@ PRIMARY = "multi_session_training"
 CAPACITY = PRIMARY + "_capacity_sensitivity"
 SUPERVISION = PRIMARY + "_supervision_sensitivity"
 ANALYSES = (PRIMARY, CAPACITY, SUPERVISION)
+# Historical source IDs contain target-only file slots. Keep those slots
+# stable: source fitting never executes either target integration module.
+SOURCE_TARGET_SLOTS = {
+    "experiments/multisession/target.py":
+        "6594517aa20012e2b094f8eb03a5428b492f026987a2012aca31e8486d0f0381",
+    "BRAID/BRAIDModel.py":
+        "f81ef97b61577af6b67404cc1e4c6623b3b990fa6cd2848d1df0c62698399d6f",
+}
 
 
-def implementation_digest() -> str:
+def implementation_digest(kind: str = "source") -> str:
     """Fingerprint numerical transfer code and native BRAID dependencies."""
     here = Path(__file__).resolve().parent
     paths = [
@@ -44,12 +52,15 @@ def implementation_digest() -> str:
             "reports/evaluation.py",
         )
     ]
-    return fingerprint(
-        {
-            str(p.relative_to(here.parents[1])): file_digest(p)
-            for p in sorted(paths)
-        }
-    )
+    if kind != "source":
+        paths.append(here / "preprocessing.py")
+    hashes = {
+        str(p.relative_to(here.parents[1])): file_digest(p)
+        for p in sorted(paths)
+    }
+    if kind == "source":
+        hashes.update(SOURCE_TARGET_SLOTS)
+    return fingerprint(hashes)
 
 
 def build_plan(settings: dict, sessions: dict[str, dict]) -> dict:
@@ -72,10 +83,13 @@ def build_plan(settings: dict, sessions: dict[str, dict]) -> dict:
         target_training=settings["target_training"],
         horizons=settings["evaluation_horizons"],
     )
+    target_implementation = implementation_digest("adaptation")
     jobs, memberships = {}, {name: [] for name in ANALYSES}
 
     def add(spec: dict) -> str:
         identity = dict(common, **spec)
+        if spec["kind"] != "source":
+            identity["implementation"] = target_implementation
         key = fingerprint(identity)
         if key not in jobs:
             jobs[key] = identity

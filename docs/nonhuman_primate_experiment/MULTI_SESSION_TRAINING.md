@@ -8,7 +8,7 @@ bash scripts/train_multi_session.sh --experiment assets/config/nhp/experiments/m
 bash scripts/train_multi_session.sh --experiment assets/config/nhp/experiments/multi_session_training.local.yaml --stage report
 ```
 
-The detached queue selects the four visible GPUs with the most free memory, including GPUs already in use, and starts one worker per selected GPU. Each worker has four CPU threads and TensorFlow memory growth. Existing processes are untouched. Repeating the launch resumes incomplete work and validates completed fits before reuse. A coordinator lock prevents duplicate queues for the same plan.
+The detached queue selects the four visible GPUs with the most free memory, including GPUs already in use, and starts one worker per selected GPU. Each worker has four CPU threads and TensorFlow memory growth. Unrelated processes are untouched. To hand over an authorized stopped coordinator, pass `--adopt-launch` with its launch directory; verified active workers finish without restart, and unoccupied slots are assigned by current free GPU memory. Repeating the launch resumes incomplete work and validates completed fits before reuse. A coordinator lock prevents duplicate queues for the same plan.
 
 ## Scientific design
 
@@ -43,6 +43,7 @@ The plan contains 13 source fits, 468 adaptations, 72 scratch controls, and 36 r
 <artifact_root>/experiments/
   BRAID_matched_scratch/<fit_id>/
   BRAID_matched_preprocessing/<fit_id>/
+  BRAID_preprocessing_predictions/<cache_id>/
   target_components/<fit_id>/
 <artifact_root>/analysis/<analysis_id>/<plan_id>/
   manifest.json
@@ -54,13 +55,19 @@ The plan contains 13 source fits, 468 adaptations, 72 scratch controls, and 36 r
 
 Scratch fits and their preprocessing dependencies live in the shared experiments store. Each analysis manifest records the resolved fit directory. Other analyses can load `model.p`, `identity.json`, `selection.npz`, `metrics.json`, and the checksum-validated `complete.json` directly; storage location and analysis membership do not change fit identity.
 
-Fit identities include scientific settings, source and target selections, seeds, implementation/dependency versions, shared-map names, and parent-checkpoint checksums. GPU and worker allocations do not enter scientific identities. Completed fits have checksum-validated `complete.json` records. Interrupted attempts are quarantined; separately completed components survive fit retries. Nonfatal worker/reporting failures do not stop independent fits.
+Fit identities include scientific settings, source and target selections, seeds, implementation/dependency versions, shared-map names, and parent-checkpoint checksums. GPU and worker allocations do not enter scientific identities. Source implementation identities exclude target-only integration changes, preserving source checkpoints when target execution is optimized. Completed fits have checksum-validated `complete.json` records. Interrupted attempts are quarantined; separately completed components survive fit retries. Nonfatal worker/reporting failures do not stop independent fits.
 
 Source records retain training-only normalization, original window indices, sampled windows per update, exposure counts, histories, best weights, final optimizer state, and component completion checksums. Target records retain selected indices, realized fractions, normalization, native checkpoints, component dependencies, allowed/consumed budgets, test predictions, masks, and per-dimension metrics.
 
 Reports retain CC, R², and MSE at horizons 1, 2, 4, 8, 16, and 32. `raw_metrics.csv`, `per_dimension.csv`, and `session_metrics.csv` retain fit-level, coordinate-level, and session-level results. `summary.csv` averages folds/repeats within each session before computing the four-session mean and SEM, with validity counts. `paired_gain.csv` and `paired_gain_summary.csv` compare matched scratch controls. `source_costs.csv` and `target_costs.csv` expose budgets and reusable component IDs. Manifests retain failure/completion accounting even before enough results exist to draw a figure.
 
 Primary CC figures use logarithmic source-count and target-label axes, the prescribed ticks, profile colors, and dashed scratch references. Sensitivity figures encode exactly two conditions in color with separate matching-sharing panels. Neural/behavior outcomes and horizons have separate figures. Capacity-matched scratch results remain in tables. Report snapshots are immutable and the latest-report pointer advances as work completes.
+
+## Execution efficiency
+
+Frozen target preprocessing predictions are cached once per exact checkpoint and input-array content, shape, and dtype. Warm-cache fits load weight containers without reconstructing the preprocessing graph. Main-stage initialization is seeded immediately before fitting, so cache hits and misses remain paired. Native checkpoints are saved from shallow model-container snapshots, preserving live graphs and avoiding save/reconstruct cycles; current forecast horizons and batch sizes survive serialization.
+
+The scheduler keeps source jobs sharing private preprocessing from competing for GPU slots. Periodic reporting runs in a separate CPU process. Detached coordinators read the already published plan instead of rescanning all sessions. Training losses, horizons, optimization limits, split indices, and stopping rules are unchanged.
 
 ## Implementation layout
 

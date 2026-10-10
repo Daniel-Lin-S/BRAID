@@ -38,6 +38,32 @@ logger = logging.getLogger(__name__)
 
 
 
+
+def validate_preprocessing_predictions(
+    predictions: tuple, training: np.ndarray, behavior: np.ndarray,
+    validation: np.ndarray | None,
+) -> tuple:
+    """Validate injected native one-step predictions before main fitting.
+
+    Predictions are (training, validation), each (samples, behavior_dims).
+    Validation predictions must be None exactly when validation is absent.
+    """
+    if len(predictions) != 2 or behavior is None:
+        raise ValueError("Expected two cached behavior prediction arrays.")
+    for values, observations in zip(predictions, (training, validation)):
+        if observations is None:
+            if values is not None:
+                raise ValueError("Unexpected cached validation predictions.")
+            continue
+        expected = (observations.shape[1], behavior.shape[0])
+        if (
+            values is None or values.shape != expected
+            or not np.isfinite(values).all()
+        ):
+            raise ValueError(f"Expected finite cached predictions {expected}.")
+    return tuple(predictions)
+
+
 # PredictorModel
 class BRAIDModel(MainModel):
     """The main class implementing BRAID. 
@@ -105,7 +131,7 @@ class BRAIDModel(MainModel):
             args_pre['model2_Cz_Full']=False
             args_pre['allow_nonzero_Cz2']=True
             args_pre['has_UFT_reg']=False
-            sId_pre = getattr(self, 'preprocessing_model', None)
+            sId_pre = self.__dict__.pop("preprocessing_model", None)
             if sId_pre is None:
                 sId_pre = MainModel(
                     artifact_role="behaviour_preprocess",
@@ -123,11 +149,33 @@ class BRAIDModel(MainModel):
                     U_validation=U_validation, **args_pre,
                 )
         
-            zPredRes1Train, _, _, _, _, _ = runPredict(sId_pre, Y=transposeIf(Y), Z=transposeIf(Z), U=transposeIf(U), YType=YType, ZType=ZType, useXFilt=False, missing_marker=self.missing_marker)
-            if Y_validation is not None:
-                zPredRes1Val, _, _, _, _, _ = runPredict(sId_pre, Y=transposeIf(Y_validation), Z=transposeIf(Z_validation), U=transposeIf(U_validation), YType=YType, ZType=ZType, useXFilt=False, missing_marker=self.missing_marker)
+            cached_predictions = self.__dict__.pop(
+                "preprocessing_predictions", None
+            )
+            if cached_predictions is None:
+                prediction_options = dict(
+                    YType=YType, ZType=ZType, useXFilt=False,
+                    missing_marker=self.missing_marker,
+                )
+                zPredRes1Train = runPredict(
+                    sId_pre, Y=transposeIf(Y), Z=transposeIf(Z),
+                    U=transposeIf(U), **prediction_options,
+                )[0]
+                if Y_validation is not None:
+                    zPredRes1Val = runPredict(
+                        sId_pre, Y=transposeIf(Y_validation),
+                        Z=transposeIf(Z_validation),
+                        U=transposeIf(U_validation), **prediction_options,
+                    )[0]
+                else:
+                    zPredRes1Val = None
+
             else:
-                zPredRes1Val = None
+                zPredRes1Train, zPredRes1Val = (
+                    validate_preprocessing_predictions(
+                        cached_predictions, Y, Z, Y_validation
+                    )
+                )
 
             if isinstance(zPredRes1Train, list):
                 zPredRes1Train = zPredRes1Train[0]
@@ -163,6 +211,11 @@ class BRAIDModel(MainModel):
         if noFT:
             args['has_UFT']=False
             args['has_UFT_reg']=False
+        initialization_seed = self.__dict__.pop(
+            "main_initialization_seed", None
+        )
+        if initialization_seed is not None:
+            tf.keras.utils.set_random_seed(initialization_seed)
         sId = MainModel(
                 artifact_role="main",
                 frozen_stage1=getattr(self, "frozen_stage1", None),

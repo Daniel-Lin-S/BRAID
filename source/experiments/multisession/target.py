@@ -24,6 +24,11 @@ from experiments.contracts import FeatureSet
 from experiments.reports.evaluation import score_channels
 from experiments.datasets.nhp import TEST
 from experiments.multisession.data import LENGTH
+from experiments.multisession.plan import implementation_digest
+from experiments.multisession.preprocessing import (
+    preprocessing_predictions, save_snapshot,
+)
+from experiments.multisession.store import load_pickle
 from experiments.datasets.windows import window_indices
 
 
@@ -133,7 +138,7 @@ def fit_preprocessing(
     )
     if model.hasBlownUp():
         raise FloatingPointError("Target preprocessing fit is nonfinite.")
-    model.saveToFile(str(directory / "model.p"))
+    save_snapshot(model, directory / "model.p")
     save_component_records(directory, components, arguments, model)
 
 
@@ -161,14 +166,17 @@ def fit_target(
 ) -> BRAIDModel:
     """Fit target-private components while imported modules stay frozen."""
     tf.keras.utils.set_random_seed(seed)
-    pre = MainModel.loadFromFile(str(preprocessing / "model.p"))
-    # Loading the dependency must not change paired main-stage initialization.
-    tf.keras.utils.set_random_seed(seed)
+    pre = load_pickle(preprocessing / "model.p")["model"]
+    predictions = preprocessing_predictions(
+        pre, arrays, preprocessing, implementation_digest("adaptation")
+    )
     components = component_directory(directory)
     model = BRAIDModel(
         log_dir=str(components),
         missing_marker=MISSING_MARKER,
         preprocessing_model=pre,
+        preprocessing_predictions=predictions,
+        main_initialization_seed=seed,
         frozen_stage1=weights,
     )
     model.fit(**arrays, YType="cont", ZType="cont", UType="cont", **arguments)
@@ -178,8 +186,7 @@ def fit_target(
         actual = getattr(model.sId.model1.rnn.cell, name).get_weights()
         for left, right in zip(expected, actual):
             np.testing.assert_array_equal(left, right)
-    model.saveToFile(str(directory / "model.p"))
-    model.restoreModels()
+    save_snapshot(model, directory / "model.p")
     save_component_records(directory, components, arguments, model.sId)
     return model
 

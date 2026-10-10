@@ -452,3 +452,100 @@ def test_adopted_worker_pid_reuse(tmp_path, monkeypatch):
     assert worker.poll() is None
     monkeypatch.setattr(queue, "process_state", lambda pid: ("S", "new"))
     assert worker.poll() == 1
+
+
+def test_preprocessing_cache_identity_and_corruption(tmp_path, monkeypatch):
+    """Only identical checkpoint/data bytes reuse precomputed predictions."""
+    import pytest
+    from experiments.multisession import preprocessing
+
+    calls = []
+
+    class Preprocessor:
+        missing_marker = -1000000
+
+        def restoreModels(self):
+            calls.append("restore")
+
+    def predict(model, **kwargs):
+        calls.append("predict")
+        return ([kwargs["Z"].copy()],)
+
+    monkeypatch.setattr(preprocessing, "runPredict", predict)
+    pre = tmp_path / "preprocessing" / "fit"
+    pre.mkdir(parents=True)
+    (pre / "model.p").write_bytes(b"checkpoint-one")
+    arrays = {
+        name + suffix: np.ones((width, LENGTH))
+        for name, width in (("Y", 3), ("U", 2), ("Z", 4))
+        for suffix in ("", "_validation")
+    }
+    first = preprocessing.preprocessing_predictions(
+        Preprocessor(), arrays, pre, "implementation"
+    )
+    assert calls == ["restore", "predict", "predict"]
+    second = preprocessing.preprocessing_predictions(
+        Preprocessor(), arrays, pre, "implementation"
+    )
+    assert len(calls) == 3
+    for left, right in zip(first, second):
+        np.testing.assert_array_equal(left, right)
+    changed = dict(arrays, Y=arrays["Y"] * 2)
+    preprocessing.preprocessing_predictions(
+        Preprocessor(), changed, pre, "implementation"
+    )
+    assert len(calls) == 6
+    caches = list(
+        tmp_path.glob("BRAID_preprocessing_predictions/*/behavior.npz")
+    )
+    assert len(caches) == 2
+    for path in caches:
+        path.write_bytes(b"corrupt")
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        preprocessing.preprocessing_predictions(
+            Preprocessor(), arrays, pre, "implementation"
+        )
+
+
+def test_snapshot_preserves_live_graphs_and_aliases(tmp_path):
+    """Saving native weight containers must not replace live model objects."""
+    from BRAID.MainModel import MainModel
+    from BRAID.BRAIDModel import BRAIDModel
+    from BRAID.tools.model_base_classes import ReconstructionInfo
+    from experiments.multisession.preprocessing import save_snapshot
+    from experiments.multisession.store import load_pickle
+
+    pre = MainModel()
+    model = BRAIDModel(preprocessing_model=pre)
+    model.sId_pre = pre
+    model.sId = MainModel()
+    model.sId.model1_Cy = MixedForecaster([(3, 3)], 4, "A", 42).sessions[0]["C"]
+    live = model.sId.model1_Cy
+    path = tmp_path / "snapshot.p"
+    save_snapshot(model, path)
+    assert model.sId.model1_Cy is live
+    stored = load_pickle(path)["model"]
+    assert stored.sId_pre is stored.preprocessing_model
+    assert isinstance(stored.sId.model1_Cy, ReconstructionInfo)
+    for left, right in zip(live.get_weights(), stored.sId.model1_Cy.weights):
+        np.testing.assert_array_equal(left, right)
+
+
+def test_source_identity_ignores_only_target_dependencies(monkeypatch):
+    """Target edits preserve source IDs; source edits invalidate them."""
+    from experiments.multisession import plan
+
+    original = plan.file_digest
+    baseline = plan.implementation_digest("source")
+    target = plan.implementation_digest("adaptation")
+    monkeypatch.setattr(
+        plan, "file_digest",
+        lambda path: "changed" if path.name == "target.py" else original(path),
+    )
+    assert plan.implementation_digest("source") == baseline
+    assert plan.implementation_digest("adaptation") != target
+    monkeypatch.setattr(
+        plan, "file_digest",
+        lambda path: "changed" if path.name == "source.py" else original(path),
+    )
+    assert plan.implementation_digest("source") != baseline

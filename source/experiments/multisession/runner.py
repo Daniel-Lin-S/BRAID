@@ -125,7 +125,7 @@ def run_job(plan: dict, key: str) -> None:
     )
 
     spec = plan["jobs"][key]
-    if implementation_digest() != spec["implementation"]:
+    if implementation_digest(spec["kind"]) != spec["implementation"]:
         raise RuntimeError("Numerical implementation changed after planning.")
     directory = fit_directory(plan, key)
     identity = dict(spec)
@@ -274,6 +274,20 @@ def run_queue(
         active = {}
     else:
         devices, active = adopt_workers(plan, previous_launch)
+        live_slots = {
+            slot for slot, (_, process) in active.items()
+            if process.poll() is None
+        }
+        occupied = {devices[slot]["uuid"] for slot in live_slots}
+        ranked = select_gpus(settings["runtime"]["device"], len(devices))
+        for slot in range(len(devices)):
+            if slot in live_slots:
+                continue
+            devices[slot] = next(
+                candidate for candidate in ranked
+                if candidate["uuid"] not in occupied
+            )
+            occupied.add(devices[slot]["uuid"])
         atomic_json(
             launch / "adopted.json",
             dict(
@@ -398,7 +412,10 @@ def run_queue(
                     coordinator_pid=os.getpid(),
                     counts=dict(Counter(states.values())),
                     active={
-                        str(slot): dict(job=key, pid=proc.pid)
+                        str(slot): dict(
+                            job=key, pid=proc.pid,
+                            log=str(getattr(proc, "log", launch / f"{key}.log")),
+                        )
                         for slot, (key, proc) in active.items()
                     },
                     failures=sorted(failed),

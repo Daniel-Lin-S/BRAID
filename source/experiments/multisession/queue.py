@@ -8,7 +8,7 @@ PID start times guard against PID reuse; completion records decide success.
 import json
 from pathlib import Path
 
-from experiments.multisession.store import completed, fit_directory
+from experiments.multisession.store import fit_directory
 
 
 def process_state(pid: int) -> tuple[str, str] | None:
@@ -34,7 +34,7 @@ class AdoptedWorker:
         state = process_state(self.pid)
         if state and state[0] != "Z" and state[1] == self.started:
             return None
-        return 0 if completed(self.directory) is not None else 1
+        return 0 if (self.directory / "complete.json").is_file() else 1
 
 
 def adopt_workers(plan: dict, launch: Path) -> tuple[list, dict]:
@@ -64,7 +64,9 @@ def adopt_workers(plan: dict, launch: Path) -> tuple[list, dict]:
                 or Path(words[words.index("--plan") + 1]) != old_path
             ):
                 raise ValueError(f"PID {pid} is not the expected fit worker.")
-        active[int(slot)] = (key, AdoptedWorker(pid, plan, key))
+        process = AdoptedWorker(pid, plan, key)
+        process.log = launch / f"{key}.log"
+        active[int(slot)] = (key, process)
     return devices, active
 
 
