@@ -1,0 +1,395 @@
+"""Scientific and artifact contracts for multi-session training.
+
+Synthetic fixtures use independent 128-step windows with unequal neural
+widths. No real data or completed campaign artifacts are modified.
+"""
+
+from copy import deepcopy
+from pathlib import Path
+
+import numpy as np
+import tensorflow as tf
+
+from BRAID.multisession import HORIZONS, LINEAR, MixedForecaster
+from BRAID.RNNModel import RNNModel
+from experiments.configuration import read_yaml
+from experiments.multisession.plan import (
+    ANALYSES,
+    CAPACITY,
+    PRIMARY,
+    SUPERVISION,
+    build_plan,
+)
+from experiments.multisession.store import completed, dump_pickle, job
+from experiments.multisession.training import recurrent_data, select_batch
+
+ROOT = Path(__file__).resolve().parents[1]
+LENGTH = 128
+
+
+def fixture_data(widths=(3, 5)):
+    """Return two finite session datasets with different channel widths."""
+    rng = np.random.default_rng(7)
+    return [
+        recurrent_data(
+            dict(
+                Y=rng.normal(size=(2, LENGTH, width)).astype("float32"),
+                U=rng.normal(size=(2, LENGTH, 2)).astype("float32"),
+            )
+        )
+        for width in widths
+    ]
+
+
+def test_grid_and_membership():
+    """Count unique fits and enforce held-out, paired source membership."""
+    settings = read_yaml(
+        ROOT / "assets/config/nhp/experiments/multi_session_training.yaml"
+    )
+    for key in ("data", "model"):
+        settings[key] = read_yaml(Path(settings["modules"][key]))
+    sessions = {s: dict(sha256=s) for s in settings["held_out_sessions"]}
+    sessions.update({f"source_{i}": dict(sha256=str(i)) for i in range(33)})
+    plan = build_plan(settings, sessions)
+    jobs = plan["jobs"]
+    assert {
+        kind: sum(j["kind"] == kind for j in jobs.values())
+        for kind in ("source", "adaptation", "scratch", "preprocessing")
+    } == {
+        "source": 39,
+        "adaptation": 2340,
+        "scratch": 360,
+        "preprocessing": 180,
+    }
+    assert set(plan["analyses"]) == set(ANALYSES)
+    sources = [j for j in jobs.values() if j["kind"] == "source"]
+    for seed in settings["seeds"]:
+        paired = [
+            j
+            for j in sources
+            if j["seed"] == seed
+            and j["objective"] == "neural"
+            and j["latent"] == 32
+        ]
+        largest = next(j["sessions"] for j in paired if j["source_count"] == 33)
+        for item in paired:
+            assert item["sessions"] == largest[: item["source_count"]]
+            assert not set(item["sessions"]) & set(
+                settings["held_out_sessions"]
+            )
+    references = set(plan["analyses"][PRIMARY])
+    assert references & set(plan["analyses"][CAPACITY])
+    assert references & set(plan["analyses"][SUPERVISION])
+
+
+def test_mixed_gradients_optimizer_isolation_and_serialization(tmp_path):
+    """Absent sessions keep their weights and Adam state exactly unchanged."""
+    model = MixedForecaster([(3, 3), (5, 5)], 4, "AK", 42)
+    data = fixture_data()
+    batch = select_batch(data, [np.array([0, 1]), np.array([], dtype=int)])
+    states, _ = model.states(batch[0])
+    assert states.shape == (2, LENGTH, 4)
+    absent = [v.numpy().copy() for v in model.private_variables[1]]
+    optimizers = [tf.keras.optimizers.legacy.Adam(0.001) for _ in range(3)]
+    groups = [model.shared_variables, *model.private_variables]
+    loss, gradients = model.loss_and_gradients(*batch)
+    assert np.isfinite(loss.numpy())
+    offset = 0
+    for i, (optimizer, variables) in enumerate(zip(optimizers, groups)):
+        selected = gradients[offset : offset + len(variables)]
+        offset += len(variables)
+        if i != 2:
+            optimizer.apply_gradients(zip(selected, variables))
+    assert optimizers[2].get_weights() == []
+    for before, after in zip(absent, model.private_variables[1]):
+        np.testing.assert_array_equal(before, after.numpy())
+    weights = model.weights()
+    restored = MixedForecaster([(3, 3), (5, 5)], 4, "AK", 93)
+    restored.restore(weights)
+    assert restored.sessions[0]["Afw"] is restored.sessions[1]["Afw"]
+    first, _ = model.predict(batch[0], batch[1])
+    second, _ = restored.predict(batch[0], batch[1])
+    for a, b in zip(first, second):
+        np.testing.assert_array_equal(a, b)
+
+
+def test_native_forecast_and_frozen_maps():
+    """Mixed recursion matches native RNN outputs for identical inputs."""
+    model = MixedForecaster([(3, 3)], 4, "AK", 42)
+    decoder = dict(
+        LINEAR,
+        units=(256,),
+        use_bias=True,
+        activation="relu",
+        kernel_initializer="glorot_uniform",
+    )
+    native = RNNModel(
+        nx=4,
+        ny=5,
+        ny_out=3,
+        block_samples=LENGTH,
+        batch_size=2,
+        n1_in=2,
+        steps_ahead=HORIZONS,
+        enable_forward_pred=True,
+        cell_args=dict(
+            ASettings=deepcopy(LINEAR),
+            KSettings=deepcopy(LINEAR),
+            CSettings=decoder,
+        ),
+    )
+    for name, layer in model.sessions[0].items():
+        getattr(native.rnn.cell, name).set_weights(layer.get_weights())
+    data = fixture_data((3,))
+    batch = select_batch(data, [np.array([0, 1])])
+    expected, _ = model.predict(batch[0], batch[1])
+    actual = native.model((batch[0][0], batch[1][0]), training=False)
+    for i in range(len(HORIZONS)):
+        np.testing.assert_allclose(expected[0][i], actual[i], atol=1e-7)
+    native.set_frozen_modules(model.transferable())
+    shared_refs = {v.ref() for v in model.shared_variables}
+    assert shared_refs
+    frozen_refs = {
+        v.ref()
+        for name in ("Afw", "Kfw")
+        for v in getattr(native.rnn.cell, name).weights
+    }
+    assert not frozen_refs & {v.ref() for v in native.model.trainable_weights}
+    before = [
+        v.numpy().copy()
+        for name in ("Afw", "Kfw")
+        for v in getattr(native.rnn.cell, name).weights
+    ]
+    with tf.GradientTape() as tape:
+        output = native.model((batch[0][0], batch[1][0]), training=True)
+        loss = sum(tf.reduce_mean(tf.square(x)) for x in output[:4])
+    variables = native.model.trainable_weights
+    gradients = tape.gradient(loss, variables)
+    tf.keras.optimizers.Adam(0.001).apply_gradients(zip(gradients, variables))
+    after = [
+        v.numpy()
+        for name in ("Afw", "Kfw")
+        for v in getattr(native.rnn.cell, name).weights
+    ]
+    for a, b in zip(before, after):
+        np.testing.assert_array_equal(a, b)
+
+
+def test_completion_reuse_and_quarantine(tmp_path):
+    """Completed payloads are reused; incomplete attempts are isolated."""
+    directory = tmp_path / "fit"
+    directory.mkdir()
+    (directory / "partial").write_text("interrupted")
+    with job(directory, dict(seed=42)) as needed:
+        assert needed
+        dump_pickle(directory / "weights.pkl", [np.ones(2)])
+    assert completed(directory)
+    assert list((tmp_path / "quarantine").glob("*/partial"))
+    before = (directory / "complete.json").read_bytes()
+    with job(directory, dict(seed=42)) as needed:
+        assert not needed
+    assert (directory / "complete.json").read_bytes() == before
+
+
+def test_neural_objective_ignores_behavior_labels(tmp_path):
+    """Changing only source Z cannot change scaling, selection or weights."""
+    from experiments.contracts import FeatureSet
+    from experiments.multisession.data import session_windows
+    from experiments.multisession.training import train_stage
+
+    rng = np.random.default_rng(42)
+    count = LENGTH * 4
+    arrays = dict(
+        Y=rng.normal(size=(count, 3)),
+        U=rng.normal(size=(count, 2)),
+        Z=rng.normal(size=(count, 4)),
+        indices=np.arange(count),
+        role=np.repeat([0, 1], count // 2),
+        segment=np.repeat([0, 1], count // 2),
+        ids=np.arange(3),
+    )
+    first = session_windows(FeatureSet(arrays, {}), False)
+    changed = dict(arrays, Z=arrays["Z"][::-1] * 100)
+    second = session_windows(FeatureSet(changed, {}), False)
+    assert first[2] == second[2]
+    outputs = []
+    for index, (train, validation, _) in enumerate((first, second)):
+        model = MixedForecaster([(3, 3)], 4, "AK", 42)
+        train_stage(
+            model,
+            [recurrent_data(train)],
+            [recurrent_data(validation)],
+            tmp_path / str(index),
+            dict(
+                maximum_updates=2,
+                learning_rate=0.001,
+                batch_size=2,
+                validation_interval=1,
+                patience=10,
+            ),
+            42,
+        )
+        outputs.append(model.weights())
+    for key in outputs[0]:
+        for a, b in zip(outputs[0][key], outputs[1][key]):
+            np.testing.assert_array_equal(a, b)
+
+
+def test_nested_subsets_and_fixed_test():
+    """Guarded role subsets remain nested after complete-batch trimming."""
+    from experiments.contracts import FeatureSet
+    from experiments.datasets.nhp import temporal_segments
+    from experiments.datasets.windows import window_indices
+    from experiments.multisession.data import target_selection
+
+    for count in (7202, 67258, 11526, 16319):
+        for fold in (0, 2, 4):
+            segments = temporal_segments(count, 5, fold, 36)
+            indices, roles, labels = [], [], []
+            for number, (start, stop, role) in enumerate(segments):
+                indices.extend(range(start + 1, stop))
+                roles.extend([role] * (stop - start - 1))
+                labels.extend([number] * (stop - start - 1))
+            features = FeatureSet(
+                dict(
+                    indices=np.asarray(indices),
+                    role=np.asarray(roles),
+                    segment=np.asarray(labels),
+                ),
+                dict(session="target", fold=fold),
+            )
+            test = window_indices(features, 2, LENGTH)
+            for seed in (42, 43, 44):
+                previous = (set(), set())
+                for fraction in (0.05, 0.1, 0.2, 0.4, 0.8):
+                    tr, va, record = target_selection(
+                        features,
+                        count,
+                        fraction,
+                        seed,
+                    )
+                    assert len(tr) and len(va)
+                    assert previous[0] <= set(tr.ravel())
+                    assert previous[1] <= set(va.ravel())
+                    assert not set(test.ravel()) & set(tr.ravel())
+                    assert not set(test.ravel()) & set(va.ravel())
+                    assert record["realized_fraction"] <= fraction
+                    previous = set(tr.ravel()), set(va.ravel())
+                    np.testing.assert_array_equal(
+                        test,
+                        window_indices(features, 2, LENGTH),
+                    )
+
+
+def test_reports_use_session_means_and_two_conditions(tmp_path, monkeypatch):
+    """Sensitivity legends have exactly the prescribed two conditions."""
+    from experiments.multisession.reports import figures, summarize
+    import matplotlib.figure
+
+    base = dict(
+        objective="neural",
+        latent=32,
+        sharing="A",
+        source_count=33,
+        fraction=0.05,
+        target="neural",
+        horizon=1,
+        metric="cc",
+    )
+    rows = [dict(base, session="one", value=v) for v in (0.1, 0.2, 0.3)]
+    rows.append(dict(base, session="two", value=0.8))
+    assert np.isclose(summarize(rows)[0]["mean"], 0.5)
+    summary = []
+    for objective in ("neural", "behavior"):
+        for latent in (32, 64):
+            for sharing in ("A", "AK", "AKC"):
+                summary.append(
+                    dict(
+                        base,
+                        objective=objective,
+                        latent=latent,
+                        sharing=sharing,
+                        mean=0.5,
+                        sem=0.1,
+                    )
+                )
+    saved = []
+
+    def capture(figure, path, **kwargs):
+        saved.append(
+            (
+                path.name,
+                [
+                    t.get_text()
+                    for legend in figure.legends
+                    for t in legend.get_texts()
+                ],
+            )
+        )
+
+    monkeypatch.setattr(matplotlib.figure.Figure, "savefig", capture)
+    settings = dict(
+        target_fractions=[0.05], source_counts=[33], evaluation_horizons=[1]
+    )
+    for analysis in (CAPACITY, SUPERVISION):
+        figures(summary, analysis, tmp_path, settings)
+    assert saved
+    for name, labels in saved:
+        assert len(labels) == 2, (name, labels)
+        if name.startswith("capacity"):
+            assert set(labels) == {"32 → 32+32", "64 → 64+64"}
+        elif name.startswith("supervision"):
+            assert set(labels) == {"Neural-only", "Behavior-supervised"}
+        else:
+            assert set(labels) == {"A1_fw + K1_fw", "A1_fw + K1_fw + Cz"}
+
+
+def test_queue_isolates_failure_and_reuses_completion(tmp_path, monkeypatch):
+    """A failed dependency blocks descendants while independent jobs finish."""
+    import json
+    from experiments.multisession import runner
+
+    specs = {
+        'bad': dict(kind='source', dependencies=[], seed=42),
+        'good': dict(kind='source', dependencies=[], seed=43),
+        'reused': dict(kind='source', dependencies=[], seed=44),
+        'dependent': dict(kind='adaptation', dependencies=['bad'], seed=42),
+        'independent': dict(kind='adaptation', dependencies=['good'], seed=43),
+    }
+    settings = dict(paths=dict(artifact_root=str(tmp_path)), runtime=dict(
+        device='auto', parallel_workers=4, cpu_threads=4,
+    ))
+    plan = dict(jobs=specs, settings=settings,
+                analyses={PRIMARY: list(specs)})
+    path = tmp_path / 'plans' / 'test' / 'plan.json'
+    path.parent.mkdir(parents=True)
+    launch = tmp_path / 'logs'
+    launch.mkdir()
+    with job(runner.fit_directory(plan, 'reused'), specs['reused']):
+        dump_pickle(runner.fit_directory(plan, 'reused') / 'value.pkl', 1)
+    started = []
+
+    class Process:
+        def __init__(self, command, **kwargs):
+            self.key = command[command.index('--job') + 1]
+            self.pid = 100 + len(started)
+            started.append(self.key)
+            assert self.key != 'reused'
+            if self.key != 'bad':
+                directory = runner.fit_directory(plan, self.key)
+                with job(directory, specs[self.key]):
+                    dump_pickle(directory / 'value.pkl', 1)
+
+        def poll(self):
+            return 1 if self.key == 'bad' else 0
+
+    monkeypatch.setattr(runner.subprocess, 'Popen', Process)
+    monkeypatch.setattr(runner, 'select_gpus', lambda *args: [
+        dict(uuid=f'GPU-{index}', index=index) for index in range(4)
+    ])
+    monkeypatch.setattr(runner, 'publish_reports', lambda *args: None)
+    monkeypatch.setattr(runner.time, 'sleep', lambda seconds: None)
+    runner.run_queue(plan, path, launch, settings)
+    status = json.loads((launch / 'status.json').read_text())
+    assert status['counts'] == dict(complete=3, failed=1, blocked=1)
+    assert set(started) == {'bad', 'good', 'independent'}

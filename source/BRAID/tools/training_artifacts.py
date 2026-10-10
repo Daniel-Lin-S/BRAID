@@ -43,7 +43,16 @@ class EpochArtifacts(tf.keras.callbacks.Callback):
             raise FloatingPointError("Training loss is nonfinite.")
         if "val_loss" in metrics and metrics["val_loss"] is None:
             raise FloatingPointError("Validation loss is nonfinite.")
-        row = dict(epoch=epoch + 1, attempt=self.attempt, metrics=metrics)
+        optimizer = getattr(self.model, 'optimizer', None)
+        updates = None
+        if optimizer is None:
+            LOGGER.warning('Optimizer count unavailable at %s', self.directory)
+        else:
+            updates = int(optimizer.iterations.numpy())
+        row = dict(
+            epoch=epoch + 1, attempt=self.attempt, metrics=metrics,
+            optimizer_updates=updates,
+        )
         with (self.directory / "history.jsonl").open("a") as stream:
             stream.write(json.dumps(row, allow_nan=False) + "\n")
             stream.flush()

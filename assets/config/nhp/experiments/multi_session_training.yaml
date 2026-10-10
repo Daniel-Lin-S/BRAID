@@ -1,0 +1,27 @@
+name: multi_session_training
+title: Multi-session training
+modules:
+  data: ../data/spikes.yaml
+  model: ../models/BRAID.yaml
+seeds: [42, 43, 44]
+source_counts: [4, 8, 16, 33]
+held_out_sessions:
+  - indy_20160921_01
+  - indy_20160627_01
+  - indy_20161220_02
+  - indy_20170131_02
+target_folds: [0, 2, 4]
+target_fractions: [0.05, 0.10, 0.20, 0.40, 0.80]
+source_training:
+  maximum_updates: 10000
+  batch_size: 32
+  learning_rate: 0.001
+  validation_interval: 25
+  patience: 10
+target_training:
+  maximum_epochs: 2500
+evaluation_horizons: [1, 2, 4, 8, 16, 32]
+runtime:
+  parallel_workers: 4
+  cpu_threads: 4
+  device: auto

@@ -105,15 +105,23 @@ class BRAIDModel(MainModel):
             args_pre['model2_Cz_Full']=False
             args_pre['allow_nonzero_Cz2']=True
             args_pre['has_UFT_reg']=False
-            sId_pre = MainModel(
+            sId_pre = getattr(self, 'preprocessing_model', None)
+            if sId_pre is None:
+                sId_pre = MainModel(
                     artifact_role="behaviour_preprocess",
-                    log_dir=(os.path.join(self.log_dir, "behaviour_preprocess")
-                             if self.log_dir else ""),
-                    missing_marker=self.missing_marker)
-            sId_pre.fit(Y, Z, U=U, nx=n_pre, n1=0,
-                    YType=YType, ZType=ZType, 
-                    Y_validation=Y_validation, Z_validation=Z_validation, U_validation=U_validation,
-                    **args_pre)
+                    log_dir=(
+                        os.path.join(self.log_dir, "behaviour_preprocess")
+                        if self.log_dir else ""
+                    ),
+                    missing_marker=self.missing_marker,
+                )
+                sId_pre.fit(
+                    Y, Z, U=U, nx=n_pre, n1=0,
+                    YType=YType, ZType=ZType,
+                    Y_validation=Y_validation,
+                    Z_validation=Z_validation,
+                    U_validation=U_validation, **args_pre,
+                )
         
             zPredRes1Train, _, _, _, _, _ = runPredict(sId_pre, Y=transposeIf(Y), Z=transposeIf(Z), U=transposeIf(U), YType=YType, ZType=ZType, useXFilt=False, missing_marker=self.missing_marker)
             if Y_validation is not None:
@@ -157,6 +165,7 @@ class BRAIDModel(MainModel):
             args['has_UFT_reg']=False
         sId = MainModel(
                 artifact_role="main",
+                frozen_stage1=getattr(self, "frozen_stage1", None),
                 log_dir=(os.path.join(self.log_dir, "main")
                          if self.log_dir else ""),
                 missing_marker=self.missing_marker)

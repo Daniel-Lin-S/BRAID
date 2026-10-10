@@ -23,6 +23,10 @@ FIT_ADAPTER_IDENTITY_EXCLUDED_CONSTANTS = frozenset({
 # Only certified numerical-equivalence pairs permit immutable bundle reuse.
 FITTING_REUSE = frozenset({
     (
+        "46b13713e9f884b4948786483f7b875b54493e87772e91a8e098c6bc97d6670c",
+        "c42f4c7d43da5675729ce75e66f738dd9a9b58ea0f6b53c5b667efa0d085619b",
+    ),
+    (
         "ad69a9feeccabcca1b324c2cec1cc391d4324d4b7e78e7fe3119493a01c29c5c",
         "46b13713e9f884b4948786483f7b875b54493e87772e91a8e098c6bc97d6670c",
     ),
@@ -48,6 +52,10 @@ FITTING_REUSE = frozenset({
     ),
 })
 INFERENCE_REUSE = frozenset({
+    (
+        "5f21a16941d35bfc41ea3da3610e3c5b3f1e7de36533548e1c3fadda936435a7",
+        "aa186cf5db457a9904ffe73bed7af941344b5c48a381f0b2a75a5cc57342a062",
+    ),
     (
         "ea27a870989f7ef6ee5d9baeacfda88dcf279ab6a12dd72e992108ecba817d87",
         "5f21a16941d35bfc41ea3da3610e3c5b3f1e7de36533548e1c3fadda936435a7",

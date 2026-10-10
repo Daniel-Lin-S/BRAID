@@ -728,8 +728,11 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
                     enable_forward_pred = False, # If true will enable forward prediction and handling of missing inputs by adding a separate set of Afw,Kfw,Cfw parameters
                     multi_step_with_A_KC = False, # If False, will use a separate Afw(x) for forward prediction, otherwise will use the same A(x)
                     observable_U_in_Cfw = False,  # If True, uses feedthrough in forward prediction
+                    frozen_module_weights=None,
                 ):
+        self.frozen_module_weights = frozen_module_weights
         self.constructor_kwargs = {
+            'frozen_module_weights': frozen_module_weights,
             'nx': nx, # RNN state dimension.  Input to A()
             'ny': ny, # RNN input dimension (ny+nu or n1+ny+nu). Input to K()
             'block_samples': block_samples, 
@@ -925,7 +928,43 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
                                     + [f'{self.rnn.name}_{step}step_state' for step in self.steps_ahead]\
                                     + [f'{self.rnn.name}_{step}step_internal_state' for step in self.steps_ahead]
 
+        self._apply_frozen_modules()
         self.compile()
+
+    def set_frozen_modules(self, weights: dict) -> None:
+        """Import named native mapping arrays and exclude them from fitting.
+
+        Parameters
+        ----------
+        weights : dict
+            Afw, Kfw, and/or C mapped to native weight-array lists.
+        """
+        self.frozen_module_weights = copy.deepcopy(weights)
+        self.constructor_kwargs['frozen_module_weights'] = copy.deepcopy(
+            weights
+        )
+        self._apply_frozen_modules()
+        self.compile()
+
+    def _apply_frozen_modules(self) -> None:
+        """Restore frozen mappings before compiling or rebuilding a graph."""
+        weights = getattr(self, 'frozen_module_weights', None) or {}
+        if set(weights) - {'Afw', 'Kfw', 'C'}:
+            raise ValueError('Only Afw, Kfw, and C can be imported.')
+        for name, values in weights.items():
+            if not hasattr(self.rnn.cell, name):
+                raise ValueError(f'Cannot freeze missing mapping {name}.')
+            mapping = getattr(self.rnn.cell, name)
+            expected = [value.shape for value in mapping.get_weights()]
+            actual = [value.shape for value in values]
+            if expected != actual:
+                raise ValueError(
+                    f'{name}: expected weight shapes {expected}, got {actual}.'
+                )
+            if any(not np.isfinite(value).all() for value in values):
+                raise ValueError(f'{name}: nonfinite transferred weights.')
+            mapping.set_weights(values)
+            mapping.trainable = False
 
     def compile(self):
         metrics = []

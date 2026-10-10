@@ -111,3 +111,5 @@ required to launch an experiment.
 | Fits and artifacts | [NHP artifacts](NHP_ARTIFACTS.md) | `artifacts.py`, `fitting.py`, `restart.py`, `analysis.py` |
 | Scores and figures | [NHP analysis](NHP_ANALYSIS.md) | `evaluation.py`, `reporting.py`, `plots.py`, `history.py` |
 | Launch, logs, and previews | [NHP runtime](NHP_RUNTIME.md) | `launcher.py`, `runner.py`, `runtime.py`, preview modules |
+
+For cross-session transfer experiments, see [Multi-session training](MULTI_SESSION_TRAINING.md).
