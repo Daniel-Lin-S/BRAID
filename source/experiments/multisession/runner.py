@@ -22,12 +22,15 @@ from experiments.storage.cache import atomic_json, fingerprint, writer_lock
 from experiments.configuration import read_yaml
 from experiments.datasets.nhp import NHPDataset
 from experiments.execution.runtime import select_gpus, thread_environment
+from experiments.multisession.queue import adopt_workers, resource_available
 from experiments.multisession.plan import (
     PRIMARY,
     build_plan,
     implementation_digest,
 )
-from experiments.multisession.store import completed, job, load_pickle
+from experiments.multisession.store import (
+    completed, fit_directory, job, load_pickle,
+)
 
 LOGGER = logging.getLogger(__name__)
 REPORT_INTERVAL_SECONDS = 300
@@ -86,7 +89,11 @@ def plan_campaign(settings: dict) -> tuple[dict, Path]:
                     name=name,
                     plan_id=identifier,
                     members={
-                        key: dict(state="pending", job=plan["jobs"][key])
+                        key: dict(
+                            state="pending",
+                            job=plan["jobs"][key],
+                            directory=str(fit_directory(plan, key)),
+                        )
                         for key in members
                     },
                 ),
@@ -97,16 +104,6 @@ def plan_campaign(settings: dict) -> tuple[dict, Path]:
         dict(Counter(x["kind"] for x in plan["jobs"].values())),
     )
     return plan, path
-
-
-def fit_directory(plan: dict, key: str) -> Path:
-    """Resolve the common immutable fit store independently of analyses."""
-    return (
-        Path(plan["settings"]["paths"]["artifact_root"])
-        / PRIMARY
-        / "fits"
-        / key
-    ).resolve()
 
 
 def run_job(plan: dict, key: str) -> None:
@@ -247,7 +244,11 @@ def reconcile(
                     if plan["jobs"][key]["kind"] == "preprocessing"
                 },
                 members={
-                    key: dict(state=states[key], job=plan["jobs"][key])
+                    key: dict(
+                        state=states[key],
+                        job=plan["jobs"][key],
+                        directory=str(fit_directory(plan, key)),
+                    )
                     for key in members
                 },
                 source_states={
@@ -260,15 +261,38 @@ def reconcile(
     return states
 
 
-def run_queue(plan: dict, path: Path, launch: Path, settings: dict) -> None:
+def run_queue(
+    plan: dict, path: Path, launch: Path, settings: dict,
+    previous_launch: Path | None = None,
+) -> None:
     """Schedule dependency-ready jobs on four memory-ranked GPU workers."""
-    devices = select_gpus(
-        settings["runtime"]["device"], settings["runtime"]["parallel_workers"]
-    )
+    if previous_launch is None:
+        devices = select_gpus(
+            settings["runtime"]["device"],
+            settings["runtime"]["parallel_workers"],
+        )
+        active = {}
+    else:
+        devices, active = adopt_workers(plan, previous_launch)
+        atomic_json(
+            launch / "adopted.json",
+            dict(
+                previous_launch=str(previous_launch.resolve()),
+                workers={
+                    str(slot): dict(job=key, pid=process.pid)
+                    for slot, (key, process) in active.items()
+                },
+            ),
+        )
+        LOGGER.info("Adopted %d existing workers", len(active))
     atomic_json(launch / "devices.json", devices)
     states = reconcile(plan, path)
     pending = {key for key, state in states.items() if state != "complete"}
-    failed, active = set(), {}
+    failed = set()
+    for key, _ in active.values():
+        pending.discard(key)
+        states[key] = "running"
+    LOGGER.info("Initial queue counts: %s", dict(Counter(states.values())))
     priorities = {'source': 0, 'preprocessing': 1,
                   'scratch': 2, 'adaptation': 3}
     ordered = sorted(plan['jobs'], key=lambda key: (
@@ -279,6 +303,7 @@ def run_queue(plan: dict, path: Path, launch: Path, settings: dict) -> None:
         plan['jobs'][key]['seed'], key,
     ))
     last_report = 0.0
+    reporting = None
     with writer_lock(path.parent / "coordinator.lock", blocking=False):
         while pending or active:
             for slot, device in enumerate(devices):
@@ -289,6 +314,7 @@ def run_queue(plan: dict, path: Path, launch: Path, settings: dict) -> None:
                         key
                         for key in ordered
                         if key in pending
+                        and resource_available(key, plan["jobs"], active)
                         and all(
                             states.get(p) == "complete"
                             for p in plan["jobs"][key]["dependencies"]
@@ -380,8 +406,14 @@ def run_queue(plan: dict, path: Path, launch: Path, settings: dict) -> None:
             )
             if changed:
                 reconcile(plan, path, states)
-                if time.monotonic() - last_report >= REPORT_INTERVAL_SECONDS:
-                    publish_reports(plan, path)
+                report_due = (
+                    time.monotonic() - last_report >= REPORT_INTERVAL_SECONDS
+                )
+                report_idle = (
+                    reporting is None or reporting.poll() is not None
+                )
+                if report_due and report_idle:
+                    reporting = start_report(path, launch, settings)
                     last_report = time.monotonic()
             ready_after_completion = any(
                 all(states.get(parent) == 'complete'
@@ -394,11 +426,27 @@ def run_queue(plan: dict, path: Path, launch: Path, settings: dict) -> None:
                 )
             if active:
                 time.sleep(5)
+        if reporting is not None:
+            reporting.wait()
         reconcile(plan, path, states)
         publish_reports(plan, path)
     if failed:
         LOGGER.error(
             "Campaign finished with %d failed/blocked jobs.", len(failed)
+        )
+
+
+def start_report(path: Path, launch: Path, settings: dict) -> subprocess.Popen:
+    """Render periodic reports on CPU without blocking GPU job dispatch."""
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="")
+    env.update(thread_environment(settings["runtime"]["cpu_threads"], 1))
+    command = [
+        sys.executable, "-m", "experiments.multisession.runner",
+        "--plan", str(path.resolve()), "--stage", "report",
+    ]
+    with (launch / "reports.log").open("a") as stream:
+        return subprocess.Popen(
+            command, env=env, stdout=stream, stderr=subprocess.STDOUT,
         )
 
 
@@ -424,6 +472,7 @@ def main() -> None:
     parser.add_argument("--job")
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--launch", type=Path)
+    parser.add_argument("--adopt-launch", type=Path)
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
@@ -435,10 +484,15 @@ def main() -> None:
         plan = json.loads(args.plan.read_text())
         run_job(plan, args.job)
         return
-    if args.experiment is None:
-        parser.error("--experiment is required")
-    settings = resolve(args.experiment)
-    plan, path = plan_campaign(settings)
+    if args.plan is not None:
+        path = args.plan.resolve()
+        plan = json.loads(path.read_text())
+        settings = plan["settings"]
+    else:
+        if args.experiment is None:
+            parser.error("--experiment or --plan is required")
+        settings = resolve(args.experiment)
+        plan, path = plan_campaign(settings)
     if args.stage == "plan":
         print(path.resolve())
         return
@@ -460,13 +514,15 @@ def main() -> None:
             sys.executable,
             "-m",
             "experiments.multisession.runner",
-            "--experiment",
-            str(args.experiment.resolve()),
+            "--plan",
+            str(path.resolve()),
             "--stage",
             "run",
             "--launch",
             str(launch),
         ]
+        if args.adopt_launch is not None:
+            command.extend(["--adopt-launch", str(args.adopt_launch.resolve())])
         with (launch / "coordinator.log").open("a") as stream:
             process = subprocess.Popen(
                 command,
@@ -484,7 +540,7 @@ def main() -> None:
         )
         print(f"Launched pid={process.pid}; logs: {launch.resolve()}")
         return
-    run_queue(plan, path, launch, settings)
+    run_queue(plan, path, launch, settings, args.adopt_launch)
 
 
 if __name__ == "__main__":

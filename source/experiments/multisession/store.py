@@ -21,6 +21,27 @@ from experiments.storage.cache import (
 )
 
 
+FIT_STORES = {
+    "scratch": "experiments/BRAID_matched_scratch",
+    "preprocessing": "experiments/BRAID_matched_preprocessing",
+}
+DEFAULT_FIT_STORE = "multi_session_training/fits"
+
+
+def fit_directory(plan: dict, key: str) -> Path:
+    """Resolve a fit from plan storage metadata, outside scientific identity.
+
+    Plans without storage metadata retain their original artifact locations.
+    Scratch checkpoints and preprocessing dependencies have shared namespaces
+    under experiments, accessible without an analysis-specific directory.
+    """
+    kind = plan["jobs"][key]["kind"]
+    relative = plan.get("storage", {}).get(kind, DEFAULT_FIT_STORE)
+    return (
+        Path(plan["settings"]["paths"]["artifact_root"]) / relative / key
+    ).resolve()
+
+
 def dump_pickle(path: Path, value: object) -> None:
     """Atomically write an internal model/array payload."""
     temporary = path.with_suffix(path.suffix + ".pending")

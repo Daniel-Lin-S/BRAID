@@ -56,10 +56,10 @@ def test_grid_and_membership():
         kind: sum(j["kind"] == kind for j in jobs.values())
         for kind in ("source", "adaptation", "scratch", "preprocessing")
     } == {
-        "source": 39,
-        "adaptation": 2340,
-        "scratch": 360,
-        "preprocessing": 180,
+        "source": 13,
+        "adaptation": 468,
+        "scratch": 72,
+        "preprocessing": 36,
     }
     assert set(plan["analyses"]) == set(ANALYSES)
     sources = [j for j in jobs.values() if j["kind"] == "source"]
@@ -388,8 +388,67 @@ def test_queue_isolates_failure_and_reuses_completion(tmp_path, monkeypatch):
         dict(uuid=f'GPU-{index}', index=index) for index in range(4)
     ])
     monkeypatch.setattr(runner, 'publish_reports', lambda *args: None)
+    monkeypatch.setattr(runner, 'start_report', lambda *args: None)
     monkeypatch.setattr(runner.time, 'sleep', lambda seconds: None)
     runner.run_queue(plan, path, launch, settings)
     status = json.loads((launch / 'status.json').read_text())
     assert status['counts'] == dict(complete=3, failed=1, blocked=1)
     assert set(started) == {'bad', 'good', 'independent'}
+
+
+def test_reduced_plan_reuses_source_and_target_identities(tmp_path):
+    """Grid membership and storage locations never change retained IDs."""
+    from experiments.multisession.store import FIT_STORES, fit_directory
+
+    settings = read_yaml(
+        ROOT / "assets/config/nhp/experiments/multi_session_training.yaml"
+    )
+    for key in ("data", "model"):
+        settings[key] = read_yaml(Path(settings["modules"][key]))
+    settings["paths"] = dict(artifact_root=str(tmp_path))
+    sessions = {s: dict(sha256=s) for s in settings["held_out_sessions"]}
+    sessions.update({f"source_{i}": dict(sha256=str(i)) for i in range(33)})
+    full = build_plan(
+        dict(settings, seeds=[42, 43, 44],
+             target_fractions=[0.05, 0.1, 0.2, 0.4, 0.8]),
+        sessions,
+    )
+    reduced = build_plan(settings, sessions)
+    for key, spec in reduced["jobs"].items():
+        assert full["jobs"][key] == spec
+        directory = fit_directory(reduced, key)
+        if spec["kind"] in FIT_STORES:
+            assert directory.is_relative_to(tmp_path / "experiments")
+        else:
+            assert directory.is_relative_to(tmp_path / PRIMARY)
+    legacy = dict(reduced)
+    legacy.pop("storage")
+    key = next(k for k, s in reduced["jobs"].items() if s["kind"] == "scratch")
+    assert fit_directory(legacy, key) == tmp_path / PRIMARY / "fits" / key
+
+
+def test_queue_shared_source_resource():
+    """Waiting for common preprocessing must not occupy another GPU."""
+    from experiments.multisession.queue import resource_available
+
+    spec = dict(kind="source", objective="behavior", seed=42,
+                sessions=["a", "b"])
+    jobs = dict(first=spec, second=dict(spec, sharing="AK"),
+                independent=dict(kind="scratch"))
+    active = {0: ("first", object())}
+    assert not resource_available("second", jobs, active)
+    assert resource_available("independent", jobs, active)
+    assert resource_available("second", jobs, {})
+
+
+def test_adopted_worker_pid_reuse(tmp_path, monkeypatch):
+    """An unrelated process reusing a worker PID is never adopted as live."""
+    from experiments.multisession import queue
+
+    plan = dict(jobs=dict(fit=dict(kind="source")),
+                settings=dict(paths=dict(artifact_root=str(tmp_path))))
+    monkeypatch.setattr(queue, "process_state", lambda pid: ("S", "old"))
+    worker = queue.AdoptedWorker(123, plan, "fit")
+    assert worker.poll() is None
+    monkeypatch.setattr(queue, "process_state", lambda pid: ("S", "new"))
+    assert worker.poll() == 1

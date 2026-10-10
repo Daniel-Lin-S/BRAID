@@ -12,6 +12,7 @@ import numpy as np
 
 from experiments.storage.cache import fingerprint, file_digest
 from experiments.storage.implementation import scientific_versions
+from experiments.multisession.store import FIT_STORES
 
 PRIMARY = "multi_session_training"
 CAPACITY = PRIMARY + "_capacity_sensitivity"
@@ -162,6 +163,7 @@ def build_plan(settings: dict, sessions: dict[str, dict]) -> dict:
                             memberships[SUPERVISION].append(adaptation)
     return dict(
         name=PRIMARY,
+        storage=dict(FIT_STORES),
         settings=deepcopy(settings),
         jobs=jobs,
         analyses=memberships,

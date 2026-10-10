@@ -17,9 +17,8 @@ from pathlib import Path
 import numpy as np
 
 from experiments.storage.cache import atomic_json, fingerprint
-from experiments.multisession.plan import PRIMARY
 from experiments.visualization.multisession import figures
-from experiments.multisession.store import completed, job
+from experiments.multisession.store import completed, fit_directory, job
 
 LOGGER = logging.getLogger(__name__)
 DESIGN = (
@@ -133,10 +132,9 @@ def paired_gains(rows: list[dict]) -> list[dict]:
 
 def collect(plan: dict, members: list[str]) -> tuple[list, list, list]:
     """Read metrics only from checksum-validated completed member fits."""
-    root = Path(plan["settings"]["paths"]["artifact_root"]) / PRIMARY / "fits"
     rows, dimensions, identities = [], [], []
     for key in members:
-        directory = root / key
+        directory = fit_directory(plan, key)
         record = completed(directory)
         if record is None:
             continue
@@ -188,7 +186,6 @@ def collect(plan: dict, members: list[str]) -> tuple[list, list, list]:
 
 def cost_tables(plan: dict, members: list[str], snapshot: Path) -> None:
     """Separate source costs from paired target component allowances."""
-    root = Path(plan["settings"]["paths"]["artifact_root"]) / PRIMARY / "fits"
     source_ids = {
         plan["jobs"][key]["source_fit"]
         for key in members
@@ -196,7 +193,7 @@ def cost_tables(plan: dict, members: list[str], snapshot: Path) -> None:
     }
     sources, targets = [], []
     for key in sorted(source_ids):
-        directory = root / key
+        directory = fit_directory(plan, key)
         if completed(directory) is None:
             continue
         for stage, record in json.loads(
@@ -216,7 +213,7 @@ def cost_tables(plan: dict, members: list[str], snapshot: Path) -> None:
             )
     dependencies = {plan["jobs"][key]["preprocessing"] for key in members}
     for key in sorted(set(members) | dependencies):
-        directory = root / key
+        directory = fit_directory(plan, key)
         if completed(directory) is None:
             continue
         budget = json.loads((directory / "budget.json").read_text())
