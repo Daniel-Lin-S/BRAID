@@ -5,7 +5,7 @@ runbook is [NHP experiments](QUICK_START.md).
 
 ## Evaluation
 
-`source/experiments/evaluation.py` scores held-out forecasts by horizon for
+`source/experiments/reports/evaluation.py` scores held-out forecasts by horizon for
 neural and behavior targets. It stores channelwise and aggregate CC, R², MSE,
 and constant-predictor baseline MSE. CC and R² are undefined for flat targets;
 an aggregate remains undefined when an included channel is undefined.

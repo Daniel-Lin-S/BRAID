@@ -32,7 +32,7 @@ scientific caches. CLI values override resolved settings for one invocation.
 
 ## BRAID adapter
 
-`source/experiments/braid_backend.py` adapts time-first experiment arrays to
+`source/experiments/models/braid_backend.py` adapts time-first experiment arrays to
 the native BRAID model. `build_cases()` expands configured latent sizes and
 population scales. It sets `n1` to the configured cap or `nx`, whichever is
 smaller; remaining latent dimensions form BRAID's residual `n2` stage.

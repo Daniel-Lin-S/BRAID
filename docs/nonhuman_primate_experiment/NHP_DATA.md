@@ -5,12 +5,12 @@ selection. The public runbook is [NHP experiments](QUICK_START.md).
 
 ## Dataset and preprocessing
 
-`source/experiments/nhp.py` reads Indy MATLAB 7.3 sessions for spike
+`source/experiments/datasets/nhp.py` reads Indy MATLAB 7.3 sessions for spike
 experiments. It produces time-first spike counts `Y`, behavior `Z`, targets
 `U`, timestamps `t`, and channel metadata. Waveform snippets are not
 continuous LFP and are excluded from this path.
 
-`source/experiments/nhp_lfp.py` pairs each `raw/indy_*.nwb` broadband
+`source/experiments/datasets/nhp_lfp.py` pairs each `raw/indy_*.nwb` broadband
 recording with its MATLAB task file. The configured ordered preprocessing
 pipeline converts broadband samples to volts and produces LFP `Y` on the same
 20-Hz behavior/target grid. Sample ticks must be continuous; isolated invalid
@@ -36,7 +36,7 @@ errors.
 
 ## Cache
 
-`source/experiments/cache.py` stores content-addressed session and fold
+`source/experiments/storage/cache.py` stores content-addressed session and fold
 entries under the configured cache root. A manifest records its identity and
 payload checksums. `reuse` accepts only a validated matching entry, `rebuild`
 creates a replacement entry, and `off` bypasses persistent cache reuse.

@@ -1,0 +1,1083 @@
+"""Render global summaries and in-memory per-session fold comparisons.
+
+Outputs are named target_metric_vs_parameter_selection.png figures. Failed
+observations are reported through warnings; pending comparisons are deferred.
+module does not load checkpoints, fit models or produce individual-fold plots.
+"""
+
+import logging
+from pathlib import Path
+import re
+
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+import numpy as np
+from PIL import Image
+
+from experiments.storage.cache import fingerprint
+from experiments.reports.outliers import iqr_outliers
+from experiments.visualization.presentation import (
+    METRIC_LABELS, configure_metric_axis, metric_axes,
+    metric_axis_settings,
+    outlier_rendering, parameter_axes, plot_metric_uncertainty,
+    presentation,
+    r2_display_limits,
+    save_figure, style_axis,
+)
+
+LOGGER = logging.getLogger("experiments.plots")
+READINESS_FIELDS = {
+    "pending", "expected_count", "completed_count", "completed_members",
+    "failed_members",
+}
+RESIDUAL_BRANCH = "residual"
+MAIN_ONLY_STYLE = ("-", "o")
+RESIDUAL_STYLE = (":", "s")
+EXCLUDED_CONDITIONS_PER_LINE = 2
+EXCLUDED_FOOTER_INCHES_PER_LINE = 0.24
+EXCLUDED_FOOTER_MINIMUM_INCHES = 0.65
+EXCLUDED_FOOTER_AXIS_GAP_INCHES = 0.8
+EXCLUDED_FOOTER_Y = 0.01
+COMPARISON_RENDERING_VERSION = 11
+FIGURE_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
+PARAMETER_LABELS = {
+    "horizon": "Forecast horizon (steps)",
+    "nx": "Latent dimension (nx)",
+    "population_scale": "Neural population (%)",
+}
+
+
+class PlotRenderingError(RuntimeError):
+    """Report renderer-local failures after all eligible figures run."""
+
+
+def curve_specs(settings: dict) -> list[dict]:
+    """Expand configured comparison designs into separate metric figures."""
+    result = []
+    for curve in settings.get("curves", []):
+        metrics = curve.get(
+            "metrics", settings.get("metrics", [curve["where"]["metric"]])
+        )
+        if not isinstance(metrics, list) or not metrics:
+            raise ValueError("Curve metrics must be a nonempty list.")
+        for metric in metrics:
+            if metric not in ("cc", "r2", "mse"):
+                raise ValueError(f"Unsupported comparison metric: {metric}")
+            where = dict(curve["where"], metric=metric)
+            zoom_multiple = curve.get("zoom_iqr_multiple")
+            zoom_group = curve.get("zoom_iqr_group")
+            if zoom_multiple is not None and (
+                isinstance(zoom_multiple, bool)
+                or not isinstance(zoom_multiple, (int, float))
+                or not np.isfinite(zoom_multiple)
+                or zoom_multiple <= 0
+            ):
+                raise ValueError(
+                    "Curve zoom_iqr_multiple must be a positive finite "
+                    "number."
+                )
+            valid_group = (
+                isinstance(zoom_group, str) and bool(zoom_group)
+            ) or (
+                isinstance(zoom_group, list)
+                and bool(zoom_group)
+                and all(
+                    isinstance(field, str) and field
+                    for field in zoom_group
+                )
+            )
+            if zoom_multiple is not None and not valid_group:
+                raise ValueError(
+                    "Curve zoom_iqr_group must contain nonempty field "
+                    "names when "
+                    "zoom_iqr_multiple is set."
+                )
+            parameter = curve["parameter"]
+            group = curve.get("group")
+            panel = curve.get("panel")
+            branch = curve.get("branch")
+            if branch is not None and branch != RESIDUAL_BRANCH:
+                raise ValueError(f"Unsupported comparison branch: {branch!r}")
+            if branch is not None and not group:
+                raise ValueError("A branched comparison requires a group.")
+            if panel:
+                if not group:
+                    raise ValueError("A panel comparison requires a group.")
+                if not isinstance(where.get(panel), list):
+                    raise ValueError(
+                        f"Panel field {panel!r} requires a list selection."
+                    )
+                target = where.get("target")
+                if isinstance(target, str):
+                    axis = (
+                        "population"
+                        if parameter == "population_scale"
+                        else parameter
+                    )
+                    scoring = where.get("evaluation_set", "all")
+                    name = (
+                        f"{target}_{metric}_vs_{axis}_by_{group}_"
+                        f"{scoring}"
+                    )
+                else:
+                    name = f"{metric}_vs_{parameter}_by_{group}"
+                result.append(dict(curve, where=where, name=name))
+                continue
+            selection = (
+                f"nx{where['nx']}"
+                if parameter == "horizon"
+                else f"horizon{where['horizon']}"
+            )
+            axis = (
+                "population" if parameter == "population_scale" else parameter
+            )
+            name = (
+                f"{where['target']}_{metric}_vs_{axis}_{selection}_"
+                f"{where['evaluation_set']}"
+            )
+            result.append(dict(curve, where=where, name=name))
+    destinations = set()
+    for spec in result:
+        directory = spec.get("subdirectory", "")
+        if directory and (
+            not isinstance(directory, str)
+            or FIGURE_COMPONENT.fullmatch(directory) is None
+        ):
+            raise ValueError(
+                f"Invalid curve subdirectory {directory!r}; expected one "
+                "safe folder name."
+            )
+        output_name = spec.get("output_name")
+        if output_name is not None:
+            if (
+                not isinstance(output_name, str)
+                or FIGURE_COMPONENT.fullmatch(output_name) is None
+            ):
+                raise ValueError(
+                    f"Invalid curve output_name {output_name!r}."
+                )
+            spec["name"] = f"{output_name}_{spec['where']['metric']}"
+        destination = (directory, spec["name"])
+        if destination in destinations:
+            raise ValueError(
+                f"Duplicate comparison destination: {destination!r}."
+            )
+        destinations.add(destination)
+    return result
+
+
+def matches(row: dict, where: dict) -> bool:
+    """Match scalar and multi-value selections without dropping missing rows."""
+    return all(
+        row[key] in value if isinstance(value, list) else row[key] == value
+        for key, value in where.items()
+    )
+
+
+def metric_curve(
+    rows: list[dict], spec: dict, style: dict,
+    outlier_style: dict | None = None,
+) -> object:
+    """Build one metric figure from means, uncertainties and x values."""
+    if not rows or not any(
+        row["mean"] is not None and np.isfinite(row["mean"]) for row in rows
+    ):
+        raise ValueError(f"No finite results for {spec['name']}.")
+    metric = spec["where"]["metric"]
+    outlier_style = outlier_rendering(
+        outlier_style or style.get("outlier_rendering")
+    )
+    panel = spec.get("panel")
+    panels = spec["where"][panel] if panel else [None]
+    figure, axes = plt.subplots(
+        1,
+        len(panels),
+        figsize=spec.get(
+            "figure_size",
+            style["horizon_size"] if panel else style["single_size"],
+        ),
+        sharey=spec.get("share_y", False),
+        squeeze=False,
+    )
+    zoom_multiple = spec.get("zoom_iqr_multiple")
+    zoom_exclusions = (
+        iqr_outliers(rows, zoom_multiple, spec["zoom_iqr_group"])
+        if zoom_multiple is not None
+        else []
+    )
+    excluded_ids = {id(row) for row in zoom_exclusions}
+    for axis, panel_value in zip(axes[0], panels):
+        panel_rows = (
+            [row for row in rows if row[panel] == panel_value]
+            if panel else rows
+        )
+        panel_exclusions = [
+            row for row in panel_rows if id(row) in excluded_ids
+        ]
+        _metric_axis(
+            axis, panel_rows, spec, style, panel_value, outlier_style,
+            panel_exclusions,
+            rows if spec.get("share_y", False) else panel_rows,
+            zoom_exclusions if spec.get("share_y", False)
+            else panel_exclusions,
+        )
+    if spec.get("share_y", False):
+        settings = style.get("metric_axes", {})
+        configure_metric_axis(axes[0][0], metric, settings)
+        configuration = metric_axis_settings(settings, metric)
+        if configuration:
+            for axis in axes[0][1:]:
+                axis.set_ylabel(configuration["label"])
+                style_axis(axis, style)
+    title = _metric_title(spec, metric)
+    context_label = spec.get("context_label")
+    if context_label:
+        title += f"\n{context_label}"
+    figure.suptitle(title, fontsize=style["title_font"], wrap=True)
+    footer_lines = []
+    if spec.get("mark_excluded_conditions", False):
+        footer_lines = _excluded_condition_footer(
+            rows, panel, panels, spec["where"]["target"]
+        )
+    if spec.get("branch") == RESIDUAL_BRANCH:
+        _add_residual_legends(figure, rows, spec, style)
+    elif panel:
+        handles, labels = axes[0][0].get_legend_handles_labels()
+        figure.legend(
+            handles,
+            labels,
+            loc="center left",
+            bbox_to_anchor=(0.99, 0.5),
+            frameon=False,
+            fontsize=style["legend_font"],
+        )
+    else:
+        axes[0][0].legend(
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1),
+            frameon=False,
+            fontsize=style["legend_font"],
+        )
+    if footer_lines:
+        width, height = figure.get_size_inches()
+        footer_height = max(
+            EXCLUDED_FOOTER_MINIMUM_INCHES,
+            len(footer_lines) * EXCLUDED_FOOTER_INCHES_PER_LINE,
+        )
+        reserved_height = (
+            footer_height + EXCLUDED_FOOTER_AXIS_GAP_INCHES
+        )
+        total_height = height + reserved_height
+        figure.set_size_inches(width, total_height)
+        figure.text(
+            0.5,
+            EXCLUDED_FOOTER_Y,
+            "\n".join(footer_lines),
+            ha="center",
+            va="bottom",
+            fontsize=style["legend_font"],
+        )
+        figure.tight_layout(rect=(0, reserved_height / total_height, 1, 1))
+    else:
+        figure.tight_layout()
+    return figure
+
+
+def _add_residual_legends(
+    figure: object, rows: list[dict], spec: dict, style: dict,
+) -> None:
+    """Render independent branch-style and optional horizon-color keys."""
+    legend_font = style["legend_font"]
+    branch_handles = [
+        Line2D(
+            [], [], color="black", linestyle=MAIN_ONLY_STYLE[0],
+            label="Main only",
+        ),
+        Line2D(
+            [], [], color="black", linestyle=RESIDUAL_STYLE[0],
+            label="Residual",
+        ),
+    ]
+    group = spec.get("group")
+    branch_y = 0.82 if group == "nx" else 0.72
+    figure.legend(
+        handles=branch_handles,
+        title="Model type",
+        loc="center left",
+        bbox_to_anchor=(0.99, branch_y),
+        frameon=False,
+        fontsize=legend_font,
+        title_fontsize=legend_font,
+    )
+    if group == "nx":
+        split_handles = []
+        for value, branch, selected, number in _comparison_series(rows, spec):
+            color, linestyle, marker = _group_style(
+                spec, value, number, style, branch
+            )
+            split = selected[-1]
+            split_handles.append(Line2D(
+                [], [], color=color, linestyle=linestyle, marker=marker,
+                label=f"n1={split['n1']}, n2={split['n2']}",
+            ))
+        figure.legend(
+            handles=split_handles,
+            title="Latent split",
+            loc="center left",
+            bbox_to_anchor=(0.99, 0.32),
+            frameon=False,
+            fontsize=legend_font,
+            title_fontsize=legend_font,
+        )
+        return
+    if group != "horizon":
+        return
+    values = sorted({row["horizon"] for row in rows})
+    color_handles = []
+    for number, value in enumerate(values):
+        color, _linestyle, _marker = _group_style(
+            spec, value, number, style, False
+        )
+        color_handles.append(Line2D(
+            [], [], color=color, linestyle="", marker="o",
+            label=_group_label("horizon", value),
+        ))
+    figure.legend(
+        handles=color_handles,
+        title="Forecast horizon",
+        loc="center left",
+        bbox_to_anchor=(0.99, 0.37),
+        frameon=False,
+        fontsize=legend_font,
+        title_fontsize=legend_font,
+    )
+
+
+def _metric_axis(
+    axis: object,
+    rows: list[dict],
+    spec: dict,
+    style: dict,
+    panel_value: object,
+    outlier_style: dict,
+    excluded_rows: list[dict],
+    range_rows: list[dict],
+    range_exclusions: list[dict],
+) -> None:
+    """Render grouped metric series for one target panel."""
+    parameter = spec["parameter"]
+    metric = spec["where"]["metric"]
+    excluded_ids = {id(row) for row in excluded_rows}
+    axis_settings = metric_axis_settings(style.get("metric_axes", {}), metric)
+    ceiling = axis_settings.get("uncertainty_ceiling")
+    lower_fraction = axis_settings.get("uncertainty_lower_fraction")
+    range_excluded_ids = {id(row) for row in range_exclusions}
+    display_limits = (
+        r2_display_limits(
+            [
+                row for row in range_rows
+                if id(row) not in range_excluded_ids
+                and not row.get("excluded_condition", False)
+            ],
+            style["metric_axes"],
+        )
+        if metric == "r2" and axis_settings else None
+    )
+    for value, branch, selected, number in _comparison_series(rows, spec):
+        x = np.array([row[parameter] for row in selected], dtype=float)
+        if parameter == "population_scale":
+            x *= 100
+        y = np.array(
+            [
+                np.nan if row["mean"] is None else row["mean"]
+                for row in selected
+            ],
+            dtype=float,
+        )
+        if not np.isfinite(y).all():
+            y[~np.isfinite(y)] = np.nan
+        excluded = np.asarray([
+            id(row) in excluded_ids for row in selected
+        ], dtype=bool)
+        y[excluded] = np.nan
+        color, linestyle, marker = _group_style(
+            spec, value, number, style, branch
+        )
+        axis.plot(
+            x,
+            y,
+            marker=marker,
+            linestyle=linestyle,
+            label=_series_label(spec, value, branch, selected),
+            color=color,
+        )
+        _plot_uncertainty(
+            axis, selected, x, y, color, metric, style,
+        )
+    ticks = sorted({row[parameter] for row in rows})
+    axis_configuration = parameter_axes(style)[parameter]
+    if axis_configuration["scale"] == "log":
+        if any(value <= 0 for value in ticks):
+            raise ValueError(
+                f"Log {parameter} axis requires positive ticks."
+            )
+        axis.set_xscale("log", base=axis_configuration["base"])
+    if parameter == "population_scale":
+        ticks = [100 * value for value in ticks]
+    axis.set_xticks(ticks, labels=[f"{value:g}" for value in ticks])
+    axis.set(
+        xlabel=PARAMETER_LABELS[parameter],
+        ylabel=(
+            METRIC_LABELS[metric]
+            if panel_value is not None and spec.get("panel") != "nx"
+            else f"{spec['where']['target'].capitalize()} "
+            f"{METRIC_LABELS[metric]}"
+        ),
+    )
+    _render_outlier_arrows(
+        axis, rows, parameter, outlier_style,
+        excluded_rows=excluded_rows,
+        range_rows=range_rows,
+        range_exclusions=range_exclusions,
+        upper_ceiling=ceiling,
+        lower_fraction=lower_fraction,
+        display_limits=display_limits,
+    )
+    if display_limits is not None:
+        axis.set_ylim(display_limits)
+    if panel_value is not None:
+        panel = spec.get("panel")
+        if panel == "n1" or (
+            panel == "nx" and spec.get("show_latent_split", False)
+        ):
+            splits = {(row["n1"], row["n2"]) for row in rows}
+            if len(splits) != 1:
+                raise ValueError(
+                    "Expected one latent split in panel "
+                    f"{panel}={panel_value}, got {sorted(splits)}."
+                )
+            n1, n2 = splits.pop()
+            nx = n1 + n2
+            if panel == "nx" and nx != panel_value:
+                raise ValueError(
+                    f"Panel nx={panel_value} has n1+n2={nx}."
+                )
+            panel_title = f"nx={nx}; n1={n1}, n2={n2}"
+        elif panel == "neural_decoder_width":
+            panel_title = f"Neural decoder width={panel_value}"
+        elif panel == "nx":
+            panel_title = f"nx={panel_value}"
+        else:
+            panel_title = str(panel_value).capitalize()
+        axis.set_title(panel_title)
+    if not spec.get("share_y", False):
+        configure_metric_axis(axis, metric, style.get("metric_axes", {}))
+    style_axis(axis, style)
+
+
+def _render_outlier_arrows(
+    axis: object, rows: list[dict], parameter: str, style: dict,
+    excluded_rows: list[dict] | None = None,
+    range_rows: list[dict] | None = None,
+    range_exclusions: list[dict] | None = None,
+    upper_ceiling: float | None = None,
+    lower_fraction: float | None = None,
+    display_limits: tuple[float, float] | None = None,
+) -> None:
+    """Zoom to normal summaries and arrow-label excluded finite values."""
+    excluded_rows = excluded_rows or []
+    range_rows = rows if range_rows is None else range_rows
+    range_exclusions = (
+        excluded_rows if range_exclusions is None else range_exclusions
+    )
+    excluded_ids = {id(row) for row in range_exclusions}
+    events = [
+        (row, event)
+        for row in rows
+        if not row.get("excluded_condition", False)
+        for event in row.get("outliers", [])
+    ]
+    events.extend(
+        (row, dict(
+            value=row["mean"],
+            member=(
+                f"nx={row.get('nx')}, "
+                f"population={row.get('population_scale')}"
+            ),
+        ))
+        for row in excluded_rows
+    )
+    if not events:
+        return
+    bounds = []
+    for row in range_rows:
+        if id(row) in excluded_ids:
+            continue
+        mean = row.get("mean")
+        if mean is None or not np.isfinite(mean):
+            continue
+        uncertainty = row.get("std", row.get("sem"))
+        if uncertainty is None or not np.isfinite(uncertainty):
+            uncertainty = 0.0
+        bounds.extend((mean - uncertainty, mean + uncertainty))
+    if not bounds:
+        raise ValueError(
+            "Cannot render configured outlier arrows without finite "
+            "normal observations."
+        )
+    lower, upper = min(bounds), max(bounds)
+    if lower_fraction is not None and lower <= 0:
+        positive = [value for value in bounds if value > 0]
+        if not positive:
+            raise ValueError("Log MSE axis has no positive normal values.")
+        lower = min(positive) * lower_fraction
+    if upper_ceiling is not None:
+        upper = min(upper, upper_ceiling)
+    span = upper - lower
+    if not np.isfinite(span) or span <= 0:
+        raise ValueError(
+            "Cannot render configured outlier arrows with a zero normal "
+            "metric range."
+        )
+    padding = span * style["zoom_padding_fraction"]
+    lower_edge, upper_edge = lower - padding, upper + padding
+    if lower_fraction is not None:
+        lower_edge = max(lower_edge, lower * lower_fraction)
+    if upper_ceiling is not None:
+        upper_edge = min(upper_edge, upper_ceiling)
+    clip_low, clip_high = lower, upper
+    if display_limits is not None:
+        lower_edge, upper_edge = display_limits
+        clip_low = max(clip_low, lower_edge)
+        clip_high = min(clip_high, upper_edge)
+    axis.set_ylim(lower_edge, upper_edge)
+    digits = style["label_significant_figures"]
+    arrows = []
+    for row, event in events:
+        value = event["value"]
+        x = row[parameter] * (100 if parameter == "population_scale" else 1)
+        if value < clip_low:
+            direction, edge = "↓", lower_edge
+        elif value > clip_high:
+            direction, edge = "↑", upper_edge
+        else:
+            direction, edge = "×", value
+            axis.plot(x, value, marker="x", color="black", linestyle="")
+        arrows.append((x, direction, edge, row, event))
+    arrows.sort(key=lambda item: (
+        item[0], item[1], item[3].get("nx", -1), item[4]["member"],
+    ))
+    offsets = {}
+    for x, direction, edge, _row, event in arrows:
+        key = (x, direction)
+        offset = offsets.get(key, 0)
+        offsets[key] = offset + 1
+        sign = -1 if direction == "↑" else 1
+        axis.annotate(
+            f"{direction} {event['value']:.{digits}g}",
+            xy=(x, edge),
+            xytext=(0, sign * (
+                style["label_offset_points"]
+                + offset * style["label_stack_points"]
+            )),
+            textcoords="offset points",
+            ha="center",
+            va="bottom" if direction == "↓" else "top",
+            arrowprops=dict(arrowstyle="->", color="black"),
+            annotation_clip=False,
+            fontsize=style["annotation_font"],
+        )
+
+
+def _excluded_condition_labels(rows: list[dict]) -> list[str]:
+    """Describe whole outlier-excluded conditions in deterministic order."""
+    excluded = [
+        row for row in rows if row.get("excluded_condition", False)
+    ]
+    if not excluded:
+        return []
+    labels = []
+    for row in sorted(excluded, key=lambda item: (
+        item.get("nx", -1), item.get("horizon", -1),
+        item.get("residual", False),
+    )):
+        branch = "residual" if row.get("residual", False) else "main"
+        labels.append(
+            f"nx={row['nx']:g}, h={row['horizon']:g}, {branch}"
+        )
+    return labels
+
+
+def _excluded_condition_footer(
+    rows: list[dict], panel: str | None, panels: list[object],
+    target: object,
+) -> list[str]:
+    """Build a footer isolated from plotted data and outlier callouts."""
+    lines = ["Whole-condition exclusions (not plotted):"]
+    for panel_value in panels:
+        selected = (
+            [row for row in rows if row[panel] == panel_value]
+            if panel else rows
+        )
+        labels = _excluded_condition_labels(selected)
+        if not labels:
+            continue
+        name = (
+            str(panel_value).capitalize()
+            if panel_value is not None
+            else str(target).capitalize()
+        )
+        for start in range(0, len(labels), EXCLUDED_CONDITIONS_PER_LINE):
+            prefix = name if start == 0 else f"{name} continued"
+            chunk = labels[start:start + EXCLUDED_CONDITIONS_PER_LINE]
+            lines.append(f"{prefix}: {'; '.join(chunk)}")
+    return lines if len(lines) > 1 else []
+
+
+def _comparison_series(
+    rows: list[dict],
+    spec: dict,
+) -> list[tuple[object, bool | None, list[dict], int]]:
+    """Return deterministic comparison series, optionally split by residuals."""
+    group = spec.get("group")
+    values = sorted({row[group] for row in rows}) if group else [None]
+    if spec.get("branch") is None:
+        return [
+            (
+                value,
+                None,
+                sorted(
+                    [row for row in rows if not group or row[group] == value],
+                    key=lambda row: row[spec["parameter"]],
+                ),
+                number,
+            )
+            for number, value in enumerate(values)
+        ]
+    result = []
+    for number, value in enumerate(values):
+        selected = [
+            row for row in rows if not group or row[group] == value
+        ]
+        main_only, residual = _residual_branches(selected, spec, value)
+        if main_only:
+            result.append((value, False, main_only, number))
+        if residual:
+            if spec["parameter"] == "nx":
+                residual = _add_shared_predecessor(main_only, residual)
+            result.append((value, True, residual, number))
+    return result
+
+
+def _residual_branches(
+    rows: list[dict],
+    spec: dict,
+    group_value: object,
+) -> tuple[list[dict], list[dict]]:
+    """Classify rows by n2 and reject ambiguous same-nx branch members."""
+    grouped = {False: {}, True: {}}
+    group = spec.get("group")
+    parameter = spec["parameter"]
+    for row in rows:
+        if "n1" not in row or "n2" not in row:
+            raise ValueError(
+                "Residual comparison requires n1 and n2 metric metadata."
+            )
+        n1, n2, nx = row["n1"], row["n2"], row["nx"]
+        if (
+            isinstance(n1, bool)
+            or isinstance(n2, bool)
+            or not isinstance(n1, int)
+            or not isinstance(n2, int)
+            or n1 < 1
+            or n2 < 0
+            or n1 + n2 != nx
+        ):
+            raise ValueError(
+                "Invalid residual dimensions for comparison: "
+                f"nx={nx!r}, n1={n1!r}, n2={n2!r}."
+            )
+        residual = n2 > 0
+        previous = grouped[residual].setdefault(nx, [])
+        if previous and (
+            previous[0]["n1"] != n1 or previous[0]["n2"] != n2
+        ):
+            label = f"{group}={group_value}" if group else "comparison"
+            raise ValueError(
+                f"Ambiguous residual branch for {label}, nx={nx}: "
+                f"(n1, n2)=({previous[0]['n1']}, {previous[0]['n2']}) "
+                f"and ({n1}, {n2})."
+            )
+        previous.append(row)
+    return (
+        _flatten_residual_branch(grouped[False], parameter, group, group_value),
+        _flatten_residual_branch(grouped[True], parameter, group, group_value),
+    )
+
+
+def _flatten_residual_branch(
+    rows: dict[int, list[dict]],
+    parameter: str,
+    group: str | None,
+    group_value: object,
+) -> list[dict]:
+    """Order one residual branch and reject repeated points on a line."""
+    result = []
+    for nx in sorted(rows):
+        values = sorted(rows[nx], key=lambda row: row[parameter])
+        if parameter == "nx" and len(values) > 1:
+            label = f"{group}={group_value}" if group else "comparison"
+            n1, n2 = values[0]["n1"], values[0]["n2"]
+            raise ValueError(
+                f"Duplicate residual branch point for {label}, nx={nx}, "
+                f"n1={n1}, n2={n2}."
+            )
+        result.extend(values)
+    return result
+
+
+def _add_shared_predecessor(
+    main_only: list[dict],
+    residual: list[dict],
+) -> list[dict]:
+    """Anchor a residual branch at its last completed shared predecessor."""
+    if not main_only or not residual:
+        return residual
+    first_residual_nx = residual[0]["nx"]
+    candidates = [
+        row for row in main_only
+        if row["nx"] < first_residual_nx
+        and row["mean"] is not None
+        and np.isfinite(row["mean"])
+        and not row.get("failed_members")
+    ]
+    if not candidates:
+        return residual
+    return [candidates[-1], *residual]
+
+
+def _plot_uncertainty(
+    axis: object, selected: list[dict], x: np.ndarray,
+    y: np.ndarray, color: str, metric: str, style: dict,
+) -> None:
+    """Render finite fold deviations or session errors on the metric axis."""
+    uncertainty = "std" if any("std" in row for row in selected) else "sem"
+    valid = [
+        index for index, row in enumerate(selected)
+        if np.isfinite(y[index])
+        and row.get(uncertainty) is not None
+        and np.isfinite(row[uncertainty])
+    ]
+    if not valid:
+        return
+    plot_metric_uncertainty(
+        axis, x[valid], y[valid],
+        np.asarray([selected[index][uncertainty] for index in valid]),
+        color, metric, style.get("metric_axes", {}),
+        4, style["tick_font"],
+    )
+
+def _group_style(
+    spec: dict,
+    value: object,
+    number: int,
+    style: dict,
+    branch: bool | None,
+) -> tuple[str, str, str]:
+    """Return redundant color, line and marker encodings for one series."""
+    if branch is not None:
+        colors = style["horizon_colors"]
+        color = colors[number % len(colors)]
+        linestyle, marker = RESIDUAL_STYLE if branch else MAIN_ONLY_STYLE
+        return color, linestyle, marker
+    group = spec.get("group")
+    if not spec.get("panel"):
+        color_index = {16: 0, 64: 1}.get(value, number)
+        color = style["pair_colors"][color_index % len(style["pair_colors"])]
+        return color, "-", "o"
+    color_index = number
+    if not isinstance(color_index, int) or color_index < 0 or (
+        color_index >= len(style["group_colors"])
+    ):
+        raise ValueError(
+            f"No configured comparison color for {group}={value}; "
+            "extend plotting.presentation.group_colors."
+        )
+    return (
+        style["group_colors"][color_index],
+        style["group_linestyles"][number % len(style["group_linestyles"])],
+        style["group_markers"][number % len(style["group_markers"])],
+    )
+
+
+def _series_label(
+    spec: dict,
+    value: object,
+    branch: bool | None,
+    selected: list[dict],
+) -> str:
+    """Format a concise legend label for a configured comparison series."""
+    group = spec.get("group")
+    if branch is None:
+        return _group_label(group, value)
+    branch_label = "residual" if branch else "main only"
+    if group == "horizon":
+        return f"{_group_label(group, value)}, {branch_label}"
+    if group == "nx":
+        row = selected[-1]
+        return f"nx={value}, n1={row['n1']}, n2={row['n2']}"
+    return f"{_group_label(group, value)}, {branch_label}"
+
+
+def _group_label(group: str | None, value: object) -> str:
+    """Format a concise legend label for one comparison series."""
+    if group == "horizon":
+        suffix = "step" if value == 1 else "steps"
+        return f"{value} {suffix}"
+    if group == "nx":
+        return f"nx={value}"
+    if group == "population_scale":
+        return f"{100 * value:g}%"
+    return "BRAID" if group is None else f"{group}={value}"
+
+
+def _metric_title(spec: dict, metric: str) -> str:
+    """Describe fixed selections or the two varying comparison dimensions."""
+    if spec.get("panel"):
+        target = spec["where"].get("target")
+        target_label = (
+            f"{target.capitalize()} " if isinstance(target, str) else ""
+        )
+        title = (
+            f"{target_label}{METRIC_LABELS[metric]} by "
+            f"{PARAMETER_LABELS[spec['parameter']]} and "
+            f"{PARAMETER_LABELS[spec['group']]}\n"
+            f"{spec['where']['evaluation_set']} scoring"
+        )
+        if spec.get("branch") == RESIDUAL_BRANCH:
+            title += "\nmain-only and residual branches"
+    else:
+        parameter = spec["parameter"]
+        target = spec["where"]["target"]
+        fixed = (
+            f"nx={spec['where']['nx']}"
+            if parameter == "horizon"
+            else f"horizon={spec['where']['horizon']}"
+        )
+        title = (
+            f"{target.capitalize()} {METRIC_LABELS[metric]}\n"
+            f"{fixed}; {spec['where']['evaluation_set']} scoring"
+        )
+    return title
+
+
+def comparison_rows(
+    chosen: list[dict], dependencies: list[dict], name: str,
+) -> list[dict]:
+    """Attach terminal dependency and missing-metric metadata to means.
+
+    Parameters
+    ----------
+    chosen : list of dict
+        Available aggregate metric rows for one figure.
+    dependencies : list of dict
+        Terminal expected points with contribution counts and member keys.
+    name : str
+        Figure identifier used in validation warnings.
+
+    Returns
+    -------
+    list of dict
+        Available means plus explicit gaps for unavailable results.
+    """
+    result = [dict(row) for row in chosen]
+    for candidate in dependencies:
+        criteria = {
+            key: value for key, value in candidate.items()
+            if key not in READINESS_FIELDS
+        }
+        row = next((
+            row for row in result
+            if all(row[key] == value for key, value in criteria.items())
+        ), None)
+        if row is None:
+            row = dict(
+                criteria,
+                mean=None,
+                sem=None,
+                std=None,
+                missing_members=list(candidate.get("completed_members", [])),
+            )
+            result.append(row)
+        row.update({
+            key: candidate[key]
+            for key in READINESS_FIELDS if key in candidate
+        })
+    for row in result:
+        row.setdefault("missing_members", [])
+        mean = row.get("mean")
+        if mean is not None and not np.isfinite(mean):
+            row["mean"] = None
+        if (
+            row.get("mean") is None
+            and not row["missing_members"]
+            and not row.get("failed_members")
+            and not row.get("excluded_condition", False)
+        ):
+            row["missing_members"] = list(
+                row.get("completed_members", [f"unidentified:{name}"])
+            )
+    return result
+
+def _comparison_signature(
+    rows: list[dict], dependencies: list[dict], spec: dict,
+    outlier_style: dict, presentation_style: dict,
+) -> str:
+    """Fingerprint values, dependencies and rendering configuration."""
+    return fingerprint(dict(
+        rendering_version=COMPARISON_RENDERING_VERSION,
+        rows=sorted(rows, key=repr),
+        dependencies=sorted(dependencies, key=repr),
+        curve={
+            key: value for key, value in spec.items()
+            if key != "context_label"
+        },
+        outlier_rendering=outlier_style,
+        presentation=presentation_style,
+    ))
+
+
+def _current_figure(path: Path, signature: str) -> bool:
+    """Return whether a readable PNG represents the current comparison."""
+    try:
+        with Image.open(path) as saved:
+            recorded = saved.info.get("BRAID-rendering")
+            saved.verify()
+    except (OSError, Image.DecompressionBombError):
+        LOGGER.warning("Redrawing damaged comparison PNG: %s", path)
+        return False
+    return recorded == signature
+
+
+def plot_suite(
+    summaries: list[dict],
+    root: Path,
+    settings: dict,
+    expected: list[dict] | None = None,
+    pending: bool = False,
+    rendered: set[str] | None = None,
+    namespace: str | None = None,
+    regenerate: bool = False,
+) -> None:
+    """Publish terminal comparisons and warn about unavailable results.
+
+    Parameters
+    ----------
+    summaries : list of dict
+        Aggregate metric means and uncertainty values.
+    root : Path
+        Destination for comparison PNG files.
+    settings : dict
+        Enabled flag, curve selections and presentation preferences.
+    expected : list of dict, optional
+        Per-point dependencies and readiness; default None.
+    pending : bool, optional
+        Defer without explicit dependencies when True; default False.
+    rendered : set of str, optional
+        Qualified figure names already handled in this invocation; default None.
+    namespace : str, optional
+        Figure namespace used for session-specific rendering; default None.
+    regenerate : bool, optional
+        Replace all figures; default False repairs missing, damaged or stale
+        figures while preserving current ones.
+    """
+    if not settings["enabled"]:
+        return
+    style = presentation(settings.get("presentation"))
+    outlier_style = outlier_rendering(settings.get("outlier_rendering"))
+    rendering_style = dict(
+        style,
+        outlier_rendering=outlier_style,
+        metric_axes=metric_axes(settings),
+        parameter_axes=parameter_axes(settings),
+    )
+    errors = []
+    warning_details = []
+    warning_members = set()
+    for configured_spec in curve_specs(settings):
+        spec = dict(configured_spec)
+        if namespace and namespace.startswith("session/"):
+            spec["mark_excluded_conditions"] = True
+        name = spec["name"]
+        directory = spec.get("subdirectory", "")
+        relative = Path(directory) / f"{name}.png"
+        render_key = (
+            f"{namespace}/{relative}" if namespace else str(relative)
+        )
+        path = root / relative
+        if rendered is not None and render_key in rendered:
+            continue
+        dependencies = [
+            row for row in expected or [] if matches(row, spec["where"])
+        ]
+        if any(row.get("pending", False) for row in dependencies) or (
+            pending and expected is None
+        ):
+            continue
+        chosen = [row for row in summaries if matches(row, spec["where"])]
+        try:
+            rows = comparison_rows(chosen, dependencies, name)
+            signature = _comparison_signature(
+                rows, dependencies, spec, outlier_style,
+                rendering_style,
+            )
+            if path.exists() and not regenerate and _current_figure(
+                path, signature
+            ):
+                if rendered is not None:
+                    rendered.add(render_key)
+                continue
+            if rendered is not None:
+                rendered.add(render_key)
+            failures = sorted({
+                member for row in rows
+                for member in row.get("failed_members", [])
+            })
+            missing = sorted({
+                member for row in rows
+                for member in row.get("missing_members", [])
+            })
+            if failures or missing:
+                counts = []
+                if failures:
+                    counts.append(f"{len(failures)} failed")
+                if missing:
+                    counts.append(f"{len(missing)} missing")
+                warning_details.append(
+                    f"{render_key} ({', '.join(counts)})"
+                )
+                warning_members.update(failures)
+                warning_members.update(missing)
+                if not any(
+                    row.get("mean") is not None
+                    and np.isfinite(row["mean"])
+                    for row in rows
+                ):
+                    continue
+            if namespace and namespace.startswith("session/"):
+                spec["context_label"] = namespace.removeprefix("session/")
+            figure = metric_curve(rows, spec, rendering_style)
+            save_figure(figure, path, style, signature)
+        except Exception as error:
+            LOGGER.exception("Comparison failed: %s", render_key)
+            errors.append(str(error))
+    if warning_members:
+        LOGGER.warning(
+            "Incomplete comparisons %s; affected members: %s",
+            "; ".join(warning_details),
+            ", ".join(sorted(warning_members)),
+        )
+    if errors:
+        raise PlotRenderingError(
+            "Comparison rendering failed: " + "; ".join(errors)
+        )

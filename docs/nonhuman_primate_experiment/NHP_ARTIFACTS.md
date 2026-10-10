@@ -5,7 +5,7 @@ runbook is [NHP experiments](QUICK_START.md).
 
 ## Fit identity and layout
 
-`source/experiments/artifacts.py` addresses a fit as:
+`source/experiments/storage/artifacts.py` addresses a fit as:
 
 ```text
 experiments/<model-name>_<settings-hash>/<session>/fold_<number>/<fit-id>/

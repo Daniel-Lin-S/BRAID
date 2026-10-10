@@ -1,1 +1,5 @@
-"""Configurable real-data experiments with pluggable datasets and models."""
+"""Configurable experiments grouped by scientific responsibility."""
+
+from ._compat import install
+
+install()
