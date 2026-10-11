@@ -605,3 +605,29 @@ def test_source_identity_ignores_only_target_dependencies(monkeypatch):
         lambda path: "changed" if path.name == "source.py" else original(path),
     )
     assert plan.implementation_digest("source") != baseline
+
+
+def test_quarantine_incomplete_components(tmp_path):
+    """A stage with events but no history is isolated on target retry."""
+    from experiments.multisession.store import (
+        quarantine_incomplete_components,
+    )
+
+    fit = tmp_path / "fits" / "fit-id"
+    root = tmp_path / "target_components" / "fit-id" / "main"
+    complete = root / "01_complete"
+    interrupted = root / "02_interrupted"
+    complete.mkdir(parents=True)
+    interrupted.mkdir()
+    (complete / "complete.json").write_text("{}")
+    event = interrupted / "train" / "events.out.tfevents.test"
+    event.parent.mkdir()
+    event.write_text("event")
+
+    moved = quarantine_incomplete_components(fit)
+
+    assert len(moved) == 1
+    assert (moved[0] / "train" / event.name).read_text() == "event"
+    assert (complete / "complete.json").exists()
+    assert not interrupted.exists()
+    assert quarantine_incomplete_components(fit) == []

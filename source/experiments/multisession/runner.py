@@ -31,6 +31,7 @@ from experiments.multisession.plan import (
 )
 from experiments.multisession.store import (
     completed, fit_directory, job, load_pickle,
+    quarantine_incomplete_components,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -180,6 +181,9 @@ def run_job(plan: dict, key: str) -> None:
             spec["target_training"]["maximum_epochs"],
         )
         atomic_json(directory / "arguments.json", arguments)
+        moved = quarantine_incomplete_components(directory)
+        for path in moved:
+            LOGGER.warning("Quarantined interrupted component: %s", path)
         seed = stable_seed(
             spec["session"],
             spec["fold"],
