@@ -356,6 +356,16 @@ def test_queue_isolates_failure_and_reuses_completion(tmp_path, monkeypatch):
         'dependent': dict(kind='adaptation', dependencies=['bad'], seed=42),
         'independent': dict(kind='adaptation', dependencies=['good'], seed=43),
     }
+    for spec in specs.values():
+        if spec['kind'] == 'source':
+            spec.update(
+                source_count=4, latent=32, objective='neural', sharing='A',
+            )
+        else:
+            spec.update(
+                session='held_out', fold=0, fraction=0.2,
+                latent=32, source_count=4, objective='neural', sharing='A',
+            )
     settings = dict(paths=dict(artifact_root=str(tmp_path)), runtime=dict(
         device='auto', parallel_workers=4, cpu_threads=4,
     ))
@@ -394,6 +404,52 @@ def test_queue_isolates_failure_and_reuses_completion(tmp_path, monkeypatch):
     status = json.loads((launch / 'status.json').read_text())
     assert status['counts'] == dict(complete=3, failed=1, blocked=1)
     assert set(started) == {'bad', 'good', 'independent'}
+    for key in started:
+        matches = list((launch / 'jobs').rglob(f'*__{key}.log'))
+        assert len(matches) == 1
+    assert not list(launch.glob('*.log'))
+
+
+def test_log_paths_and_analysis_manifest_are_compact(tmp_path):
+    """Keep readable worker logs and store job specifications only in plan."""
+    import json
+    from experiments.multisession.log_paths import job_log_path
+    from experiments.multisession.runner import reconcile
+
+    source = dict(
+        kind='source', seed=42, source_count=4, latent=32,
+        objective='neural', sharing='AK',
+    )
+    target = dict(
+        kind='adaptation', seed=42, session='held_out', fold=2,
+        fraction=0.2, latent=32, source_count=4,
+        objective='neural', sharing='AK',
+    )
+    jobs = {'source-id': source, 'target-id': target}
+    launch = tmp_path / 'logs'
+    source_log = job_log_path(launch, 'source-id', source)
+    target_log = job_log_path(launch, 'target-id', target)
+    assert source_log.parent == launch / 'jobs' / 'source'
+    assert target_log.parent == launch / 'jobs' / 'adaptation' / 'held_out'
+    assert 'fold2_labels20pct' in target_log.name
+    assert 'sources4_neural_AK' in target_log.name
+
+    plan = dict(
+        jobs=jobs,
+        settings=dict(paths=dict(artifact_root=str(tmp_path))),
+        analyses={PRIMARY: list(jobs)},
+    )
+    path = tmp_path / 'plans' / 'plan-id' / 'plan.json'
+    path.parent.mkdir(parents=True)
+    reconcile(plan, path, {key: 'pending' for key in jobs})
+    manifest = json.loads((
+        tmp_path / 'analysis' / PRIMARY / 'plan-id' / 'manifest.json'
+    ).read_text())
+    assert manifest['members'] == {
+        key: {'state': 'pending'} for key in jobs
+    }
+    assert 'source_states' not in manifest
+    assert 'preprocessing_states' not in manifest
 
 
 def test_reduced_plan_reuses_source_and_target_identities(tmp_path):

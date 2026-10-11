@@ -3,8 +3,8 @@
 Usage: python -m experiments.multisession.runner --experiment YAML --detach
 Stages: plan, run, report; worker is an internal subprocess interface.
 The artifact root contains multi_session_training/fits and immutable plans.
-Three separate analysis roots reference shared fit IDs. Launch records and
-worker logs contain absolute paths, process IDs, GPU assignments and failures.
+Three separate analysis roots reference shared fit IDs. status.json and
+coordinator.log stay at the launch root; jobs/ and diagnostics/ hold detail.
 """
 
 import argparse
@@ -22,6 +22,7 @@ from experiments.storage.cache import atomic_json, fingerprint, writer_lock
 from experiments.configuration import read_yaml
 from experiments.datasets.nhp import NHPDataset
 from experiments.execution.runtime import select_gpus, thread_environment
+from experiments.multisession.log_paths import job_label, job_log_path
 from experiments.multisession.queue import adopt_workers, resource_available
 from experiments.multisession.plan import (
     PRIMARY,
@@ -89,11 +90,7 @@ def plan_campaign(settings: dict) -> tuple[dict, Path]:
                     name=name,
                     plan_id=identifier,
                     members={
-                        key: dict(
-                            state="pending",
-                            job=plan["jobs"][key],
-                            directory=str(fit_directory(plan, key)),
-                        )
+                        key: dict(state="pending")
                         for key in members
                     },
                 ),
@@ -238,23 +235,9 @@ def reconcile(
                 name=name,
                 plan_id=path.parent.name,
                 counts=dict(Counter(states[key] for key in members)),
-                preprocessing_states={
-                    key: state
-                    for key, state in states.items()
-                    if plan["jobs"][key]["kind"] == "preprocessing"
-                },
                 members={
-                    key: dict(
-                        state=states[key],
-                        job=plan["jobs"][key],
-                        directory=str(fit_directory(plan, key)),
-                    )
+                    key: dict(state=states[key])
                     for key in members
-                },
-                source_states={
-                    key: state
-                    for key, state in states.items()
-                    if plan["jobs"][key]["kind"] == "source"
                 },
             ),
         )
@@ -339,7 +322,9 @@ def run_queue(
                 if ready is None:
                     continue
                 pending.remove(ready)
-                log = launch / f"{ready}.log"
+                spec = plan["jobs"][ready]
+                log = job_log_path(launch, ready, spec)
+                log.parent.mkdir(parents=True, exist_ok=True)
                 env = dict(os.environ)
                 env.update(
                     thread_environment(settings["runtime"]["cpu_threads"], 1)
@@ -366,11 +351,12 @@ def run_queue(
                         stdout=stream,
                         stderr=subprocess.STDOUT,
                     )
+                process.log = log
                 active[slot] = (ready, process)
                 states[ready] = "running"
                 LOGGER.info(
                     "Started %s pid=%d gpu=%d log=%s",
-                    ready,
+                    job_label(ready, spec),
                     process.pid,
                     device["index"],
                     log.resolve(),
@@ -389,7 +375,11 @@ def run_queue(
                 states[key] = "complete" if code == 0 and valid else "failed"
                 if states[key] == "failed":
                     failed.add(key)
-                LOGGER.info("Job %s %s exit=%d", key, states[key], code)
+                LOGGER.info(
+                    "Job %s %s exit=%d",
+                    job_label(key, plan["jobs"][key]),
+                    states[key], code,
+                )
                 changed = True
             while True:
                 blocked = {
@@ -414,7 +404,8 @@ def run_queue(
                     active={
                         str(slot): dict(
                             job=key, pid=proc.pid,
-                            log=str(getattr(proc, "log", launch / f"{key}.log")),
+                            label=job_label(key, plan["jobs"][key]),
+                            log=str(proc.log),
                         )
                         for slot, (key, proc) in active.items()
                     },
@@ -461,7 +452,9 @@ def start_report(path: Path, launch: Path, settings: dict) -> subprocess.Popen:
         sys.executable, "-m", "experiments.multisession.runner",
         "--plan", str(path.resolve()), "--stage", "report",
     ]
-    with (launch / "reports.log").open("a") as stream:
+    log = launch / "diagnostics" / "reporter.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with log.open("a") as stream:
         return subprocess.Popen(
             command, env=env, stdout=stream, stderr=subprocess.STDOUT,
         )

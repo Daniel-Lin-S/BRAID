@@ -65,7 +65,7 @@ def adopt_workers(plan: dict, launch: Path) -> tuple[list, dict]:
             ):
                 raise ValueError(f"PID {pid} is not the expected fit worker.")
         process = AdoptedWorker(pid, plan, key)
-        process.log = launch / f"{key}.log"
+        process.log = Path(worker["log"])
         active[int(slot)] = (key, process)
     return devices, active
 
