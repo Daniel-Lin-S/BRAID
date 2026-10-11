@@ -465,7 +465,7 @@ def publish_reports(plan: dict, path: Path) -> None:
     from experiments.multisession.reports import report
 
     try:
-        report(plan, path)
+        report(plan, path, final=True)
     except Exception:
         LOGGER.exception("Report generation failed; fitting will continue.")
 
