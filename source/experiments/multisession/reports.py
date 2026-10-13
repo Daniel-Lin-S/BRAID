@@ -29,8 +29,12 @@ from experiments.storage.cache import (
 from experiments.visualization.multisession import figures
 from experiments.multisession.store import completed, fit_directory, job
 from experiments.multisession.plan import CAPACITY, SUPERVISION
+from experiments.multisession.sensitivity import (
+    FILTER, RESIDUAL, SOURCE_COUNT,
+)
 
 LOGGER = logging.getLogger(__name__)
+RESIDUAL_STAGE_COUNT = 2
 DESIGN = (
     "objective",
     "latent",
@@ -252,6 +256,11 @@ def write_payload(
     directory: Path,
 ) -> None:
     """Write one report's tables and figures into an empty directory."""
+    if name in (FILTER, RESIDUAL):
+        write_sharing_payload(
+            plan, name, members, rows, dimensions, summary, directory
+        )
+        return
     write_table(directory / "raw_metrics.csv", rows)
     write_table(directory / "per_dimension.csv", dimensions)
     write_table(directory / "summary.csv", summary)
@@ -265,6 +274,83 @@ def write_payload(
             directory / "paired_gain_summary.csv", summarize(gain_rows)
         )
     figures(summary, name, directory, plan["settings"])
+
+
+def write_sharing_payload(
+    plan: dict,
+    name: str,
+    members: list[str],
+    rows: list[dict],
+    dimensions: list[dict],
+    summary: list[dict],
+    directory: Path,
+) -> None:
+    """Write nested tables and figures for the two new analysis roots."""
+    from experiments.visualization.sharing_sensitivity import (
+        source_figures, target_figures,
+    )
+    from experiments.multisession.source_validation import (
+        collect_source_validation,
+    )
+
+    tables = directory / "tables"
+    figures_root = directory / "figures"
+    tables.mkdir()
+    figures_root.mkdir()
+    conditions = (
+        ["AK", "AAK"] if name == FILTER else ["AAK", "AAK2"]
+    )
+    atomic_json(
+        tables / "design.json",
+        dict(
+            conditions=conditions,
+            source_count=SOURCE_COUNT,
+            source_update_ceiling={
+                "AK": [
+                    plan["settings"]["source_training"]["maximum_updates"]
+                ],
+                "AAK": [
+                    plan["settings"]["source_training"]["maximum_updates"]
+                ],
+                "AAK2": [
+                    plan["settings"]["source_training"]["maximum_updates"]
+                    // RESIDUAL_STAGE_COUNT
+                ] * RESIDUAL_STAGE_COUNT,
+            },
+            interpretation=(
+                "Stage-1 filter sharing comparison"
+                if name == FILTER
+                else "Two-stage package comparison; source architecture "
+                "and stage-1 exposure also change."
+            ),
+        ),
+    )
+    write_table(tables / "raw_metrics.csv", rows)
+    write_table(tables / "per_dimension.csv", dimensions)
+    write_table(tables / "summary.csv", summary)
+    write_table(tables / "session_metrics.csv", session_means(rows))
+    cost_tables(plan, members, tables)
+    gains = paired_gains(rows)
+    if gains:
+        write_table(tables / "paired_gain.csv", gains)
+        gain_rows = [dict(row, value=row["difference"]) for row in gains]
+        write_table(
+            tables / "paired_gain_summary.csv", summarize(gain_rows)
+        )
+    target_figures(summary, name, figures_root, plan["settings"])
+    if name == FILTER:
+        source_rows, source_losses = collect_source_validation(plan)
+        if source_rows:
+            write_table(
+                tables / "source_validation_metrics.csv", source_rows
+            )
+            write_table(
+                tables / "source_validation_loss.csv", source_losses
+            )
+            source_figures(
+                source_rows, source_losses,
+                figures_root / "source_validation",
+            )
 
 
 def report_path(analysis: Path, record: dict) -> Path:
@@ -287,8 +373,11 @@ def ready_checksums(directory: Path, fit_set_hash: str) -> None:
         "summary.csv",
         "session_metrics.csv",
     )
+    table_root = directory / "tables"
+    if not table_root.is_dir():
+        table_root = directory
     for name in required:
-        path = directory / name
+        path = table_root / name
         if not path.is_file() or path.stat().st_size == 0:
             raise ValueError(f"Missing or empty report payload: {path}")
     files = [p for p in directory.rglob("*") if p.is_file()]

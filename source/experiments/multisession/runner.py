@@ -73,7 +73,16 @@ def plan_campaign(settings: dict) -> tuple[dict, Path]:
             samples=len(session.arrays["t"]),
             channel_ids=session.arrays["ids"].tolist(),
         )
-    plan = build_plan(settings, sessions)
+    if settings["name"] == "multi_session_sharing_sensitivity":
+        from experiments.multisession.sensitivity import (
+            build_sensitivity_plan,
+        )
+
+        reference_path = Path(settings["reference_plan"]).resolve()
+        reference = json.loads(reference_path.read_text())
+        plan = build_sensitivity_plan(settings, sessions, reference)
+    else:
+        plan = build_plan(settings, sessions)
     identifier = fingerprint(dict(jobs=plan["jobs"], analyses=plan["analyses"]))
     root = Path(settings["paths"]["artifact_root"]).resolve()
     path = root / PRIMARY / "plans" / identifier / "plan.json"

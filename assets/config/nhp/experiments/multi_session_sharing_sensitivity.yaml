@@ -1,0 +1,3 @@
+extends: multi_session_training.yaml
+name: multi_session_sharing_sensitivity
+title: Multi-session sharing sensitivities

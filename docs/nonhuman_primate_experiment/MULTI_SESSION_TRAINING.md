@@ -8,6 +8,13 @@ bash scripts/train_multi_session.sh --experiment assets/config/nhp/experiments/m
 bash scripts/train_multi_session.sh --experiment assets/config/nhp/experiments/multi_session_training.local.yaml --stage report
 ```
 
+For the four-source sharing sensitivities, create an ignored
+multi_session_sharing_sensitivity.local.yaml extending
+multi_session_sharing_sensitivity.yaml and ../paths.local.yaml, and set
+reference_plan to the completed campaign plan.json. Run the same script
+with that local YAML. It validates completed reference fits before scheduling
+two source fits and 72 adaptations.
+
 The detached queue selects the four visible GPUs with the most free memory, including GPUs already in use, and starts one worker per selected GPU. Each worker has four CPU threads and TensorFlow memory growth. Unrelated processes are untouched. To hand over an authorized stopped coordinator, pass `--adopt-launch` with its launch directory; verified active workers finish without restart, and unoccupied slots are assigned by current free GPU memory. Repeating the launch resumes incomplete work and validates completed fits before reuse. A coordinator lock prevents duplicate queues for the same plan.
 
 ## Scientific design
@@ -26,6 +33,8 @@ Scratch controls share preprocessing, subset indices, initialization seeds, arch
 
 | Analysis identifier | Main comparison |
 |---|---|
+| multi_session_filter_sensitivity | Four-source AK versus A+AK single-stage neural training |
+| multi_session_residual_sharing_sensitivity | Four-source single-stage A+AK versus two-stage A+AK with shared residual dynamics |
 | `multi_session_training` | Source scaling and target-label scaling for the two sharing profiles |
 | `multi_session_training_capacity_sensitivity` | 32 → 32+32 versus 64 → 64+64 at 33 sources |
 | `multi_session_training_supervision_sensitivity` | Neural-only versus behavior-supervised source training at 33 sources |
@@ -50,7 +59,8 @@ The plan contains 13 source fits, 468 adaptations, 72 scratch controls, and 36 r
   latest_report.json
   reports/<snapshot_id>/
 <log_root>/multi_session_training/<launch_id>/
-  launch.json, devices.json, status.json, coordinator.log, <fit_id>.log
+  launch.json, devices.json, status.json, coordinator.log
+  jobs/<kind>/<session>/<readable_label>__<fit_id>.log
 ```
 
 Scratch fits and their preprocessing dependencies live in the shared experiments store. Each analysis manifest records the resolved fit directory. Other analyses can load `model.p`, `identity.json`, `selection.npz`, `metrics.json`, and the checksum-validated `complete.json` directly; storage location and analysis membership do not change fit identity.
@@ -60,6 +70,14 @@ Fit identities include scientific settings, source and target selections, seeds,
 Source records retain training-only normalization, original window indices, sampled windows per update, exposure counts, histories, best weights, final optimizer state, and component completion checksums. Target records retain selected indices, realized fractions, normalization, native checkpoints, component dependencies, allowed/consumed budgets, test predictions, masks, and per-dimension metrics.
 
 Reports retain CC, R², and MSE at horizons 1, 2, 4, 8, 16, and 32. `raw_metrics.csv`, `per_dimension.csv`, and `session_metrics.csv` retain fit-level, coordinate-level, and session-level results. `summary.csv` averages folds/repeats within each session before computing the four-session mean and SEM, with validity counts. `paired_gain.csv` and `paired_gain_summary.csv` compare matched scratch controls. `source_costs.csv` and `target_costs.csv` expose budgets and reusable component IDs. Manifests retain failure/completion accounting even before enough results exist to draw a figure.
+
+The two four-source sensitivity roots retain separate manifests and nested
+tables/, figures/target_transfer/{neural,behavior}/, and
+figures/source_validation/ output. Source-validation figures show CC on the
+same four source sessions and macro-validation loss over each fit's full
+source set. The residual comparison holds the total source-update ceiling at
+10,000 but allocates 5,000 per stage; it compares training packages because
+stage-1 exposure and architecture differ.
 
 Primary CC figures use logarithmic source-count and target-label axes, the prescribed ticks, profile colors, and dashed scratch references. Sensitivity figures encode exactly two conditions in color with separate matching-sharing panels. Neural/behavior outcomes and horizons have separate figures. Capacity-matched scratch results remain in tables. Report snapshots are immutable and the latest-report pointer advances as work completes.
 
