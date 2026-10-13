@@ -27,6 +27,7 @@ PREPROCESSING_SIZE = 150
 NEURAL_WIDTH = 256
 BEHAVIOR_WIDTH = 64
 COMPONENT_COUNT = 5
+NEURAL_STAGE_COUNT = 2
 
 
 def fit_component(
@@ -77,27 +78,39 @@ def behavior_targets(
 
 
 def residual_data(
-    main: MixedForecaster, decoder: ReadoutStage, data: list[dict]
+    main: MixedForecaster,
+    decoder: ReadoutStage | None,
+    data: list[dict],
 ) -> list[dict]:
-    """Prepare native residual neural filtering and forward dependencies."""
+    """Prepare residual neural inputs and additive stage-1 predictions."""
     from experiments.multisession.training import select_batch, MAX_HORIZON
 
     all_states = [[] for _ in data]
+    all_predictions = [[] for _ in data]
     for start in range(0, max(len(d["T"]) for d in data), 32):
         indices = [np.arange(start, min(start + 32, len(d["T"]))) for d in data]
         inputs, forward, _, _ = select_batch(data, indices)
-        _, states = main.forecast(
+        predictions, states = main.forecast(
             inputs, forward, tuple(range(1, MAX_HORIZON + 1))
         )
         for i in range(len(data)):
             if len(indices[i]):
                 all_states[i].append(states[i].numpy())
+                if decoder is None:
+                    all_predictions[i].append(predictions[i].numpy())
     result = []
-    for parts, row, readout in zip(all_states, data, decoder.models):
+    readouts = decoder.models if decoder is not None else [None] * len(data)
+    for parts, forecasts, row, readout in zip(
+        all_states, all_predictions, data, readouts
+    ):
         x = np.concatenate(parts, axis=1)
-        prior = np.stack(
-            [readout.apply_func(x[h - 1]).numpy() for h in HORIZONS]
-        )
+        if readout is None:
+            predicted = np.concatenate(forecasts, axis=1)
+            prior = predicted[np.asarray(HORIZONS) - 1]
+        else:
+            prior = np.stack(
+                [readout.apply_func(x[h - 1]).numpy() for h in HORIZONS]
+            )
         result.append(
             dict(
                 row,
@@ -118,19 +131,29 @@ def fit_source(
     settings: dict,
 ) -> None:
     """Execute the configured objective and publish transferable weights."""
+    if identity["objective"] not in (
+        "neural", "neural_residual", "behavior"
+    ):
+        raise ValueError(
+            f"Unknown source objective {identity['objective']}."
+        )
     latent = identity["latent"]
     sharing, seed = identity["sharing"], identity["seed"]
     supervised = identity["objective"] == "behavior"
+    two_stage = identity["objective"] == "neural_residual"
     stage_settings = deepcopy(settings)
     if supervised:
         stage_settings["maximum_updates"] //= COMPONENT_COUNT
+    if two_stage:
+        stage_settings["maximum_updates"] //= NEURAL_STAGE_COUNT
     base = {k: v for k, v in identity.items() if k != "sharing"}
     records = {}
     dimensions = [(d["Y"].shape[-1], d["Y"].shape[-1]) for d in train]
     neural_train = [recurrent_data(d) for d in train]
     neural_val = [recurrent_data(d) for d in validation]
     if not supervised:
-        model = MixedForecaster(dimensions, latent, sharing, seed)
+        stage1_sharing = "AAK" if two_stage else sharing
+        model = MixedForecaster(dimensions, latent, stage1_sharing, seed)
         records["neural"] = fit_component(
             model,
             neural_train,
@@ -140,6 +163,30 @@ def fit_source(
             stage_settings,
             seed,
         )
+        if two_stage:
+            residual = MixedForecaster(
+                dimensions,
+                latent,
+                "AAK",
+                seed + 4,
+                input_dimensions=[
+                    d[0] + latent + 2 for d in dimensions
+                ],
+                forward_dimensions=latent + 2,
+            )
+            records["residual"] = fit_component(
+                residual,
+                residual_data(model, None, neural_train),
+                residual_data(model, None, neural_val),
+                component_root,
+                dict(
+                    identity,
+                    stage="residual",
+                    parent=records["neural"]["component_id"],
+                ),
+                stage_settings,
+                seed + 4,
+            )
     else:
         pre = MixedForecaster(dimensions, PREPROCESSING_SIZE, "none", seed)
         records["preprocessing_neural"] = fit_component(
@@ -249,5 +296,11 @@ def fit_source(
             stage_settings,
             seed + 4,
         )
-    dump_pickle(directory / "shared.pkl", model.transferable())
+    transferable = model.transferable()
+    if two_stage:
+        transferable = dict(
+            stage1=transferable,
+            stage2=residual.transferable(),
+        )
+    dump_pickle(directory / "shared.pkl", transferable)
     atomic_json(directory / "components.json", records)

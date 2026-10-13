@@ -1163,6 +1163,11 @@ class MainModel(PredictorModel):
             if model1 is None:
                 raise ValueError('Frozen stage-1 weights require n1 > 0.')
             model1.set_frozen_modules(frozen)
+        frozen2 = getattr(self, 'frozen_stage2', None)
+        if frozen2:
+            if model2 is None:
+                raise ValueError('Frozen stage-2 weights require n2 > 0.')
+            model2.set_frozen_modules(frozen2)
         if trainableParams is not None:
             MainModelSetTrainableParameters(
                 model1=model1, model1_Cy=model1_Cy, model1_Cy_fw=model1_Cy_fw, 

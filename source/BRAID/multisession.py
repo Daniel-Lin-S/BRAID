@@ -90,7 +90,7 @@ class MixedForecaster:
         latent : int
             Common recurrent state width.
         sharing : str
-            none, A, AK, or AKC.
+            none, A, AK, AKC, or AAK (A, Afw, and Kfw).
         seed : int
             Paired initialization seed.
         decoder_width : int, optional
@@ -100,7 +100,7 @@ class MixedForecaster:
         forward_dimensions : int, optional
             Observable forward-input width; default 2.
         """
-        if sharing not in ("none", "A", "AK", "AKC"):
+        if sharing not in ("none", "A", "AK", "AKC", "AAK"):
             raise ValueError(f"Unknown sharing profile {sharing}.")
         self.latent, self.sharing = latent, sharing
         self.dimensions = dimensions
@@ -109,7 +109,9 @@ class MixedForecaster:
         tf.keras.utils.set_random_seed(seed)
         if sharing != "none":
             self.shared["Afw"] = mapping(latent, latent, 0, "shared_Afw")
-        if sharing in ("AK", "AKC"):
+        if sharing == "AAK":
+            self.shared["A"] = mapping(latent, latent, 0, "shared_A")
+        if sharing in ("AK", "AKC", "AAK"):
             self.shared["Kfw"] = mapping(
                 forward_dimensions, latent, 0, "shared_Kfw"
             )

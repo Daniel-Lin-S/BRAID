@@ -170,6 +170,13 @@ def fit_target(
     predictions = preprocessing_predictions(
         pre, arrays, preprocessing, implementation_digest("adaptation")
     )
+    nested = "stage1" in weights or "stage2" in weights
+    if nested and set(weights) != {"stage1", "stage2"}:
+        raise ValueError(
+            "Two-stage transfer requires both stage1 and stage2 maps."
+        )
+    stage1 = weights["stage1"] if nested else weights
+    stage2 = weights["stage2"] if nested else {}
     components = component_directory(directory)
     model = BRAIDModel(
         log_dir=str(components),
@@ -177,15 +184,20 @@ def fit_target(
         preprocessing_model=pre,
         preprocessing_predictions=predictions,
         main_initialization_seed=seed,
-        frozen_stage1=weights,
+        frozen_stage1=stage1,
+        frozen_stage2=stage2,
     )
     model.fit(**arrays, YType="cont", ZType="cont", UType="cont", **arguments)
     if model.hasBlownUp():
         raise FloatingPointError("Nonfinite target BRAID fit.")
-    for name, expected in weights.items():
-        actual = getattr(model.sId.model1.rnn.cell, name).get_weights()
-        for left, right in zip(expected, actual):
-            np.testing.assert_array_equal(left, right)
+    for stage, transferred in (
+        (model.sId.model1, stage1),
+        (model.sId.model2, stage2),
+    ):
+        for name, expected in transferred.items():
+            actual = getattr(stage.rnn.cell, name).get_weights()
+            for left, right in zip(expected, actual):
+                np.testing.assert_array_equal(left, right)
     save_snapshot(model, directory / "model.p")
     save_component_records(directory, components, arguments, model.sId)
     return model

@@ -937,7 +937,7 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
         Parameters
         ----------
         weights : dict
-            Afw, Kfw, and/or C mapped to native weight-array lists.
+            A, Afw, Kfw, and/or C mapped to native weight-array lists.
         """
         self.frozen_module_weights = copy.deepcopy(weights)
         self.constructor_kwargs['frozen_module_weights'] = copy.deepcopy(
@@ -949,8 +949,8 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
     def _apply_frozen_modules(self) -> None:
         """Restore frozen mappings before compiling or rebuilding a graph."""
         weights = getattr(self, 'frozen_module_weights', None) or {}
-        if set(weights) - {'Afw', 'Kfw', 'C'}:
-            raise ValueError('Only Afw, Kfw, and C can be imported.')
+        if set(weights) - {'A', 'Afw', 'Kfw', 'C'}:
+            raise ValueError('Only A, Afw, Kfw, and C can be imported.')
         for name, values in weights.items():
             if not hasattr(self.rnn.cell, name):
                 raise ValueError(f'Cannot freeze missing mapping {name}.')

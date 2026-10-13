@@ -219,6 +219,7 @@ class BRAIDModel(MainModel):
         sId = MainModel(
                 artifact_role="main",
                 frozen_stage1=getattr(self, "frozen_stage1", None),
+                frozen_stage2=getattr(self, "frozen_stage2", None),
                 log_dir=(os.path.join(self.log_dir, "main")
                          if self.log_dir else ""),
                 missing_marker=self.missing_marker)
