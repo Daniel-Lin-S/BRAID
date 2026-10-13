@@ -281,8 +281,10 @@ def test_nested_subsets_and_fixed_test():
                     )
 
 
-def test_reports_use_session_means_and_two_conditions(tmp_path, monkeypatch):
-    """Sensitivity legends have exactly the prescribed two conditions."""
+def test_reports_use_session_means_and_scratch_references(
+    tmp_path, monkeypatch
+):
+    """Sensitivity legends keep paired conditions and scratch references."""
     from experiments.multisession.reports import figures, summarize
     import matplotlib.figure
 
@@ -313,6 +315,18 @@ def test_reports_use_session_means_and_two_conditions(tmp_path, monkeypatch):
                         sem=0.1,
                     )
                 )
+    for latent in (32, 64):
+        summary.append(
+            dict(
+                base,
+                objective="scratch",
+                latent=latent,
+                sharing="scratch",
+                source_count=0,
+                mean=0.4,
+                sem=0.05,
+            )
+        )
     saved = []
 
     def capture(figure, path, **kwargs):
@@ -324,6 +338,11 @@ def test_reports_use_session_means_and_two_conditions(tmp_path, monkeypatch):
                     for legend in figure.legends
                     for t in legend.get_texts()
                 ],
+                {
+                    line.get_label(): line.get_linestyle()
+                    for axis in figure.axes
+                    for line in axis.lines
+                },
             )
         )
 
@@ -334,14 +353,29 @@ def test_reports_use_session_means_and_two_conditions(tmp_path, monkeypatch):
     for analysis in (CAPACITY, SUPERVISION):
         figures(summary, analysis, tmp_path, settings)
     assert saved
-    for name, labels in saved:
-        assert len(labels) == 2, (name, labels)
+    for name, labels, styles in saved:
+        for label in labels:
+            expected = "--" if label.startswith("Scratch") else "-"
+            assert styles[label] == expected, (name, label)
         if name.startswith("capacity"):
-            assert set(labels) == {"32 → 32+32", "64 → 64+64"}
+            assert set(labels) == {
+                "32 → 32+32",
+                "64 → 64+64",
+                "Scratch 32+32",
+                "Scratch 64+64",
+            }
         elif name.startswith("supervision"):
-            assert set(labels) == {"Neural-only", "Behavior-supervised"}
+            assert set(labels) == {
+                "Neural-only",
+                "Behavior-supervised",
+                "Scratch BRAID",
+            }
         else:
-            assert set(labels) == {"A1_fw + K1_fw", "A1_fw + K1_fw + Cz"}
+            assert set(labels) == {
+                "A1_fw + K1_fw",
+                "A1_fw + K1_fw + Cz",
+                "Scratch BRAID",
+            }
 
 
 def test_queue_isolates_failure_and_reuses_completion(tmp_path, monkeypatch):

@@ -6,7 +6,9 @@ from pathlib import Path
 import pytest
 
 from experiments.multisession import reports
-from experiments.multisession.plan import PRIMARY
+from experiments.multisession.plan import (
+    CAPACITY, PRIMARY, SUPERVISION,
+)
 from experiments.multisession.store import completed
 
 
@@ -100,3 +102,57 @@ def test_rolling_report_replaces_only_validated_output(
     renders = state["renders"]
     reports.report(plan, path, final=True)
     assert state["renders"] == renders
+
+
+def test_sensitivity_figure_revision_preserves_final_reports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plot-only refresh reuses completed figures and retains final tables."""
+    from experiments.multisession.store import job
+
+    plan_id = "plan-id"
+    plan = dict(
+        settings=dict(
+            paths=dict(artifact_root=str(tmp_path)),
+            target_fractions=[0.2],
+            source_counts=[33],
+            evaluation_horizons=[1],
+        )
+    )
+    plan_path = tmp_path / "plans" / plan_id / "plan.json"
+    plan_path.parent.mkdir(parents=True)
+    rendered = []
+    for name in (CAPACITY, SUPERVISION):
+        analysis = tmp_path / "analysis" / name / plan_id
+        snapshot = analysis / "reports" / "final"
+        with job(snapshot, dict(report=name)) as needed:
+            assert needed
+            (snapshot / "summary.csv").write_text(
+                "objective,latent,sharing,source_count,fraction,target,"
+                "horizon,metric,mean,sem\n"
+                "neural,32,A,33,0.2,neural,1,cc,0.5,0.1\n"
+            )
+        (analysis / "latest_report.json").write_text(
+            json.dumps(dict(mode="final", snapshot="reports/final"))
+        )
+
+    def render(_rows: list, name: str, directory: Path, settings: dict) -> None:
+        rendered.append(name)
+        families = ("capacity",) if name == CAPACITY else (
+            "supervision", "decoder"
+        )
+        for family in families:
+            for target in ("behavior", "neural"):
+                (directory / f"{family}_{target}_h1.png").write_bytes(b"png")
+
+    monkeypatch.setattr(reports, "figures", render)
+    reports.refresh_sensitivity_figures(plan, plan_path)
+    reports.refresh_sensitivity_figures(plan, plan_path)
+    assert rendered == [CAPACITY, SUPERVISION]
+    for name, count in ((CAPACITY, 2), (SUPERVISION, 4)):
+        analysis = tmp_path / "analysis" / name / plan_id
+        pointer = json.loads((analysis / "latest_figures.json").read_text())
+        assert pointer["figure_count"] == count
+        assert pointer["source_report"] == "reports/final"
+        assert completed(analysis / pointer["snapshot"]) is not None
+        assert completed(analysis / "reports" / "final") is not None

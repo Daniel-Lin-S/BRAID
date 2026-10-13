@@ -1,7 +1,9 @@
 """Launch and resume Multi-session training without touching other campaigns.
 
 Usage: python -m experiments.multisession.runner --experiment YAML --detach
-Stages: plan, run, report; worker is an internal subprocess interface.
+Figure revision:
+  python -m experiments.multisession.runner --plan PLAN --stage figures
+Stages: plan, run, report, figures; worker is an internal subprocess interface.
 The artifact root contains multi_session_training/fits and immutable plans.
 Three separate analysis roots reference shared fit IDs. status.json and
 coordinator.log stay at the launch root; jobs/ and diagnostics/ hold detail.
@@ -479,7 +481,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--experiment", type=Path)
     parser.add_argument(
-        "--stage", choices=("plan", "run", "worker", "report"), default="run"
+        "--stage", choices=("plan", "run", "worker", "report", "figures"),
+        default="run"
     )
     parser.add_argument("--detach", action="store_true")
     parser.add_argument("--plan", type=Path)
@@ -515,6 +518,13 @@ def main() -> None:
 
         reconcile(plan, path)
         report(plan, path)
+        return
+    if args.stage == "figures":
+        from experiments.multisession.reports import (
+            refresh_sensitivity_figures,
+        )
+
+        refresh_sensitivity_figures(plan, path)
         return
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     launch = args.launch or (

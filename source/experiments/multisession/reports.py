@@ -6,7 +6,8 @@ raw_metrics.csv contains fit/session/fold/seed, design, metric and value;
 per_dimension.csv retains coordinate scores. summary.csv averages repeats
 and folds within sessions before computing mean/SEM across sessions.
 paired_gain.csv compares each transfer fit with its matched scratch control.
-latest_report.json points to the validated live or final report.
+latest_report.json points to the validated live or final report. Figure-only
+revisions live under figures/ and latest_figures.json, without copying tables.
 """
 
 from collections import defaultdict
@@ -27,6 +28,7 @@ from experiments.storage.cache import (
 )
 from experiments.visualization.multisession import figures
 from experiments.multisession.store import completed, fit_directory, job
+from experiments.multisession.plan import CAPACITY, SUPERVISION
 
 LOGGER = logging.getLogger(__name__)
 DESIGN = (
@@ -440,3 +442,102 @@ def report(
                     plan, name, members, rows, dimensions, summary,
                     analysis, fit_set_hash, len(identities),
                 )
+
+
+def read_summary(path: Path) -> list[dict]:
+    """Read final aggregate scores for figure-only publication.
+
+    Parameters
+    ----------
+    path : Path
+        Final summary.csv with design keys, mean, SEM, and session counts.
+
+    Returns
+    -------
+    list[dict]
+        Numeric fields restored for the sensitivity renderer.
+    """
+    with path.open(newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    if not rows:
+        raise ValueError(f"Final summary has no rows: {path.resolve()}")
+    for row in rows:
+        for name in ("latent", "source_count", "horizon"):
+            row[name] = int(row[name])
+        for name in ("fraction", "mean"):
+            row[name] = float(row[name])
+        row["sem"] = float(row["sem"]) if row["sem"] else None
+        values = [row["fraction"], row["mean"]]
+        if row["sem"] is not None:
+            values.append(row["sem"])
+        if not np.isfinite(values).all():
+            raise ValueError(f"Nonfinite final summary row: {path.resolve()}")
+    return rows
+
+
+def refresh_sensitivity_figures(plan: dict, plan_path: Path) -> None:
+    """Publish immutable figure revisions from completed sensitivity reports.
+
+    The final report and its tables remain untouched. Each sensitivity root
+    gains figures/scratch-baselines-<id>/ and a latest_figures.json pointer.
+    """
+    root = Path(plan["settings"]["paths"]["artifact_root"]) / "analysis"
+    renderer = Path(figures.__code__.co_filename)
+    for name in (CAPACITY, SUPERVISION):
+        analysis = root / name / plan_path.parent.name
+        pointer = analysis / "latest_report.json"
+        if not pointer.is_file():
+            raise ValueError(
+                f"Missing final report pointer: {pointer.resolve()}"
+            )
+        record = json.loads(pointer.read_text())
+        snapshot = report_path(analysis, record)
+        if record.get("mode") != "final" or completed(snapshot) is None:
+            raise ValueError(f"Sensitivity report is not final: {analysis}")
+        summary_path = snapshot / "summary.csv"
+        identity = dict(
+            analysis=name,
+            final_report_checksum=file_digest(summary_path),
+            renderer_checksum=file_digest(renderer),
+            fractions=plan["settings"]["target_fractions"],
+            source_counts=plan["settings"]["source_counts"],
+            horizons=plan["settings"]["evaluation_horizons"],
+        )
+        directory = (
+            analysis / "figures"
+            / f"scratch-baselines-{fingerprint(identity)[:12]}"
+        )
+        families = (
+            ("capacity",)
+            if name == CAPACITY
+            else ("supervision", "decoder")
+        )
+        expected = {
+            f"{family}_{target}_h{horizon}.png"
+            for family in families
+            for target in ("behavior", "neural")
+            for horizon in identity["horizons"]
+        }
+        with job(directory, identity) as needed:
+            if needed:
+                figures(
+                    read_summary(summary_path),
+                    name,
+                    directory,
+                    plan["settings"],
+                )
+                missing = expected - {
+                    path.name for path in directory.glob("*.png")
+                }
+                if missing:
+                    raise ValueError(
+                        f"Missing sensitivity figures: {sorted(missing)}"
+                    )
+        atomic_json(
+            analysis / "latest_figures.json",
+            dict(
+                snapshot=str(directory.relative_to(analysis)),
+                source_report=record["snapshot"],
+                figure_count=len(expected),
+            ),
+        )

@@ -217,6 +217,40 @@ def figures(
                                 label,
                                 color,
                             )
+                        if family == "capacity":
+                            for latent, color in (
+                                (32, "#2878b5"),
+                                (64, "#e28528"),
+                            ):
+                                any_data |= curve(
+                                    axis,
+                                    summary,
+                                    dict(
+                                        common,
+                                        latent=latent,
+                                        sharing="scratch",
+                                    ),
+                                    parameter,
+                                    ticks,
+                                    f"Scratch {latent}+{latent}",
+                                    color,
+                                    "--",
+                                )
+                        else:
+                            any_data |= curve(
+                                axis,
+                                summary,
+                                dict(
+                                    common,
+                                    latent=32,
+                                    sharing="scratch",
+                                ),
+                                parameter,
+                                ticks,
+                                LABELS["scratch"],
+                                COLORS["scratch"],
+                                "--",
+                            )
                         axis.set_title(
                             LABELS[panel]
                             if family != "decoder"
@@ -250,13 +284,24 @@ def figures(
                     figure.suptitle(
                         f"{target.capitalize()} · horizon {horizon}"
                     )
+                    legend_columns = (
+                        len(handles)
+                        if analysis == PRIMARY
+                        else 1 if family == "decoder"
+                        else min(2, len(handles))
+                    )
                     figure.legend(
                         handles.values(),
                         handles.keys(),
                         loc="lower center",
-                        ncol=len(handles),
+                        ncol=legend_columns,
                     )
-                    figure.tight_layout(rect=(0, 0.08, 1, 0.95))
+                    bottom = (
+                        0.08 if analysis == PRIMARY
+                        else 0.23 if family == "decoder"
+                        else 0.16
+                    )
+                    figure.tight_layout(rect=(0, bottom, 1, 0.95))
                     figure.savefig(
                         directory / f"{family}_{target}_h{horizon}.png", dpi=150
                     )
