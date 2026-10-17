@@ -24,6 +24,18 @@ LINEAR = dict(
     output_activation="linear",
     kernel_initializer="uniform",
 )
+SHARED_MODULES = {
+    "none": (),
+    "A": ("Afw",),
+    "AA": ("A", "Afw"),
+    "AK": ("Afw", "Kfw"),
+    "AKC": ("Afw", "Kfw", "C"),
+    "AAK": ("A", "Afw", "Kfw"),
+    "A2": ("A",),
+    "A2_fw": ("Afw",),
+    "K2_fw": ("Kfw",),
+    "A2_A2_fw_K2_fw": ("A", "Afw", "Kfw"),
+}
 
 
 def mapping(
@@ -90,7 +102,7 @@ class MixedForecaster:
         latent : int
             Common recurrent state width.
         sharing : str
-            none, A, AK, AKC, or AAK (A, Afw, and Kfw).
+            Named set of mapping modules shared across source sessions.
         seed : int
             Paired initialization seed.
         decoder_width : int, optional
@@ -100,22 +112,23 @@ class MixedForecaster:
         forward_dimensions : int, optional
             Observable forward-input width; default 2.
         """
-        if sharing not in ("none", "A", "AK", "AKC", "AAK"):
+        if sharing not in SHARED_MODULES:
             raise ValueError(f"Unknown sharing profile {sharing}.")
         self.latent, self.sharing = latent, sharing
         self.dimensions = dimensions
         self.forward_dimensions = forward_dimensions
         self.shared = {}
         tf.keras.utils.set_random_seed(seed)
-        if sharing != "none":
+        modules = SHARED_MODULES[sharing]
+        if "Afw" in modules:
             self.shared["Afw"] = mapping(latent, latent, 0, "shared_Afw")
-        if sharing == "AAK":
+        if "A" in modules:
             self.shared["A"] = mapping(latent, latent, 0, "shared_A")
-        if sharing in ("AK", "AKC", "AAK"):
+        if "Kfw" in modules:
             self.shared["Kfw"] = mapping(
                 forward_dimensions, latent, 0, "shared_Kfw"
             )
-        if sharing == "AKC":
+        if "C" in modules:
             widths = {d[1] for d in dimensions}
             if len(widths) != 1:
                 raise ValueError("Shared Cz requires identical coordinates.")

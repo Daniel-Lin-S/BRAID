@@ -1,9 +1,9 @@
-"""Build two four-source sensitivity roots from completed reference jobs.
+"""Plan matched Indy and Indy-to-Loco sharing comparisons.
 
-Inputs are resolved scientific settings, current source fingerprints, and an
-immutable completed reference plan. Output is a dependency-linked plan whose
-new jobs coexist with unchanged source, preprocessing, scratch, and adaptation
-identities. No completed fit payload is copied or rewritten.
+Inputs are a completed four-source sensitivity plan, its source and target
+fingerprints, and four explicitly selected Loco targets. The output plan has
+four separate analysis memberships and fit-store overrides for Loco jobs.
+Completed source and Indy target identities remain unchanged.
 """
 
 from copy import deepcopy
@@ -15,165 +15,308 @@ from experiments.multisession.store import completed, fit_directory
 FILTER = "multi_session_filter_sensitivity"
 RESIDUAL = "multi_session_residual_sharing_sensitivity"
 CAMPAIGN = "multi_session_sharing_sensitivity"
-REFERENCE_PROFILE = "AK"
-FILTER_PROFILE = "AAK"
-RESIDUAL_PROFILE = "AAK2"
+DIRECTION = "indy_to_loco"
+FILTER_PROFILES = ("scratch", "A", "AA", "AK", "AAK")
+RESIDUAL_PROFILES = (
+    "A", "A2", "A2_fw", "K2_fw", "A2_A2_fw_K2_fw",
+)
+STAGE2_PROFILES = RESIDUAL_PROFILES[1:]
 SOURCE_COUNT = 4
 LATENT_SIZE = 32
 SEED = 42
+TARGET_COUNT = 36
+LOCO_STORES = {
+    "adaptation": "multi_session_training/indy_to_loco/fits",
+    "scratch": "experiments/BRAID_indy_to_loco_matched_scratch",
+    "preprocessing": (
+        "experiments/BRAID_indy_to_loco_matched_preprocessing"
+    ),
+}
 
 
-def _reference_jobs(reference: dict) -> tuple[str, list[str], list[str]]:
-    """Locate the paired old source, target, and scratch job identifiers."""
+def target_key(spec: dict) -> tuple:
+    """Identify one matched session, fold, and target fraction."""
+    return spec["session"], spec["fold"], spec["fraction"]
+
+
+def reference_jobs(reference: dict) -> tuple[dict, dict, dict]:
+    """Find the completed four-source fits and matched target controls."""
     jobs = reference["jobs"]
-    sources = [
-        key for key, spec in jobs.items()
-        if spec["kind"] == "source"
-        and spec["objective"] == "neural"
-        and spec["latent"] == LATENT_SIZE
-        and spec["seed"] == SEED
-        and spec["sharing"] in ("A", "AK")
-    ]
-    baseline = [
-        key for key, spec in jobs.items()
-        if spec["kind"] == "adaptation"
-        and spec["source_count"] == SOURCE_COUNT
-        and spec["objective"] == "neural"
-        and spec["latent"] == LATENT_SIZE
-        and spec["sharing"] == REFERENCE_PROFILE
-        and spec["seed"] == SEED
-    ]
-    scratch = [
-        key for key, spec in jobs.items()
-        if spec["kind"] == "scratch"
-        and spec["latent"] == LATENT_SIZE
-        and spec["seed"] == SEED
-    ]
-    matching = [
-        key for key in sources
-        if jobs[key]["source_count"] == SOURCE_COUNT
-        and jobs[key]["sharing"] == REFERENCE_PROFILE
-    ]
-    if (
-        len(matching) != 1
-        or len(baseline) != 36
-        or len(scratch) != 36
-    ):
+    source = {}
+    targets = {}
+    scratch = {}
+    for key, spec in jobs.items():
+        if spec["kind"] == "source":
+            if (
+                spec["objective"] == "neural"
+                and spec["source_count"] == SOURCE_COUNT
+                and spec["latent"] == LATENT_SIZE
+                and spec["seed"] == SEED
+                and spec["sharing"] in ("A", "AK", "AAK")
+            ):
+                profile = spec["sharing"]
+                if profile in source:
+                    raise ValueError(
+                        f"Duplicate four-source {profile} reference."
+                    )
+                source[profile] = key
+        elif (
+            spec["kind"] in ("adaptation", "scratch")
+            and spec["latent"] == LATENT_SIZE
+            and spec["seed"] == SEED
+            and spec["session"] in reference["held_out_sessions"]
+        ):
+            matched = target_key(spec)
+            if spec["kind"] == "scratch":
+                scratch[matched] = key
+            elif (
+                spec["source_count"] == SOURCE_COUNT
+                and spec["objective"] == "neural"
+                and spec["sharing"] in ("A", "AK", "AAK")
+            ):
+                targets[spec["sharing"], matched] = key
+    expected = set(scratch)
+    if set(source) != {"A", "AK", "AAK"}:
+        raise ValueError("Missing completed A, AK, or AAK source fit.")
+    if len(expected) != TARGET_COUNT:
         raise ValueError(
-            "Reference requires one four-source AK fit, "
-            "36 AK adaptations, and 36 matched scratch controls."
+            f"Expected {TARGET_COUNT} scratch targets, got {len(expected)}."
         )
-    if len(sources) != 8:
-        raise ValueError(
-            f"Expected eight completed source-scaling fits, got {len(sources)}."
-        )
-    return matching[0], sources, baseline + scratch
-
-
-def _validate_reference(
-    settings: dict, sessions: dict, reference: dict, keys: list[str]
-) -> None:
-    """Reject changed data or missing reference completions."""
-    prior = reference["settings"]
-    if (
-        settings["paths"]["artifact_root"]
-        != prior["paths"]["artifact_root"]
-    ):
-        raise ValueError(
-            "Sensitivity artifact root must match the reference fit store."
-        )
-    for name in (
-        "data", "model", "seeds", "target_folds", "target_fractions",
-        "held_out_sessions", "source_training", "target_training",
-        "evaluation_horizons",
-    ):
-        if settings[name] != prior[name]:
+    for profile in ("A", "AK", "AAK"):
+        found = {
+            matched for name, matched in targets if name == profile
+        }
+        if found != expected:
             raise ValueError(
-                f"Sensitivity setting {name} differs from reference."
+                f"{profile} target set differs from matched scratch."
             )
+    return source, targets, scratch
+
+
+def validate_reference(
+    settings: dict, sessions: dict, reference: dict, keys: set
+) -> None:
+    """Check completed dependencies and unchanged scientific settings."""
+    previous = reference["settings"]
+    fields = (
+        "data", "model", "seeds", "target_folds",
+        "target_fractions", "held_out_sessions",
+        "source_training", "target_training",
+        "evaluation_horizons",
+    )
+    if settings["paths"]["artifact_root"] != (
+        previous["paths"]["artifact_root"]
+    ):
+        raise ValueError("Reference artifact root differs.")
+    for field in fields:
+        if settings[field] != previous[field]:
+            raise ValueError(f"Reference setting changed: {field}.")
     for key in keys:
         spec = reference["jobs"][key]
         if spec["kind"] == "source":
             for name, recorded in spec["sources"].items():
                 if sessions.get(name) != recorded:
-                    raise ValueError(f"Source fingerprint changed: {name}.")
-        elif sessions.get(spec["session"]) != spec["source"]:
-            raise ValueError(
-                f"Target fingerprint changed: {spec['session']}."
-            )
+                    raise ValueError(
+                        f"Source fingerprint changed: {name}."
+                    )
+        elif spec["kind"] != "preprocessing":
+            if sessions.get(spec["session"]) != spec["source"]:
+                raise ValueError(
+                    f"Target fingerprint changed: {spec['session']}."
+                )
         if completed(fit_directory(reference, key)) is None:
-            raise ValueError(f"Reference fit is incomplete: {key}.")
+            raise ValueError(f"Incomplete reference fit: {key}.")
+
+
+def add_source(
+    jobs: dict, template: dict, sharing: str,
+    objective: str, first_stage: str | None = None,
+) -> str:
+    """Add one source identity without changing referenced completions."""
+    spec = deepcopy(template)
+    spec["sharing"] = sharing
+    spec["objective"] = objective
+    spec["implementation"] = implementation_digest()
+    if first_stage is not None:
+        spec["stage1_sharing"] = "A"
+        spec["stage2_sharing"] = sharing
+        spec["stage1_source"] = first_stage
+        spec["dependencies"] = [first_stage]
+    key = fingerprint(spec)
+    jobs[key] = spec
+    return key
+
+
+def add_target(
+    jobs: dict, template: dict, sharing: str,
+    source_id: str, objective: str,
+    target: dict | None = None,
+    preprocessing: str | None = None,
+) -> str:
+    """Add a dependency-linked target adaptation."""
+    spec = deepcopy(template)
+    if target is not None:
+        spec.update(target)
+        spec["transfer_direction"] = DIRECTION
+    if preprocessing is not None:
+        spec["preprocessing"] = preprocessing
+    spec.update(
+        sharing=sharing,
+        objective=objective,
+        source_fit=source_id,
+        dependencies=[source_id, spec["preprocessing"]],
+        implementation=implementation_digest("adaptation"),
+    )
+    key = fingerprint(spec)
+    jobs[key] = spec
+    return key
+
+
+def add_loco_control(
+    jobs: dict, template: dict, target: dict,
+    preprocessing: str | None = None,
+) -> str:
+    """Add a Loco preprocessing or scratch job."""
+    spec = deepcopy(template)
+    spec.update(target)
+    spec["transfer_direction"] = DIRECTION
+    spec["implementation"] = implementation_digest(
+        spec["kind"]
+    )
+    if preprocessing is not None:
+        spec["preprocessing"] = preprocessing
+        spec["dependencies"] = [preprocessing]
+    key = fingerprint(spec)
+    jobs[key] = spec
+    return key
 
 
 def build_sensitivity_plan(
     settings: dict, sessions: dict, reference: dict
 ) -> dict:
-    """Build exactly two new source fits and 72 new adaptations."""
+    """Build four separate matched analyses in one dependency graph."""
+    source, targets, scratch = reference_jobs(reference)
     old = reference["jobs"]
-    source_id, source_refs, target_refs = _reference_jobs(reference)
-    source_digest = implementation_digest()
-    target_digest = implementation_digest("adaptation")
-    dependencies = {
-        old[key]["preprocessing"]
-        for key in target_refs
-        if "preprocessing" in old[key]
+    target_keys = sorted(scratch)
+    prerequisites = {
+        old[key]["preprocessing"] for key in targets.values()
     }
-    retained = set(source_refs + target_refs) | dependencies
-    _validate_reference(settings, sessions, reference, sorted(retained))
+    retained = set(source.values()) | set(targets.values())
+    retained |= set(scratch.values()) | prerequisites
+    validate_reference(settings, sessions, reference, retained)
+    loco = settings["loco_targets"]
+    if (
+        len(loco) != SOURCE_COUNT
+        or len(set(loco)) != len(loco)
+        or any(not name.startswith("loco_") for name in loco)
+        or set(loco) - set(sessions)
+    ):
+        raise ValueError("Expected four distinct available Loco targets.")
     jobs = {key: deepcopy(old[key]) for key in sorted(retained)}
-    source_spec = deepcopy(old[source_id])
-    source_spec["implementation"] = source_digest
-    source_spec["sharing"] = FILTER_PROFILE
-    filter_source = fingerprint(source_spec)
-    jobs[filter_source] = source_spec
-    residual_spec = deepcopy(source_spec)
-    residual_spec["objective"] = "neural_residual"
-    residual_spec["sharing"] = RESIDUAL_PROFILE
-    residual_source = fingerprint(residual_spec)
-    jobs[residual_source] = residual_spec
-
-    scratch = [
-        key for key in target_refs if old[key]["kind"] == "scratch"
-    ]
-    baseline = [
-        key for key in target_refs if old[key]["kind"] == "adaptation"
-    ]
-    members = {
-        FILTER: scratch + baseline,
-        RESIDUAL: scratch[:],
-    }
-    for key in baseline:
-        for source_key, profile, objective, analysis in (
-            (filter_source, FILTER_PROFILE, "neural", FILTER),
-            (
-                residual_source, RESIDUAL_PROFILE,
-                "neural_residual", RESIDUAL,
-            ),
-        ):
-            spec = deepcopy(old[key])
-            spec.update(
-                sharing=profile,
-                objective=objective,
-                source_fit=source_key,
-                dependencies=[source_key, spec["preprocessing"]],
-                implementation=target_digest,
-            )
-            fit_id = fingerprint(spec)
-            jobs[fit_id] = spec
-            members[analysis].append(fit_id)
-    members[RESIDUAL].extend(
-        key for key in members[FILTER]
-        if jobs[key]["kind"] == "adaptation"
-        and jobs[key]["sharing"] == FILTER_PROFILE
+    source_ids = dict(source)
+    source_ids["AA"] = add_source(
+        jobs, old[source["A"]], "AA", "neural"
     )
-    if len(members[FILTER]) != 108 or len(members[RESIDUAL]) != 108:
-        raise ValueError("Each sensitivity requires 108 target members.")
+    for profile in STAGE2_PROFILES:
+        source_ids[profile] = add_source(
+            jobs, old[source["A"]], profile,
+            "neural_residual", source["A"],
+        )
+    loco_filter = f"{FILTER}_{DIRECTION}"
+    loco_residual = f"{RESIDUAL}_{DIRECTION}"
+    analyses = {
+        FILTER: [],
+        RESIDUAL: [],
+        loco_filter: [],
+        loco_residual: [],
+    }
+    overrides = {}
+    for matched in target_keys:
+        analyses[FILTER].append(scratch[matched])
+        for profile in ("A", "AK", "AAK"):
+            key = targets[profile, matched]
+            analyses[FILTER].append(key)
+            if profile == "A":
+                analyses[RESIDUAL].append(key)
+        template = old[targets["A", matched]]
+        for profile in ("AA", *STAGE2_PROFILES):
+            objective = (
+                "neural" if profile == "AA" else "neural_residual"
+            )
+            key = add_target(
+                jobs, template, profile, source_ids[profile],
+                objective,
+            )
+            group = FILTER if profile == "AA" else RESIDUAL
+            analyses[group].append(key)
+    prep_template = old[next(iter(prerequisites))]
+    scratch_template = old[scratch[target_keys[0]]]
+    adaptation_template = old[targets["A", target_keys[0]]]
+    for session in loco:
+        for fold in settings["target_folds"]:
+            for fraction in settings["target_fractions"]:
+                target = dict(
+                    session=session,
+                    fold=fold,
+                    fraction=fraction,
+                    source=sessions[session],
+                )
+                prep = add_loco_control(
+                    jobs, prep_template, target
+                )
+                overrides[prep] = LOCO_STORES["preprocessing"]
+                control = add_loco_control(
+                    jobs, scratch_template, target, prep
+                )
+                overrides[control] = LOCO_STORES["scratch"]
+                analyses[loco_filter].append(control)
+                for profile in ("A", "AA", "AK", "AAK"):
+                    key = add_target(
+                        jobs, adaptation_template, profile,
+                        source_ids[profile], "neural",
+                        target, prep,
+                    )
+                    overrides[key] = LOCO_STORES["adaptation"]
+                    analyses[loco_filter].append(key)
+                    if profile == "A":
+                        analyses[loco_residual].append(key)
+                for profile in STAGE2_PROFILES:
+                    key = add_target(
+                        jobs, adaptation_template, profile,
+                        source_ids[profile], "neural_residual",
+                        target, prep,
+                    )
+                    overrides[key] = LOCO_STORES["adaptation"]
+                    analyses[loco_residual].append(key)
+    for name, members in analyses.items():
+        if len(members) != TARGET_COUNT * len(FILTER_PROFILES):
+            raise ValueError(
+                f"{name} has {len(members)} members; expected 180."
+            )
+        if len(members) != len(set(members)):
+            raise ValueError(f"Duplicate target membership: {name}.")
     return dict(
         name=CAMPAIGN,
-        storage=deepcopy(reference["storage"]),
         settings=deepcopy(settings),
+        storage=deepcopy(reference.get("storage", {})),
+        storage_overrides=overrides,
         jobs=jobs,
-        analyses=members,
-        source_references=source_refs + [filter_source, residual_source],
+        analyses=analyses,
+        analysis_paths={
+            FILTER: FILTER,
+            RESIDUAL: RESIDUAL,
+            loco_filter: f"{FILTER}/{DIRECTION}",
+            loco_residual: f"{RESIDUAL}/{DIRECTION}",
+        },
+        analysis_kinds={
+            FILTER: FILTER,
+            RESIDUAL: RESIDUAL,
+            loco_filter: FILTER,
+            loco_residual: RESIDUAL,
+        },
+        source_references=[
+            source_ids[name] for name in ("A", "AA", "AK", "AAK")
+        ],
         held_out_sessions=reference["held_out_sessions"],
+        loco_targets=list(loco),
     )

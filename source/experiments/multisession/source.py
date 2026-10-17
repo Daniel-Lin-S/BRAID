@@ -7,6 +7,7 @@ The neural-only branch never constructs or reads a behavior objective.
 """
 
 from copy import deepcopy
+import json
 from pathlib import Path
 
 import numpy as np
@@ -15,7 +16,9 @@ from BRAID.multisession import HORIZONS, MixedForecaster
 
 from experiments.storage.cache import atomic_json, fingerprint
 from experiments.multisession.data import Scale
-from experiments.multisession.store import completed, dump_pickle, job
+from experiments.multisession.store import (
+    completed, dump_pickle, job, load_pickle,
+)
 from experiments.multisession.training import (
     ReadoutStage,
     recurrent_data,
@@ -122,6 +125,40 @@ def residual_data(
     return result
 
 
+def restore_first_stage(
+    model: MixedForecaster,
+    directory: Path,
+    source_id: str,
+    stage_settings: dict,
+) -> dict:
+    """Restore a completed A component after checking the stage cap."""
+    source_directory = directory.parent / source_id
+    if completed(source_directory) is None:
+        raise ValueError(f"Incomplete first-stage source: {source_directory}")
+    records = json.loads(
+        (source_directory / "components.json").read_text()
+    )
+    record = records["neural"]
+    component = (
+        directory.parent.parent / "source_components"
+        / record["component_id"]
+    )
+    if completed(component) is None:
+        raise ValueError(f"Incomplete first-stage component: {component}")
+    payload = load_pickle(component / "completed.pkl")
+    prior = payload["training"]
+    cap = stage_settings["maximum_updates"]
+    if prior["updates"] > cap:
+        raise ValueError(
+            f"First stage used {prior['updates']} updates, above {cap}."
+        )
+    comparable = dict(prior["settings"], maximum_updates=cap)
+    if comparable != stage_settings:
+        raise ValueError("First-stage training settings differ.")
+    model.restore(payload["weights"])
+    return record
+
+
 def fit_source(
     train: list[dict],
     validation: list[dict],
@@ -152,22 +189,30 @@ def fit_source(
     neural_train = [recurrent_data(d) for d in train]
     neural_val = [recurrent_data(d) for d in validation]
     if not supervised:
-        stage1_sharing = "AAK" if two_stage else sharing
-        model = MixedForecaster(dimensions, latent, stage1_sharing, seed)
-        records["neural"] = fit_component(
-            model,
-            neural_train,
-            neural_val,
-            component_root,
-            dict(identity, stage="neural"),
-            stage_settings,
-            seed,
+        stage1_sharing = (
+            identity.get("stage1_sharing", "AAK")
+            if two_stage else sharing
         )
+        model = MixedForecaster(dimensions, latent, stage1_sharing, seed)
+        if two_stage and "stage1_source" in identity:
+            records["neural"] = restore_first_stage(
+                model, directory, identity["stage1_source"], stage_settings
+            )
+        else:
+            records["neural"] = fit_component(
+                model,
+                neural_train,
+                neural_val,
+                component_root,
+                dict(identity, stage="neural"),
+                stage_settings,
+                seed,
+            )
         if two_stage:
             residual = MixedForecaster(
                 dimensions,
                 latent,
-                "AAK",
+                identity.get("stage2_sharing", "AAK"),
                 seed + 4,
                 input_dimensions=[
                     d[0] + latent + 2 for d in dimensions

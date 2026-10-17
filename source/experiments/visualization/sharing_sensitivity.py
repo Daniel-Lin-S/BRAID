@@ -13,18 +13,31 @@ from experiments.multisession.sensitivity import FILTER, RESIDUAL
 from experiments.visualization.multisession import curve
 
 COLORS = {
+    "scratch": "#222222",
+    "A": "#8046a5",
+    "AA": "#aa3c86",
     "AK": "#2878b5",
     "AAK": "#e28528",
-    "AAK2": "#339966",
-    "A": "#8046a5",
-    "scratch": "#222222",
+    "A2": "#339966",
+    "A2_fw": "#b7792b",
+    "K2_fw": "#4e83ab",
+    "A2_A2_fw_K2_fw": "#be4b40",
 }
 LABELS = {
-    "A": "A1_fw",
+    "scratch": "Scratch BRAID",
+    "A": "A1_fw; stage 2 private",
+    "AA": "A1 + A1_fw",
     "AK": "A1_fw + K1_fw",
     "AAK": "A1 + A1_fw + K1_fw",
-    "AAK2": "Stage 1 + shared RNN2 dynamics",
-    "scratch": "Scratch BRAID",
+    "A2": "A1_fw; share A2",
+    "A2_fw": "A1_fw; share A2_fw",
+    "K2_fw": "A1_fw; share K2_fw",
+    "A2_A2_fw_K2_fw": "A1_fw; share all RNN2 dynamics",
+}
+METRICS = {
+    "cc": "CC",
+    "r2": "R²",
+    "mse_dummy_improvement": "MSE improvement over dummy (%)",
 }
 HORIZONS = (1, 2, 4, 8)
 SOURCE_COUNTS = (4, 8, 16, 33)
@@ -43,40 +56,51 @@ def _axis(axis: object, ticks: list, x_label: str, y_label: str) -> None:
 def target_figures(
     summary: list[dict], analysis: str, root: Path, settings: dict
 ) -> None:
-    """Compare exactly two transfers with a matched scratch reference."""
+    """Draw all prediction metrics at each horizon for matched profiles."""
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    profiles = ("AK", "AAK") if analysis == FILTER else ("AAK", "AAK2")
+    profiles = (
+        ("A", "AA", "AK", "AAK")
+        if analysis == FILTER
+        else ("A", "A2", "A2_fw", "K2_fw", "A2_A2_fw_K2_fw")
+    )
     fractions = settings["target_fractions"]
     for target in ("neural", "behavior"):
-        directory = root / "target_transfer" / target
-        directory.mkdir(parents=True, exist_ok=True)
-        for horizon in settings["evaluation_horizons"]:
-            figure, axis = plt.subplots(figsize=(7.5, 4.8))
-            common = dict(target=target, metric="cc", horizon=horizon)
-            for profile in profiles:
+        for metric, label in METRICS.items():
+            directory = root / "target_transfer" / target / metric
+            directory.mkdir(parents=True, exist_ok=True)
+            for horizon in settings["evaluation_horizons"]:
+                figure, axis = plt.subplots(figsize=(7.5, 4.8))
+                common = dict(
+                    target=target, metric=metric, horizon=horizon
+                )
+                for profile in profiles:
+                    curve(
+                        axis, summary,
+                        dict(common, sharing=profile),
+                        "fraction", fractions,
+                        LABELS[profile], COLORS[profile],
+                    )
                 curve(
                     axis, summary,
-                    dict(common, sharing=profile),
-                    "fraction", fractions, LABELS[profile], COLORS[profile],
+                    dict(common, sharing="scratch"),
+                    "fraction", fractions,
+                    LABELS["scratch"], COLORS["scratch"], "--",
                 )
-            curve(
-                axis, summary, dict(common, sharing="scratch"),
-                "fraction", fractions, LABELS["scratch"],
-                COLORS["scratch"], "--",
-            )
-            _axis(
-                axis, fractions, "Target labels (%)", "CC",
-            )
-            axis.set_xticklabels([f"{100 * x:g}" for x in fractions])
-            axis.set_title(f"{target.capitalize()} · horizon {horizon}")
-            axis.legend(loc="best")
-            figure.tight_layout()
-            figure.savefig(directory / f"h{horizon}.png", dpi=150)
-            plt.close(figure)
+                _axis(axis, fractions, "Target labels (%)", label)
+                axis.set_xticklabels(
+                    [f"{100 * value:g}" for value in fractions]
+                )
+                axis.set_title(
+                    f"{target.capitalize()} · horizon {horizon}"
+                )
+                axis.legend(loc="best")
+                figure.tight_layout()
+                figure.savefig(directory / f"h{horizon}.png", dpi=150)
+                plt.close(figure)
 
 
 def source_figures(
@@ -91,7 +115,7 @@ def source_figures(
     root.mkdir(parents=True, exist_ok=True)
     for horizon in HORIZONS:
         figure, axis = plt.subplots(figsize=(7.5, 4.8))
-        for profile in ("A", "AK", "AAK", "AAK2"):
+        for profile in ("A", "AA", "AK", "AAK"):
             by_count = []
             for count in SOURCE_COUNTS:
                 values = [
@@ -135,7 +159,7 @@ def source_figures(
         figure.savefig(root / f"common_four_neural_h{horizon}.png", dpi=150)
         plt.close(figure)
     figure, axis = plt.subplots(figsize=(7.5, 4.8))
-    for profile in ("A", "AK", "AAK", "AAK2"):
+    for profile in ("A", "AA", "AK", "AAK"):
         selected = sorted(
             (
                 row["source_count"], row["macro_validation_loss"]

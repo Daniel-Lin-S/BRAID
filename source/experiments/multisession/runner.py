@@ -28,6 +28,7 @@ from experiments.multisession.log_paths import job_label, job_log_path
 from experiments.multisession.queue import adopt_workers, resource_available
 from experiments.multisession.plan import (
     PRIMARY,
+    analysis_directory,
     build_plan,
     implementation_digest,
 )
@@ -52,9 +53,16 @@ def resolve(path: Path) -> dict:
 
 def dataset(settings: dict) -> NHPDataset:
     """Construct the configured spike adapter with machine-local paths."""
+    subjects = (
+        ("indy", "loco")
+        if settings["name"] == "multi_session_sharing_sensitivity"
+        and settings.get("loco_targets")
+        else ("indy",)
+    )
     return NHPDataset(
         dict(
             settings["data"],
+            subjects=subjects,
             root=settings["paths"]["dataset_root"],
             cache_root=settings["paths"]["cache_root"],
             cache_mode="reuse",
@@ -83,17 +91,21 @@ def plan_campaign(settings: dict) -> tuple[dict, Path]:
         plan = build_sensitivity_plan(settings, sessions, reference)
     else:
         plan = build_plan(settings, sessions)
-    identifier = fingerprint(dict(jobs=plan["jobs"], analyses=plan["analyses"]))
+    identifier = fingerprint(dict(
+        jobs=plan["jobs"], analyses=plan["analyses"],
+        storage_overrides=plan.get("storage_overrides", {}),
+        analysis_paths=plan.get("analysis_paths", {}),
+    ))
     root = Path(settings["paths"]["artifact_root"]).resolve()
     path = root / PRIMARY / "plans" / identifier / "plan.json"
     if path.exists():
         stored = json.loads(path.read_text())
-        if stored["jobs"] != plan["jobs"]:
+        if stored != plan:
             raise ValueError(f"Immutable plan mismatch: {path}")
     else:
         atomic_json(path, plan)
     for name, members in plan["analyses"].items():
-        analysis = root / "analysis" / name / identifier
+        analysis = analysis_directory(plan, name, identifier)
         manifest = analysis / "manifest.json"
         if not manifest.exists():
             atomic_json(
@@ -241,9 +253,11 @@ def reconcile(
                 states[key] = status["state"]
             else:
                 states[key] = "pending"
-    root = Path(plan["settings"]["paths"]["artifact_root"]) / "analysis"
     for name, members in plan["analyses"].items():
-        manifest = root / name / path.parent.name / "manifest.json"
+        manifest = (
+            analysis_directory(plan, name, path.parent.name)
+            / "manifest.json"
+        )
         atomic_json(
             manifest,
             dict(
@@ -321,19 +335,36 @@ def run_queue(
             for slot, device in enumerate(devices):
                 if slot in active:
                     continue
-                ready = next(
-                    (
-                        key
-                        for key in ordered
-                        if key in pending
-                        and resource_available(key, plan["jobs"], active)
-                        and all(
-                            states.get(p) == "complete"
-                            for p in plan["jobs"][key]["dependencies"]
-                        )
-                    ),
-                    None,
-                )
+                eligible = [
+                    key for key in ordered
+                    if key in pending
+                    and resource_available(key, plan["jobs"], active)
+                    and all(
+                        states.get(parent) == "complete"
+                        for parent in plan["jobs"][key]["dependencies"]
+                    )
+                ]
+                if plan["name"] == (
+                    "multi_session_sharing_sensitivity"
+                ):
+                    active_sources = sum(
+                        plan["jobs"][key]["kind"] == "source"
+                        for key, _ in active.values()
+                    )
+                    kinds = (
+                        ("source",) if active_sources < 2 else ()
+                    ) + (
+                        "adaptation", "preprocessing", "scratch", "source"
+                    )
+                    ready = next(
+                        (
+                            key for kind in kinds for key in eligible
+                            if plan["jobs"][key]["kind"] == kind
+                        ),
+                        None,
+                    )
+                else:
+                    ready = eligible[0] if eligible else None
                 if ready is None:
                     continue
                 pending.remove(ready)

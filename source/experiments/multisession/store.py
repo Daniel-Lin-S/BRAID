@@ -36,7 +36,11 @@ def fit_directory(plan: dict, key: str) -> Path:
     under experiments, accessible without an analysis-specific directory.
     """
     kind = plan["jobs"][key]["kind"]
-    relative = plan.get("storage", {}).get(kind, DEFAULT_FIT_STORE)
+    relative = plan.get("storage_overrides", {}).get(key)
+    if relative is None:
+        relative = plan.get("storage", {}).get(
+            kind, DEFAULT_FIT_STORE
+        )
     return (
         Path(plan["settings"]["paths"]["artifact_root"]) / relative / key
     ).resolve()

@@ -149,7 +149,7 @@ def fold_features(
 
 
 class NHPDataset:
-    """Dataset plugin for the real Indy reaching sessions."""
+    """Dataset plugin for Indy and explicitly selected Loco sessions."""
 
     def __init__(self, settings: dict) -> None:
         self.settings = settings
@@ -162,13 +162,20 @@ class NHPDataset:
 
     def sessions(self) -> list[str]:
         """Return the configured ordered session IDs, validating existence."""
-        found = sorted(p.stem for p in self.root.glob("indy_*.mat"))
+        subjects = self.settings.get("subjects", ("indy",))
+        found = sorted(
+            p.stem
+            for subject in subjects
+            for p in self.root.glob(f"{subject}_*.mat")
+        )
         chosen = self.settings.get("sessions") or found
         if not chosen or len(chosen) != len(set(chosen)):
             raise ValueError("Expected a nonempty unique session list.")
         missing = set(chosen) - set(found)
         if missing:
-            raise FileNotFoundError(f"Missing Indy sessions: {sorted(missing)}")
+            raise FileNotFoundError(
+                f"Missing selected sessions: {sorted(missing)}"
+            )
         return chosen
 
     def inventory(self) -> dict[str, list[str]]:

@@ -183,3 +183,12 @@ def build_plan(settings: dict, sessions: dict[str, dict]) -> dict:
         analyses=memberships,
         held_out_sessions=targets,
     )
+
+
+def analysis_directory(plan: dict, name: str, plan_id: str) -> Path:
+    """Resolve one analysis root from the plan's relative layout."""
+    relative = Path(plan.get("analysis_paths", {}).get(name, name))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError(f"Invalid analysis directory: {relative}")
+    root = Path(plan["settings"]["paths"]["artifact_root"])
+    return root / "analysis" / relative / plan_id

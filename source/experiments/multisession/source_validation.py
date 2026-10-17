@@ -63,7 +63,8 @@ def _evaluate_fit(
     spec = plan["jobs"][fit_id]
     dimensions = [(v["Y"].shape[-1], v["Y"].shape[-1]) for v in values]
     sharing = (
-        "AAK" if spec["objective"] == "neural_residual"
+        spec.get("stage1_sharing", "AAK")
+        if spec["objective"] == "neural_residual"
         else spec["sharing"]
     )
     main = _restore(
@@ -76,7 +77,8 @@ def _evaluate_fit(
         residual_inputs = residual_data(main, None, inputs)
         residual = _restore(
             _component(plan, fit_id, "residual"),
-            dimensions, "AAK", spec["seed"] + 4, residual=True,
+            dimensions, spec.get("stage2_sharing", "AAK"),
+            spec["seed"] + 4, residual=True,
         )
         corrections, _ = stage_predictions(residual, residual_inputs)
         predictions = [
