@@ -1,0 +1,3 @@
+extends: multi_session_training.yaml
+name: multi_session_source_scaling
+title: Multi-session source scaling

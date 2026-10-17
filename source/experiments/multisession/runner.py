@@ -55,8 +55,10 @@ def dataset(settings: dict) -> NHPDataset:
     """Construct the configured spike adapter with machine-local paths."""
     subjects = (
         ("indy", "loco")
-        if settings["name"] == "multi_session_sharing_sensitivity"
-        and settings.get("loco_targets")
+        if settings["name"] in (
+            "multi_session_sharing_sensitivity",
+            "multi_session_source_scaling",
+        ) and settings.get("loco_targets")
         else ("indy",)
     )
     return NHPDataset(
@@ -89,6 +91,18 @@ def plan_campaign(settings: dict) -> tuple[dict, Path]:
         reference_path = Path(settings["reference_plan"]).resolve()
         reference = json.loads(reference_path.read_text())
         plan = build_sensitivity_plan(settings, sessions, reference)
+    elif settings["name"] == "multi_session_source_scaling":
+        from experiments.multisession.scaling import build_scaling_plan
+
+        reference = json.loads(
+            Path(settings["reference_plan"]).resolve().read_text()
+        )
+        source_reference = json.loads(
+            Path(settings["source_reference_plan"]).resolve().read_text()
+        )
+        plan = build_scaling_plan(
+            settings, sessions, reference, source_reference
+        )
     else:
         plan = build_plan(settings, sessions)
     identifier = fingerprint(dict(
@@ -344,8 +358,9 @@ def run_queue(
                         for parent in plan["jobs"][key]["dependencies"]
                     )
                 ]
-                if plan["name"] == (
-                    "multi_session_sharing_sensitivity"
+                if plan["name"] in (
+                    "multi_session_sharing_sensitivity",
+                    "multi_session_source_scaling",
                 ):
                     active_sources = sum(
                         plan["jobs"][key]["kind"] == "source"

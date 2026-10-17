@@ -203,6 +203,28 @@ def dummy_mse_by_coordinate(
                         f"Nonfinite dummy MSE for {spec['session']}."
                     )
                 baselines[target, horizon] = error
+                centered = truth[valid[index]] - np.mean(
+                    truth[valid[index]], axis=0
+                )
+                test_variance = np.mean(centered ** 2, axis=0)
+                scored = (
+                    np.isfinite(error)
+                    & np.isfinite(test_variance)
+                    & (test_variance > 0)
+                )
+                if not np.any(scored):
+                    raise ValueError(
+                        f"No valid dummy R² coordinates: "
+                        f"{spec['session']}."
+                    )
+                dummy_r2 = 1 - error[scored] / test_variance[scored]
+                if not np.isfinite(dummy_r2).all():
+                    raise ValueError(
+                        f"Nonfinite dummy R² for {spec['session']}."
+                    )
+                baselines[target, horizon, "r2"] = float(
+                    np.mean(dummy_r2)
+                )
     cache[key] = baselines
     return baselines
 
@@ -301,8 +323,11 @@ def collect(plan: dict, members: list[str]) -> tuple[list, list, list]:
     """Read metrics only from checksum-validated completed member fits."""
     rows, dimensions, identities = [], [], []
     baseline_cache = {}
+    from experiments.multisession.scaling import CAMPAIGN as SCALING
+
     normalize_mse = (
-        plan["name"] == CAMPAIGN and "loco_targets" in plan
+        plan["name"] in (CAMPAIGN, SCALING)
+        and "loco_targets" in plan
     )
     for key in members:
         directory = fit_directory(plan, key)
@@ -471,6 +496,17 @@ def write_payload(
 ) -> None:
     """Write one report's tables and figures into an empty directory."""
     kind = plan.get("analysis_kinds", {}).get(name, name)
+    from experiments.multisession.scaling import CAMPAIGN as SCALING
+
+    if kind == SCALING:
+        from experiments.multisession.scaling_report import (
+            write_scaling_payload,
+        )
+
+        write_scaling_payload(
+            plan, name, members, rows, dimensions, summary, directory
+        )
+        return
     if kind in (FILTER, RESIDUAL):
         write_sharing_payload(
             plan, kind, members, rows, dimensions, summary, directory
@@ -780,15 +816,23 @@ def scratch_controls_ready(
     bool
         Whether all scratch controls can appear in tables and figures.
     """
-    if plan["name"] != CAMPAIGN or not name.endswith(
-        f"_{DIRECTION}"
+    from experiments.multisession.scaling import CAMPAIGN as SCALING
+
+    scaling = plan["name"] == SCALING
+    if not scaling and (
+        plan["name"] != CAMPAIGN
+        or not name.endswith(f"_{DIRECTION}")
     ):
         return True
     controls = [
         key for key in members
         if plan["jobs"][key]["kind"] == "scratch"
     ]
-    expected = len(plan["loco_targets"])
+    expected = (
+        len(plan["held_out_sessions"])
+        if scaling and name.startswith("Indy → Indy")
+        else len(plan["loco_targets"])
+    )
     expected *= len(plan["settings"]["target_folds"])
     expected *= len(plan["settings"]["target_fractions"])
     if len(controls) != expected:
