@@ -58,6 +58,7 @@ def dataset(settings: dict) -> NHPDataset:
         if settings["name"] in (
             "multi_session_sharing_sensitivity",
             "multi_session_source_scaling",
+            "multi_session_source_capacity_scaling",
         ) and settings.get("loco_targets")
         else ("indy",)
     )
@@ -103,6 +104,17 @@ def plan_campaign(settings: dict) -> tuple[dict, Path]:
         plan = build_scaling_plan(
             settings, sessions, reference, source_reference
         )
+    elif settings["name"] == "multi_session_source_capacity_scaling":
+        from experiments.multisession.capacity import build_capacity_plan
+
+        reference = json.loads(
+            Path(settings["reference_plan"]).resolve().read_text()
+        )
+        prior = json.loads(
+            Path(settings["capacity_reference_plan"]).resolve()
+            .read_text()
+        )
+        plan = build_capacity_plan(settings, sessions, reference, prior)
     else:
         plan = build_plan(settings, sessions)
     identifier = fingerprint(dict(
@@ -361,6 +373,7 @@ def run_queue(
                 if plan["name"] in (
                     "multi_session_sharing_sensitivity",
                     "multi_session_source_scaling",
+                    "multi_session_source_capacity_scaling",
                 ):
                     active_sources = sum(
                         plan["jobs"][key]["kind"] == "source"

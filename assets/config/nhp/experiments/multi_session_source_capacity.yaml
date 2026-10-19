@@ -1,0 +1,5 @@
+extends: multi_session_source_scaling.yaml
+name: multi_session_source_capacity_scaling
+title: Multi-session source capacity scaling
+source_counts: [4, 33]
+latent_widths: [32, 64, 128]

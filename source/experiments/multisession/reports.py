@@ -324,9 +324,10 @@ def collect(plan: dict, members: list[str]) -> tuple[list, list, list]:
     rows, dimensions, identities = [], [], []
     baseline_cache = {}
     from experiments.multisession.scaling import CAMPAIGN as SCALING
+    from experiments.multisession.capacity import CAMPAIGN as CAPACITY
 
     normalize_mse = (
-        plan["name"] in (CAMPAIGN, SCALING)
+        plan["name"] in (CAMPAIGN, SCALING, CAPACITY)
         and "loco_targets" in plan
     )
     for key in members:
@@ -498,6 +499,17 @@ def write_payload(
     kind = plan.get("analysis_kinds", {}).get(name, name)
     from experiments.multisession.scaling import CAMPAIGN as SCALING
 
+    from experiments.multisession.capacity import CAMPAIGN as CAPACITY
+
+    if kind == CAPACITY:
+        from experiments.multisession.capacity_report import (
+            write_capacity_payload,
+        )
+
+        write_capacity_payload(
+            plan, name, members, rows, dimensions, summary, directory
+        )
+        return
     if kind == SCALING:
         from experiments.multisession.scaling_report import (
             write_scaling_payload,
@@ -818,7 +830,9 @@ def scratch_controls_ready(
     """
     from experiments.multisession.scaling import CAMPAIGN as SCALING
 
-    scaling = plan["name"] == SCALING
+    from experiments.multisession.capacity import CAMPAIGN as CAPACITY
+
+    scaling = plan["name"] in (SCALING, CAPACITY)
     if not scaling and (
         plan["name"] != CAMPAIGN
         or not name.endswith(f"_{DIRECTION}")
@@ -835,6 +849,8 @@ def scratch_controls_ready(
     )
     expected *= len(plan["settings"]["target_folds"])
     expected *= len(plan["settings"]["target_fractions"])
+    if plan["name"] == CAPACITY:
+        expected *= len(plan["settings"]["latent_widths"])
     if len(controls) != expected:
         raise ValueError(
             f"Expected {expected} Loco scratch controls for {name}; "
