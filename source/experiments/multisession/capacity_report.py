@@ -110,7 +110,8 @@ def comparison_rows(rows: list[dict], dummy: dict) -> list[dict]:
 
 
 def capacity_figures(
-    summary: list[dict], direction: str, root: Path, settings: dict
+    summary: list[dict], direction: str, root: Path, settings: dict,
+    pending_128: bool,
 ) -> None:
     """Plot scratch and 4/33-source curves at all horizons and metrics."""
     import matplotlib
@@ -169,7 +170,15 @@ def capacity_figures(
                 figure.suptitle(
                     f"{direction}: {target}, horizon {horizon}"
                 )
-                figure.tight_layout(rect=(0, 0, 0.82, 0.94))
+                if pending_128:
+                    figure.text(
+                        0.41, 0.025, "Width 128 pending.",
+                        ha="center", va="bottom", fontsize=9,
+                    )
+                bottom = 0.10 if pending_128 else 0
+                figure.tight_layout(
+                    rect=(0, bottom, 0.82, 0.94)
+                )
                 figure.savefig(directory / f"h{horizon}.png", dpi=150)
                 plt.close(figure)
 
@@ -275,7 +284,9 @@ def source_loss_figures(histories: dict, root: Path) -> None:
 def write_capacity_payload(
     plan: dict, direction: str, members: list[str],
     rows: list[dict], dimensions: list[dict],
-    summary: list[dict], directory: Path
+    summary: list[dict], directory: Path,
+    dummy_cache: dict | None = None,
+    pending_128: bool = False,
 ) -> None:
     """Write matched raw, relative, exposure, and figure artifacts."""
     from experiments.multisession.reports import (
@@ -291,7 +302,7 @@ def write_capacity_payload(
     write_table(tables / "summary.csv", summary)
     write_table(tables / "session_metrics.csv", session_means(rows))
     cost_tables(plan, members, tables)
-    dummy = dummy_scores(plan, members)
+    dummy = dummy_scores(plan, members, dummy_cache)
     gains = relative_gains(rows, dummy)
     for row in gains:
         row["latent"] = plan["jobs"][row["fit_id"]]["latent"]
@@ -305,7 +316,9 @@ def write_capacity_payload(
         for row in exposure:
             row["latent"] = plan["jobs"][row["source_fit"]]["latent"]
         write_table(tables / "source_exposure.csv", exposure)
-    capacity_figures(summary, direction, figures, plan["settings"])
+    capacity_figures(
+        summary, direction, figures, plan["settings"], pending_128
+    )
     source_loss_figures(
         source_histories(plan), figures / "source_training_loss"
     )

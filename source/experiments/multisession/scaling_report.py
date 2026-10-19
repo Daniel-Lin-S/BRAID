@@ -28,11 +28,29 @@ GAIN_THRESHOLD_PERCENT = 10.0
 DENOMINATOR_EPSILON = 1e-10
 
 
-def dummy_scores(plan: dict, members: list[str]) -> dict:
-    """Compute the training-label dummy reference for matched scratch fits."""
+def dummy_scores(
+    plan: dict, members: list[str], cache: dict | None = None
+) -> dict:
+    """Compute the training-label dummy reference for matched scratch fits.
+
+    Parameters
+    ----------
+    plan : dict
+        Campaign plan containing target preprocessing and fit locations.
+    members : list[str]
+        Matched adaptation and scratch fit identifiers.
+    cache : dict, optional
+        Previously calculated dummy scores keyed by target selection.
+
+    Returns
+    -------
+    dict
+        Dummy CC, R², and MSE improvement by matched target identity.
+    """
     from experiments.multisession.reports import dummy_mse_by_coordinate
 
-    cache = {}
+    if cache is None:
+        cache = {}
     scores = {}
     for key in members:
         spec = plan["jobs"][key]

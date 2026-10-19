@@ -354,6 +354,10 @@ def run_queue(
         plan['jobs'][key].get('latent', 0),
         plan['jobs'][key]['seed'], key,
     ))
+    from experiments.multisession.capacity import (
+        CAMPAIGN as CAPACITY_SCALING, PHASE_WIDTHS,
+    )
+
     last_report = 0.0
     reporting = None
     with writer_lock(path.parent / "coordinator.lock", blocking=False):
@@ -370,10 +374,31 @@ def run_queue(
                         for parent in plan["jobs"][key]["dependencies"]
                     )
                 ]
-                if plan["name"] in (
+                if plan["name"] == CAPACITY_SCALING:
+                    phase_pending = any(
+                        states[key] in ("pending", "running")
+                        and plan["jobs"][key].get("latent", 0)
+                        in PHASE_WIDTHS
+                        for key in ordered
+                    )
+                    if phase_pending:
+                        eligible = [
+                            key for key in eligible
+                            if plan["jobs"][key].get("latent", 0)
+                            in PHASE_WIDTHS
+                        ]
+                    kinds = (
+                        "scratch", "source",
+                        "preprocessing", "adaptation",
+                    )
+                    ready = next(
+                        (key for kind in kinds for key in eligible
+                         if plan["jobs"][key]["kind"] == kind),
+                        None,
+                    )
+                elif plan["name"] in (
                     "multi_session_sharing_sensitivity",
                     "multi_session_source_scaling",
-                    "multi_session_source_capacity_scaling",
                 ):
                     active_sources = sum(
                         plan["jobs"][key]["kind"] == "source"

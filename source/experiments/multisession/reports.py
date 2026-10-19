@@ -16,6 +16,7 @@ from itertools import combinations
 import csv
 import json
 import logging
+import os
 from pathlib import Path
 import shutil
 import uuid
@@ -319,10 +320,13 @@ def paired_comparisons(
     return result
 
 
-def collect(plan: dict, members: list[str]) -> tuple[list, list, list]:
+def collect(
+    plan: dict, members: list[str], baseline_cache: dict | None = None
+) -> tuple[list, list, list]:
     """Read metrics only from checksum-validated completed member fits."""
     rows, dimensions, identities = [], [], []
-    baseline_cache = {}
+    if baseline_cache is None:
+        baseline_cache = {}
     from experiments.multisession.scaling import CAMPAIGN as SCALING
     from experiments.multisession.capacity import CAMPAIGN as CAPACITY
 
@@ -494,6 +498,8 @@ def write_payload(
     dimensions: list[dict],
     summary: list[dict],
     directory: Path,
+    dummy_cache: dict | None = None,
+    pending_128: bool = False,
 ) -> None:
     """Write one report's tables and figures into an empty directory."""
     kind = plan.get("analysis_kinds", {}).get(name, name)
@@ -507,7 +513,8 @@ def write_payload(
         )
 
         write_capacity_payload(
-            plan, name, members, rows, dimensions, summary, directory
+            plan, name, members, rows, dimensions, summary,
+            directory, dummy_cache, pending_128,
         )
         return
     if kind == SCALING:
@@ -687,6 +694,32 @@ def remove_old_live(reports: Path, keep: Path | None) -> None:
         shutil.rmtree(path)
 
 
+def publish_current_paths(analysis: Path, snapshot: Path) -> None:
+    """Point stable capacity figure and table paths at a validated report.
+
+    Parameters
+    ----------
+    analysis : Path
+        Direction-specific analysis root.
+    snapshot : Path
+        Validated live or immutable final report directory.
+    """
+    for name in ("figures", "tables"):
+        target = analysis / name
+        if target.exists() and not target.is_symlink():
+            raise ValueError(
+                f"Cannot replace non-symlink report path: {target}"
+            )
+        link = analysis / f".{name}-{uuid.uuid4().hex}"
+        destination = snapshot.relative_to(analysis) / name
+        try:
+            os.symlink(destination, link)
+            os.replace(link, target)
+        finally:
+            if link.is_symlink():
+                link.unlink()
+
+
 def publish_live(
     plan: dict,
     name: str,
@@ -697,6 +730,9 @@ def publish_live(
     analysis: Path,
     fit_set_hash: str,
     completed_fits: int,
+    dummy_cache: dict | None = None,
+    pending_128: bool = False,
+    expected_fits: int | None = None,
 ) -> None:
     """Replace an interim report only after its new payload is validated."""
     reports = analysis / "reports"
@@ -704,23 +740,41 @@ def publish_live(
     stage.mkdir()
     try:
         write_payload(
-            plan, name, members, rows, dimensions, summary, stage
+            plan, name, members, rows, dimensions, summary, stage,
+            dummy_cache, pending_128,
         )
         ready_checksums(stage, fit_set_hash)
         if not valid_live(stage, fit_set_hash):
             raise ValueError(f"Invalid staged report: {stage}")
+        from experiments.multisession.capacity import (
+            CAMPAIGN as CAPACITY_SCALING,
+        )
         atomic_json(
             analysis / "latest_report.json",
             dict(
                 snapshot=str(stage.relative_to(analysis)),
                 completed_fits=completed_fits,
-                expected_fits=len(members),
+                expected_fits=(
+                    len(members) if expected_fits is None
+                    else expected_fits
+                ),
+                phase_expected_fits=(
+                    len(members) if pending_128 else None
+                ),
                 fit_set_hash=fit_set_hash,
                 mode="live",
             ),
         )
+        if plan["name"] == CAPACITY_SCALING:
+            publish_current_paths(analysis, stage)
     except BaseException:
-        shutil.rmtree(stage)
+        pointer = analysis / "latest_report.json"
+        current = (
+            json.loads(pointer.read_text())
+            if pointer.is_file() else {}
+        )
+        if current.get("snapshot") != str(stage.relative_to(analysis)):
+            shutil.rmtree(stage)
         raise
     remove_old_live(reports, stage)
 
@@ -735,16 +789,21 @@ def publish_final(
     analysis: Path,
     identities: list,
     fit_set_hash: str,
+    dummy_cache: dict | None = None,
 ) -> None:
     """Publish one checksum-validated immutable final report."""
     snapshot = analysis / "reports" / fit_set_hash
     with job(snapshot, dict(members=identities)) as needed:
         if needed:
             write_payload(
-                plan, name, members, rows, dimensions, summary, snapshot
+                plan, name, members, rows, dimensions, summary,
+                snapshot, dummy_cache,
             )
     if completed(snapshot) is None:
         raise ValueError(f"Final report lacks completion: {snapshot}")
+    from experiments.multisession.capacity import (
+        CAMPAIGN as CAPACITY_SCALING,
+    )
     atomic_json(
         analysis / "latest_report.json",
         dict(
@@ -755,6 +814,8 @@ def publish_final(
             mode="final",
         ),
     )
+    if plan["name"] == CAPACITY_SCALING:
+        publish_current_paths(analysis, snapshot)
     remove_old_live(analysis / "reports", None)
 
 
@@ -850,7 +911,9 @@ def scratch_controls_ready(
     expected *= len(plan["settings"]["target_folds"])
     expected *= len(plan["settings"]["target_fractions"])
     if plan["name"] == CAPACITY:
-        expected *= len(plan["settings"]["latent_widths"])
+        expected *= len({
+            plan["jobs"][key]["latent"] for key in members
+        })
     if len(controls) != expected:
         raise ValueError(
             f"Expected {expected} Loco scratch controls for {name}; "
@@ -874,12 +937,88 @@ def scratch_controls_ready(
     return False
 
 
+def capacity_report_members(
+    plan: dict, members: list[str]
+) -> tuple[list[str], bool] | None:
+    """Select a complete 32/64 phase or complete full capacity report."""
+    from experiments.multisession.capacity import (
+        COUNTS, LATENTS, PHASE_WIDTHS, TARGETS_PER_DIRECTION,
+    )
+
+    full_expected = TARGETS_PER_DIRECTION * (len(COUNTS) + 1)
+    full_expected *= len(LATENTS)
+    if len(members) != full_expected:
+        raise ValueError(
+            f"Expected {full_expected} capacity members; "
+            f"found {len(members)}."
+        )
+    phase = [
+        key for key in members
+        if plan["jobs"][key]["latent"] in PHASE_WIDTHS
+    ]
+    phase_expected = TARGETS_PER_DIRECTION * (len(COUNTS) + 1)
+    phase_expected *= len(PHASE_WIDTHS)
+    if len(phase) != phase_expected:
+        raise ValueError(
+            f"Expected {phase_expected} 32/64 capacity members; "
+            f"found {len(phase)}."
+        )
+    fields = ("session", "fold", "seed", "fraction", "latent")
+    controls = set()
+    adaptations = defaultdict(set)
+    for key in members:
+        spec = plan["jobs"][key]
+        target = tuple(spec[field] for field in fields)
+        if spec["kind"] == "scratch":
+            if target in controls:
+                raise ValueError(f"Duplicate capacity control: {target}.")
+            controls.add(target)
+        elif spec["kind"] == "adaptation":
+            adaptations[target].add(spec["source_count"])
+        else:
+            raise ValueError(
+                f"Unexpected capacity report kind: {spec['kind']}."
+            )
+    if set(adaptations) != controls or any(
+        counts != set(COUNTS) for counts in adaptations.values()
+    ):
+        raise ValueError(
+            "Capacity adaptations lack matched scratch controls."
+        )
+    if all(
+        completed(fit_directory(plan, key)) is not None
+        for key in members
+    ):
+        return members, False
+    if all(
+        completed(fit_directory(plan, key)) is not None
+        for key in phase
+    ):
+        return phase, True
+    return None
+
+
 def report(
     plan: dict, plan_path: Path, final: bool = False
 ) -> None:
     """Publish rolling interim reports or immutable final reports."""
     for name, members in plan["analyses"].items():
         members = report_members(plan, name, members)
+        expected_fits = len(members)
+        pending_128 = False
+        kind = plan.get("analysis_kinds", {}).get(name, name)
+        from experiments.multisession.capacity import (
+            CAMPAIGN as CAPACITY_SCALING,
+        )
+        if kind == CAPACITY_SCALING:
+            selected = capacity_report_members(plan, members)
+            if selected is None:
+                LOGGER.info(
+                    "%s: awaiting complete 32/64-width membership.",
+                    name,
+                )
+                continue
+            members, pending_128 = selected
         analysis = analysis_directory(
             plan, name, plan_path.parent.name
         )
@@ -890,7 +1029,10 @@ def report(
                 plan, name, members, analysis
             ):
                 continue
-            rows, dimensions, identities = collect(plan, members)
+            dummy_cache = {}
+            rows, dimensions, identities = collect(
+                plan, members, dummy_cache
+            )
             if not rows:
                 LOGGER.info("%s: no completed target metrics yet.", name)
                 continue
@@ -902,23 +1044,28 @@ def report(
                     path = report_path(analysis, previous)
                     if previous.get("mode") == "final":
                         if completed(path) is not None:
+                            if kind == CAPACITY_SCALING:
+                                publish_current_paths(analysis, path)
                             continue
                     elif not final and valid_live(path, fit_set_hash):
+                        if kind == CAPACITY_SCALING:
+                            publish_current_paths(analysis, path)
                         remove_old_live(reports, path)
                         continue
             summary = summarize(rows)
             if not summary:
                 LOGGER.warning("%s: no finite metrics to summarize.", name)
                 continue
-            if final:
+            if (final or kind == CAPACITY_SCALING) and not pending_128:
                 publish_final(
                     plan, name, members, rows, dimensions, summary,
-                    analysis, identities, fit_set_hash,
+                    analysis, identities, fit_set_hash, dummy_cache,
                 )
             else:
                 publish_live(
                     plan, name, members, rows, dimensions, summary,
                     analysis, fit_set_hash, len(identities),
+                    dummy_cache, pending_128, expected_fits,
                 )
 
 

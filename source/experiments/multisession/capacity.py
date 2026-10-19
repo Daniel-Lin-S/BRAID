@@ -16,6 +16,7 @@ CAMPAIGN = "multi_session_source_capacity_scaling"
 ANALYSIS_ROOT = "multi_session_training_capacity_sensitivity"
 COUNTS = (4, 33)
 LATENTS = (32, 64, 128)
+PHASE_WIDTHS = LATENTS[:2]
 TARGETS_PER_DIRECTION = 36
 
 
