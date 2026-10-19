@@ -374,7 +374,7 @@ def run_queue(
                         for parent in plan["jobs"][key]["dependencies"]
                     )
                 ]
-                if plan["name"] == CAPACITY_SCALING:
+                if plan.get("name") == CAPACITY_SCALING:
                     phase_pending = any(
                         states[key] in ("pending", "running")
                         and plan["jobs"][key].get("latent", 0)
@@ -396,7 +396,7 @@ def run_queue(
                          if plan["jobs"][key]["kind"] == kind),
                         None,
                     )
-                elif plan["name"] in (
+                elif plan.get("name") in (
                     "multi_session_sharing_sensitivity",
                     "multi_session_source_scaling",
                 ):

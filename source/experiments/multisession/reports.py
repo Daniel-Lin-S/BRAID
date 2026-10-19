@@ -765,7 +765,7 @@ def publish_live(
                 mode="live",
             ),
         )
-        if plan["name"] == CAPACITY_SCALING:
+        if plan.get("name") == CAPACITY_SCALING:
             publish_current_paths(analysis, stage)
     except BaseException:
         pointer = analysis / "latest_report.json"
@@ -814,7 +814,7 @@ def publish_final(
             mode="final",
         ),
     )
-    if plan["name"] == CAPACITY_SCALING:
+    if plan.get("name") == CAPACITY_SCALING:
         publish_current_paths(analysis, snapshot)
     remove_old_live(analysis / "reports", None)
 
@@ -893,9 +893,9 @@ def scratch_controls_ready(
 
     from experiments.multisession.capacity import CAMPAIGN as CAPACITY
 
-    scaling = plan["name"] in (SCALING, CAPACITY)
+    scaling = plan.get("name") in (SCALING, CAPACITY)
     if not scaling and (
-        plan["name"] != CAMPAIGN
+        plan.get("name") != CAMPAIGN
         or not name.endswith(f"_{DIRECTION}")
     ):
         return True
@@ -910,7 +910,7 @@ def scratch_controls_ready(
     )
     expected *= len(plan["settings"]["target_folds"])
     expected *= len(plan["settings"]["target_fractions"])
-    if plan["name"] == CAPACITY:
+    if plan.get("name") == CAPACITY:
         expected *= len({
             plan["jobs"][key]["latent"] for key in members
         })
@@ -1030,9 +1030,14 @@ def report(
             ):
                 continue
             dummy_cache = {}
-            rows, dimensions, identities = collect(
-                plan, members, dummy_cache
-            )
+            if kind == CAPACITY_SCALING:
+                rows, dimensions, identities = collect(
+                    plan, members, dummy_cache
+                )
+            else:
+                rows, dimensions, identities = collect(
+                    plan, members
+                )
             if not rows:
                 LOGGER.info("%s: no completed target metrics yet.", name)
                 continue
