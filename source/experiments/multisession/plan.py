@@ -10,57 +10,19 @@ from pathlib import Path
 
 import numpy as np
 
-from experiments.storage.cache import fingerprint, file_digest
+from experiments.storage.cache import fingerprint
 from experiments.storage.implementation import scientific_versions
+from experiments.storage.scientific_modules import fit_module_digest
 from experiments.multisession.store import FIT_STORES
 
 PRIMARY = "multi_session_training"
 CAPACITY = PRIMARY + "_capacity_sensitivity"
 SUPERVISION = PRIMARY + "_supervision_sensitivity"
 ANALYSES = (PRIMARY, CAPACITY, SUPERVISION)
-# Historical source IDs contain target-only file slots. Keep those slots
-# stable: source fitting never executes either target integration module.
-SOURCE_TARGET_SLOTS = {
-    "experiments/multisession/target.py":
-        "6594517aa20012e2b094f8eb03a5428b492f026987a2012aca31e8486d0f0381",
-    "BRAID/BRAIDModel.py":
-        "f81ef97b61577af6b67404cc1e4c6623b3b990fa6cd2848d1df0c62698399d6f",
-}
-
-
-def implementation_digest(kind: str = "source") -> str:
-    """Fingerprint numerical transfer code and native BRAID dependencies."""
-    here = Path(__file__).resolve().parent
-    paths = [
-        here / name
-        for name in (
-            "data.py",
-            "source.py",
-            "target.py",
-            "training.py",
-        )
-    ]
-    paths += list((here.parents[1] / "BRAID").rglob("*.py"))
-    paths += [
-        here.parent / name
-        for name in (
-            "datasets/nhp.py",
-            "datasets/windows.py",
-            "contracts.py",
-            "configuration.py",
-            "models/braid_backend.py",
-            "reports/evaluation.py",
-        )
-    ]
-    if kind != "source":
-        paths.append(here / "preprocessing.py")
-    hashes = {
-        str(p.relative_to(here.parents[1])): file_digest(p)
-        for p in sorted(paths)
-    }
-    if kind == "source":
-        hashes.update(SOURCE_TARGET_SLOTS)
-    return fingerprint(hashes)
+def implementation_digest(kind: str, model: dict | None = None) -> str:
+    """Hash active scientific module versions for a new job."""
+    stages = (2,) if kind == "preprocessing" else (1, 2)
+    return fit_module_digest(kind, model, stages)
 
 
 def build_plan(settings: dict, sessions: dict[str, dict]) -> dict:
@@ -75,7 +37,7 @@ def build_plan(settings: dict, sessions: dict[str, dict]) -> dict:
             f"got {len(sources)}."
         )
     common = dict(
-        implementation=implementation_digest(),
+        implementation=implementation_digest("source"),
         numerical_versions=scientific_versions(),
         data=settings["data"],
         model=settings["model"],
@@ -83,13 +45,14 @@ def build_plan(settings: dict, sessions: dict[str, dict]) -> dict:
         target_training=settings["target_training"],
         horizons=settings["evaluation_horizons"],
     )
-    target_implementation = implementation_digest("adaptation")
     jobs, memberships = {}, {name: [] for name in ANALYSES}
 
     def add(spec: dict) -> str:
         identity = dict(common, **spec)
         if spec["kind"] != "source":
-            identity["implementation"] = target_implementation
+            identity["implementation"] = implementation_digest(
+                spec["kind"], settings["model"]
+            )
         key = fingerprint(identity)
         if key not in jobs:
             jobs[key] = identity

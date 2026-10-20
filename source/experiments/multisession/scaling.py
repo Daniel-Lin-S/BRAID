@@ -152,7 +152,7 @@ def source_jobs(
             sources={name: sessions[name] for name in sets[count]},
             source_count=count,
             source_training=training,
-            implementation=implementation_digest(),
+            implementation=implementation_digest("source"),
         )
         first_id = add_job(jobs, first)
         second = deepcopy(old[existing[SHARING]])
@@ -163,7 +163,7 @@ def source_jobs(
             source_training=dict(training, maximum_updates=2 * cap),
             stage1_source=first_id,
             dependencies=[first_id],
-            implementation=implementation_digest(),
+            implementation=implementation_digest("source"),
         )
         residual[count] = add_job(jobs, second)
     return residual
@@ -229,7 +229,7 @@ def build_scaling_plan(
                 source_fit=sources[count],
                 source_training=jobs[sources[count]]["source_training"],
                 dependencies=[sources[count], spec["preprocessing"]],
-                implementation=implementation_digest("adaptation"),
+                implementation=implementation_digest("adaptation", spec["model"]),
             )
             key = add_job(jobs, spec)
             if direction == LOCO:

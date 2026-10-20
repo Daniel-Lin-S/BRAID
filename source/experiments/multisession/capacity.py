@@ -129,14 +129,14 @@ def capacity_sources(jobs: dict, reference: dict, indexed: dict) -> dict:
         for latent in LATENTS[1:]:
             first_spec = deepcopy(first)
             first_spec["latent"] = latent
-            first_spec["implementation"] = implementation_digest()
+            first_spec["implementation"] = implementation_digest("source")
             new_first = add_job(jobs, first_spec)
             residual_spec = deepcopy(residual)
             residual_spec.update(
                 latent=latent,
                 stage1_source=new_first,
                 dependencies=[new_first],
-                implementation=implementation_digest(),
+                implementation=implementation_digest("source"),
             )
             sources[count, latent] = add_job(jobs, residual_spec)
     return sources
@@ -218,7 +218,7 @@ def build_capacity_plan(
                             preprocessing[target],
                         ],
                         implementation=implementation_digest(
-                            "adaptation"
+                            "adaptation", spec["model"]
                         ),
                     )
                     adaptation_id = add_job(jobs, spec)

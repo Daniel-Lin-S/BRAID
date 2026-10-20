@@ -25,7 +25,14 @@ from experiments.configuration import read_yaml
 from experiments.datasets.nhp import NHPDataset
 from experiments.execution.runtime import select_gpus, thread_environment
 from experiments.multisession.log_paths import job_label, job_log_path
+from experiments.multisession.compatibility import (
+    freeze_source, load_compatibility, validate_resume,
+    validate_worker, verify_source_code,
+)
 from experiments.multisession.queue import adopt_workers, resource_available
+from experiments.multisession.queue_status import (
+    inspect_status, publish_status,
+)
 from experiments.multisession.plan import (
     PRIMARY,
     analysis_directory,
@@ -153,7 +160,9 @@ def plan_campaign(settings: dict) -> tuple[dict, Path]:
     return plan, path
 
 
-def run_job(plan: dict, key: str) -> None:
+def run_job(
+    plan: dict, key: str, compatibility: dict | None = None,
+) -> None:
     """Execute one ready source, preprocessing, or target job."""
     import numpy as np
     from experiments.multisession.data import (
@@ -172,8 +181,8 @@ def run_job(plan: dict, key: str) -> None:
     )
 
     spec = plan["jobs"][key]
-    if implementation_digest(spec["kind"]) != spec["implementation"]:
-        raise RuntimeError("Numerical implementation changed after planning.")
+    current = implementation_digest(spec["kind"], spec.get("model"))
+    validate_worker(key, spec, current, compatibility)
     directory = fit_directory(plan, key)
     identity = dict(spec)
     identity["parent_checksums"] = {}
@@ -254,6 +263,7 @@ def run_job(plan: dict, key: str) -> None:
             fit_directory(plan, spec["preprocessing"]),
             weights,
             seed,
+            spec["implementation"],
         )
         evaluate_target(model, features, directory, spec, spec["horizons"])
 
@@ -302,6 +312,9 @@ def reconcile(
 def run_queue(
     plan: dict, path: Path, launch: Path, settings: dict,
     previous_launch: Path | None = None,
+    compatibility: dict | None = None,
+    compatibility_path: Path | None = None,
+    source_sha256: str | None = None,
 ) -> None:
     """Schedule dependency-ready jobs on four memory-ranked GPU workers."""
     if previous_launch is None:
@@ -338,8 +351,25 @@ def run_queue(
         )
         LOGGER.info("Adopted %d existing workers", len(active))
     atomic_json(launch / "devices.json", devices)
+    launch_record = launch / "launch.json"
+    recorded_source = (
+        json.loads(launch_record.read_text()).get("source_sha256")
+        if launch_record.is_file() else None
+    )
+    if (
+        source_sha256 is not None and recorded_source is not None
+        and source_sha256 != recorded_source
+    ):
+        raise ValueError("Launch and command source checksums differ.")
+    expected_source = source_sha256 or recorded_source
+    if expected_source is not None:
+        verify_source_code(expected_source)
     states = reconcile(plan, path)
+    if compatibility is not None:
+        validate_resume(plan, states, compatibility)
     pending = {key for key, state in states.items() if state != "complete"}
+    for key in pending:
+        states[key] = "pending"
     failed = set()
     for key, _ in active.values():
         pending.discard(key)
@@ -443,6 +473,12 @@ def run_queue(
                     "--threads",
                     str(settings["runtime"]["cpu_threads"]),
                 ]
+                if compatibility_path is not None:
+                    command.extend([
+                        "--compatibility", str(compatibility_path.resolve())
+                    ])
+                if expected_source is not None:
+                    command.extend(["--source-sha256", expected_source])
                 with log.open("a") as stream:
                     process = subprocess.Popen(
                         command,
@@ -495,21 +531,8 @@ def run_queue(
                     states[key] = "blocked"
                     pending.remove(key)
                     failed.add(key)
-            atomic_json(
-                launch / "status.json",
-                dict(
-                    coordinator_pid=os.getpid(),
-                    counts=dict(Counter(states.values())),
-                    active={
-                        str(slot): dict(
-                            job=key, pid=proc.pid,
-                            label=job_label(key, plan["jobs"][key]),
-                            log=str(proc.log),
-                        )
-                        for slot, (key, proc) in active.items()
-                    },
-                    failures=sorted(failed),
-                ),
+            publish_status(
+                launch, plan, states, pending, active, "active"
             )
             if changed:
                 reconcile(plan, path, states)
@@ -537,6 +560,9 @@ def run_queue(
             reporting.wait()
         reconcile(plan, path, states)
         publish_reports(plan, path)
+        publish_status(
+            launch, plan, states, pending, active, "finished"
+        )
     if failed:
         LOGGER.error(
             "Campaign finished with %d failed/blocked jobs.", len(failed)
@@ -574,7 +600,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--experiment", type=Path)
     parser.add_argument(
-        "--stage", choices=("plan", "run", "worker", "report", "figures"),
+        "--stage", choices=(
+            "plan", "run", "worker", "report", "figures", "status"
+        ),
         default="run"
     )
     parser.add_argument("--detach", action="store_true")
@@ -583,16 +611,30 @@ def main() -> None:
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--launch", type=Path)
     parser.add_argument("--adopt-launch", type=Path)
+    parser.add_argument("--compatibility", type=Path)
+    parser.add_argument("--source-sha256")
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
     )
+    if args.stage == "status":
+        if args.launch is None:
+            parser.error("--stage status requires --launch")
+        print(json.dumps(inspect_status(args.launch.resolve()), indent=2))
+        return
     if args.stage == "worker":
         from experiments.execution.runtime import configure_device
 
+        if args.source_sha256 is not None:
+            verify_source_code(args.source_sha256)
         configure_device("auto", args.threads)
-        plan = json.loads(args.plan.read_text())
-        run_job(plan, args.job)
+        path = args.plan.resolve()
+        plan = json.loads(path.read_text())
+        compatibility = (
+            load_compatibility(args.compatibility, path)
+            if args.compatibility is not None else None
+        )
+        run_job(plan, args.job, compatibility)
         return
     if args.plan is not None:
         path = args.plan.resolve()
@@ -603,6 +645,10 @@ def main() -> None:
             parser.error("--experiment or --plan is required")
         settings = resolve(args.experiment)
         plan, path = plan_campaign(settings)
+    compatibility = (
+        load_compatibility(args.compatibility, path)
+        if args.compatibility is not None else None
+    )
     if args.stage == "plan":
         print(path.resolve())
         return
@@ -613,6 +659,13 @@ def main() -> None:
         report(plan, path)
         return
     if args.stage == "figures":
+        if settings["name"] == "multi_session_source_scaling":
+            from experiments.multisession.scaling_report import (
+                refresh_scaling_figures,
+            )
+
+            refresh_scaling_figures(plan, path)
+            return
         from experiments.multisession.reports import (
             refresh_sensitivity_figures,
         )
@@ -627,6 +680,9 @@ def main() -> None:
     )
     launch.mkdir(parents=True, exist_ok=True)
     if args.detach:
+        source_sha256 = freeze_source(launch.resolve())
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = str((launch / "source").resolve())
         command = [
             sys.executable,
             "-m",
@@ -637,12 +693,19 @@ def main() -> None:
             "run",
             "--launch",
             str(launch),
+            "--source-sha256",
+            source_sha256,
         ]
         if args.adopt_launch is not None:
             command.extend(["--adopt-launch", str(args.adopt_launch.resolve())])
+        if args.compatibility is not None:
+            command.extend([
+                "--compatibility", str(args.compatibility.resolve())
+            ])
         with (launch / "coordinator.log").open("a") as stream:
             process = subprocess.Popen(
                 command,
+                env=environment,
                 stdout=stream,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
@@ -653,11 +716,15 @@ def main() -> None:
                 pid=process.pid,
                 plan=str(path),
                 command=command,
+                source_sha256=source_sha256,
             ),
         )
         print(f"Launched pid={process.pid}; logs: {launch.resolve()}")
         return
-    run_queue(plan, path, launch, settings, args.adopt_launch)
+    run_queue(
+        plan, path, launch, settings, args.adopt_launch,
+        compatibility, args.compatibility, args.source_sha256,
+    )
 
 
 if __name__ == "__main__":

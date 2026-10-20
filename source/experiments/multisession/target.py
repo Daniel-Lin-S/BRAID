@@ -24,7 +24,6 @@ from experiments.contracts import FeatureSet
 from experiments.reports.evaluation import score_channels
 from experiments.datasets.nhp import TEST
 from experiments.multisession.data import LENGTH
-from experiments.multisession.plan import implementation_digest
 from experiments.multisession.preprocessing import (
     preprocessing_predictions, save_snapshot,
 )
@@ -163,12 +162,13 @@ def fit_target(
     preprocessing: Path,
     weights: dict,
     seed: int,
+    implementation: str,
 ) -> BRAIDModel:
     """Fit target-private components while imported modules stay frozen."""
     tf.keras.utils.set_random_seed(seed)
     pre = load_pickle(preprocessing / "model.p")["model"]
     predictions = preprocessing_predictions(
-        pre, arrays, preprocessing, implementation_digest("adaptation")
+        pre, arrays, preprocessing, implementation
     )
     nested = "stage1" in weights or "stage2" in weights
     if nested and set(weights) != {"stage1", "stage2"}:

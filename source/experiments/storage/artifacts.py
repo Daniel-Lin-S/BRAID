@@ -20,6 +20,9 @@ from experiments.storage.cache import (
 )
 from experiments.contracts import FeatureSet, Model
 from experiments.datasets.populations import POPULATION_SELECTION_POLICY
+from experiments.storage.scientific_modules import (
+    active_stages, fit_module_digest,
+)
 
 FIT_SCHEMA = 1
 SEED_MODULUS = 2**31 - 1
@@ -99,6 +102,42 @@ def resolved_fit(identity: dict, features: FeatureSet | None = None) -> dict:
     return arguments
 
 
+def scientific_fit_arguments(identity: dict) -> dict:
+    """Exclude arguments for stages absent from a new BRAID neural fit.
+
+    Parameters
+    ----------
+    identity : dict
+        Resolved configuration, case, and optional fit overrides.
+
+    Returns
+    -------
+    dict
+        Canonical numerical arguments used by the active fit stages.
+    """
+    arguments = resolved_fit(identity)
+    from experiments.storage.implementation import legacy_fitting_signatures
+
+    recorded = identity["configurations"].get("fitting_implementation")
+    if recorded in legacy_fitting_signatures():
+        return arguments
+    return active_stage_arguments(arguments)
+
+
+def active_stage_arguments(arguments: dict) -> dict:
+    """Canonicalize a copy of fit arguments to the executed stages."""
+    result = copy.deepcopy(arguments)
+    for stage in {1, 2} - set(active_stages(result)):
+        for name in ("A", "K", "Cy", "Cz"):
+            result["args_base"].pop(f"{name}{stage}_args", None)
+        for name in (
+            "state_transition_architecture", "lstm_arguments",
+            "transformer_arguments",
+        ):
+            result["args_base"].pop(f"stage_{stage}_{name}", None)
+    return result
+
+
 def effective_model_configuration(identity: dict) -> dict:
     """Return the exact model YAML for one structural case.
 
@@ -163,13 +202,24 @@ def scientific_source(source: dict) -> dict:
 
 def model_identity(snapshots: dict, case: dict) -> dict:
     """Collect numerical context shared by seed and recipe resolution."""
+    fit = scientific_fit_arguments(dict(configurations=snapshots, case=case))
+    structure = effective_model_configuration(
+        dict(configurations=snapshots, case=case)
+    )
+    from experiments.storage.implementation import legacy_fitting_signatures
+
+    recorded = snapshots.get("fitting_implementation")
+    implementation = (
+        recorded if recorded in legacy_fitting_signatures()
+        else fit_module_digest("generic", structure, active_stages(fit))
+    )
     return dict(
-        model=resolved_fit(dict(configurations=snapshots, case=case)),
+        model=fit,
         data=scientific_source(snapshots["data"]),
         seed=snapshots["experiment"]["seed"],
         model_plugin=snapshots["experiment"]["model_plugin"],
         versions=snapshots.get("versions"),
-        fitting_implementation=snapshots.get("fitting_implementation"),
+        fitting_implementation=implementation,
     )
 
 
@@ -194,7 +244,7 @@ def model_settings(
         against a particular session's available windows.
     """
     recipe = model_identity(snapshots, case)
-    recipe["model"] = resolved_fit(dict(
+    recipe["model"] = scientific_fit_arguments(dict(
         configurations=snapshots, case=case, model_overrides=overrides,
     ))
     recipe["data"].pop("sessions", None)
@@ -233,7 +283,7 @@ def fit_inputs(identity: dict) -> dict:
     """Collect effective fitting inputs before deriving the random seed."""
     snapshots = identity["configurations"]
     model = model_identity(snapshots, identity["case"])
-    model["model"] = resolved_fit(identity)
+    model["model"] = scientific_fit_arguments(identity)
     return dict(
         schema=FIT_SCHEMA, model=model, fold=identity["fold"],
         source=scientific_source(identity["source"]),
@@ -308,6 +358,14 @@ def validate_model_settings(directory: Path) -> dict:
     return record
 
 
+def _normalized_recipe(recipe: dict) -> dict:
+    """Compare legacy and new recipes on executed BRAID stage arguments."""
+    result = copy.deepcopy(recipe)
+    result.pop("fitting_implementation", None)
+    result["model"] = active_stage_arguments(result["model"])
+    return result
+
+
 def _compatible_model_settings(recorded: dict, expected: dict) -> bool:
     """Compare recipes using only certified fitting compatibility."""
     from experiments.storage.implementation import compatible_fitting
@@ -315,8 +373,7 @@ def _compatible_model_settings(recorded: dict, expected: dict) -> bool:
     numerical = "fitting_implementation"
     return (
         set(recorded) == set(expected)
-        and {k: v for k, v in recorded.items() if k != numerical}
-        == {k: v for k, v in expected.items() if k != numerical}
+        and _normalized_recipe(recorded) == _normalized_recipe(expected)
         and compatible_fitting(
             recorded.get(numerical), expected.get(numerical)
         )
@@ -380,7 +437,7 @@ def fit_directory(root: Path, identity: dict) -> Path:
     from experiments.storage.implementation import fitting_predecessors
 
     predecessors = fitting_predecessors(
-        identity["configurations"].get("fitting_implementation")
+        fit_inputs(identity)["model"]["fitting_implementation"]
     )
     completed = []
     for implementation in predecessors:
@@ -457,6 +514,10 @@ def completed_fit(run: Path, identity: dict) -> bool:
         for value in (actual_core, expected_core):
             value.pop("fit_seed", None)
             value.pop("settings_hash", None)
+        for value in (actual_core, expected_core):
+            value["model"]["model"] = active_stage_arguments(
+                value["model"]["model"]
+            )
         if (
             actual_core != expected_core
             or not compatible_fitting(

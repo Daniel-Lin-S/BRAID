@@ -1,25 +1,27 @@
-"""Fingerprint fitting, inference and analysis implementations independently.
+"""Version fitting and inference separately from analysis source files.
 
-Function-level adapter signatures prevent scoring/report changes from
-invalidating trained checkpoints. Scientific model and preprocessing source
-versions still participate in fit identity.
+Inputs are explicit numerical module versions. Outputs are deterministic
+signatures for new BRAID fits and inference; analysis retains a code digest.
+Legacy source hashes remain eligible only through certified transitions.
 """
 
-import ast
 from importlib.metadata import version
 from pathlib import Path
 import platform
 
 from experiments.storage.cache import file_digest, fingerprint
+from experiments.storage.scientific_modules import (
+    MODULE_VERSIONS, fit_module_digest,
+)
 
 SOURCE = Path(__file__).resolve().parents[2]
-FIT_ADAPTER_METHODS = {"resolve_fit_configuration", "fit", "save"}
-FIT_ADAPTER_IDENTITY_EXCLUDED_CONSTANTS = frozenset({
-    "CANONICAL_ZERO_STAGE_THREE",
-    "CASE_NAME_PREFIX",
-    "LATENT_SPLIT_FIELDS",
-    "ZERO_STAGE_THREE",
-})
+SIGNATURE_SCHEMA = 2
+LEGACY_FITTING_CANONICAL = (
+    "ad69a9feeccabcca1b324c2cec1cc391d4324d4b7e78e7fe3119493a01c29c5c"
+)
+LEGACY_FITTING_POST_TRANSFORMER = (
+    "7202fb249cc2e4fb23a6ee4cd77c1e25fd471aeec09b8a8d38df12a61a770654"
+)
 # Only certified numerical-equivalence pairs permit immutable bundle reuse.
 FITTING_REUSE = frozenset({
     (
@@ -56,6 +58,11 @@ FITTING_REUSE = frozenset({
     ),
 })
 INFERENCE_REUSE = frozenset({
+    # The explicit inference version retains the reviewed legacy path.
+    (
+        "ea27a870989f7ef6ee5d9baeacfda88dcf279ab6a12dd72e992108ecba817d87",
+        "dc7cd9c8cbe1c400d0783c0e77328dce594dac66e431c16f277312d2f47713dc",
+    ),
     (
         "aa186cf5db457a9904ffe73bed7af941344b5c48a381f0b2a75a5cc57342a062",
         "c3629ba0b1feb4510eabbffaede2ac0e9365fd27e16cebb2dd20e613cfd5a7f3",
@@ -110,47 +117,16 @@ def scientific_versions() -> dict:
 
 
 def implementation_signatures() -> dict[str, str]:
-    """Return scientific implementation signatures for each artifact owner."""
-    adapter = SOURCE / "experiments" / "models/braid_backend.py"
-    tree = ast.parse(adapter.read_text())
-    methods = {
-        node.name: ast.dump(node, include_attributes=False)
-        for cls in tree.body if isinstance(cls, ast.ClassDef)
-        for node in cls.body if isinstance(node, ast.FunctionDef)
-    }
-    model = {
-        str(path.relative_to(SOURCE)): file_digest(path)
-        for path in sorted((SOURCE / "BRAID").rglob("*.py"))
-        if path.name != "multisession.py"
-    }
-    fitting = dict(
-        model=model,
-        adapter={name: methods[name] for name in FIT_ADAPTER_METHODS},
-        window_selection=file_digest(SOURCE / "experiments" / "datasets/windows.py"),
-        constants=[
-            ast.dump(node, include_attributes=False)
-            for node in tree.body
-            if isinstance(node, ast.Assign)
-            and not any(
-                isinstance(target, ast.Name)
-                and target.id in FIT_ADAPTER_IDENTITY_EXCLUDED_CONSTANTS
-                for target in node.targets
-            )
-        ],
-    )
-    prediction_tree = ast.parse(
-        (SOURCE / "experiments" / "execution/fitting.py").read_text()
-    )
+    """Return versioned runtime signatures and separate analysis digest."""
+    fitting = dict(schema=SIGNATURE_SCHEMA, modules=MODULE_VERSIONS)
     inference = dict(
-        model=model, predict=methods["predict"],
-        inputs=[
-            ast.dump(node, include_attributes=False)
-            for node in prediction_tree.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "prediction_arrays"
-        ],
-        window_selection=fitting["window_selection"],
+        schema=SIGNATURE_SCHEMA,
+        version=MODULE_VERSIONS["braid.inference"],
     )
+    source_audit = {
+        str(path.relative_to(SOURCE)): file_digest(path)
+        for path in sorted(SOURCE.rglob("*.py"))
+    }
     analysis = {
         name: file_digest(SOURCE / "experiments" / name)
         for name in (
@@ -159,6 +135,7 @@ def implementation_signatures() -> dict[str, str]:
     }
     return dict(
         fitting_implementation=fingerprint(fitting),
+        fitting_source_audit=source_audit,
         inference_implementation=fingerprint(inference),
         analysis_implementation=fingerprint(analysis),
     )
@@ -188,18 +165,51 @@ def _compatible_transition(
     return False
 
 
+def legacy_fitting_signatures() -> frozenset[str]:
+    """Return reviewed raw-code signatures from existing BRAID fits."""
+    signatures = {
+        recorded for recorded, _ in FITTING_REUSE
+        if _compatible_transition(
+            recorded, LEGACY_FITTING_CANONICAL, FITTING_REUSE
+        )
+    }
+    signatures.update({
+        LEGACY_FITTING_CANONICAL, LEGACY_FITTING_POST_TRANSFORMER,
+    })
+    return frozenset(signatures)
+
+
+def semantic_legacy_targets() -> frozenset[str]:
+    """Return new MLP and LSTM fit signatures certified for legacy reuse."""
+    result = set()
+    for architecture in ("multilayer_perceptron", "lstm"):
+        model = dict(model=dict(stage_1=dict(
+            state_transition=dict(architecture=architecture)
+        )))
+        result.add(fit_module_digest("generic", model, (1,)))
+    return frozenset(result)
+
+
 def compatible_fitting(recorded: str | None, expected: str | None) -> bool:
     """Return whether a completed fit is numerically reusable."""
+    if (
+        expected in semantic_legacy_targets()
+        and recorded in legacy_fitting_signatures()
+    ):
+        return True
     return _compatible_transition(recorded, expected, FITTING_REUSE)
 
 
 def fitting_predecessors(expected: str | None) -> tuple[str, ...]:
     """Return certified predecessor fingerprints for one implementation."""
-    return tuple(sorted(
+    predecessors = {
         recorded for recorded, _ in FITTING_REUSE
         if recorded != expected
         and _compatible_transition(recorded, expected, FITTING_REUSE)
-    ))
+    }
+    if expected in semantic_legacy_targets():
+        predecessors.update(legacy_fitting_signatures())
+    return tuple(sorted(predecessors))
 
 
 def compatible_inference(recorded: str | None, expected: str | None) -> bool:

@@ -136,7 +136,7 @@ def add_source(
     spec = deepcopy(template)
     spec["sharing"] = sharing
     spec["objective"] = objective
-    spec["implementation"] = implementation_digest()
+    spec["implementation"] = implementation_digest("source")
     if first_stage is not None:
         spec["stage1_sharing"] = "A"
         spec["stage2_sharing"] = sharing
@@ -165,7 +165,7 @@ def add_target(
         objective=objective,
         source_fit=source_id,
         dependencies=[source_id, spec["preprocessing"]],
-        implementation=implementation_digest("adaptation"),
+        implementation=implementation_digest("adaptation", spec["model"]),
     )
     key = fingerprint(spec)
     jobs[key] = spec
@@ -181,7 +181,7 @@ def add_loco_control(
     spec.update(target)
     spec["transfer_direction"] = DIRECTION
     spec["implementation"] = implementation_digest(
-        spec["kind"]
+        spec["kind"], spec["model"]
     )
     if preprocessing is not None:
         spec["preprocessing"] = preprocessing

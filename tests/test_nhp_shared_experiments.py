@@ -788,7 +788,9 @@ def test_main_sweeps_share_two_fits_without_common_retraining(
         "implementation", "dependencies", "numerical_override",
     ],
 )
-def test_settings_hash_covers_complete_recipe(workflow, change):
+def test_settings_hash_covers_complete_recipe(
+    workflow, change, monkeypatch
+):
     """Every scientific recipe change must leave the old settings group."""
     config = sweep("latent_dimension_sweep")
     case = build_cases(config["experiment"]["suite"])[0]
@@ -814,7 +816,9 @@ def test_settings_hash_covers_complete_recipe(workflow, change):
     elif change == "seed":
         changed["experiment"]["seed"] = 100
     elif change == "implementation":
-        changed["fitting_implementation"] = "different-numerical-code"
+        from experiments.storage.scientific_modules import MODULE_VERSIONS
+
+        monkeypatch.setitem(MODULE_VERSIONS, "braid.training", 2)
     elif change == "dependencies":
         changed["versions"] = {"python": "different-version"}
     elif change == "numerical_override":
@@ -827,20 +831,36 @@ def test_settings_hash_covers_complete_recipe(workflow, change):
 
 
 
-def test_certified_fitting_predecessor_reuses_only_completed_fit(
-    workflow, monkeypatch,
-):
-    """Reuse a certified completion while leaving an incomplete fit behind."""
+def test_inactive_stage_options_do_not_change_new_fit_identity():
+    """Only executed stages contribute parameters to a new fit ID."""
+    config = sweep("latent_dimension_sweep")
+    case = build_cases(config["experiment"]["suite"])[0]
+    case = copy.deepcopy(case)
+    case["dimensions"] = {"nx": 1, "n1": 1}
+    baseline = model_settings(config, case)
+    inactive = copy.deepcopy(config)
+    inactive["model"]["model"]["stage_2"]["neural_decoder"][
+        "hidden_size"
+    ] = 128
+    assert model_settings(inactive, case) == baseline
+    active = copy.deepcopy(config)
+    active["model"]["model"]["stage_1"]["neural_decoder"][
+        "hidden_size"
+    ] = 128
+    assert model_settings(active, case) != baseline
+
+
+def test_certified_fitting_predecessor_reuses_only_completed_fit(workflow):
+    """Reuse a validated raw-code fit under a new module-version identity."""
     from experiments import implementation
 
     old = sweep("latent_dimension_sweep")
-    old["fitting_implementation"] = "old-fitting"
+    old["fitting_implementation"] = (
+        implementation.LEGACY_FITTING_CANONICAL
+    )
     new = copy.deepcopy(old)
-    new["fitting_implementation"] = "new-fitting"
-    monkeypatch.setattr(
-        implementation,
-        "FITTING_REUSE",
-        frozenset({("old-fitting", "new-fitting")}),
+    new["fitting_implementation"] = (
+        implementation.implementation_signatures()["fitting_implementation"]
     )
     case = build_cases(old["experiment"]["suite"])[0]
     old_identity, _ = case_identity(

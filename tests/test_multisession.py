@@ -6,6 +6,7 @@ widths. No real data or completed campaign artifacts are modified.
 
 from copy import deepcopy
 from pathlib import Path
+import json
 
 import numpy as np
 import tensorflow as tf
@@ -436,7 +437,10 @@ def test_queue_isolates_failure_and_reuses_completion(tmp_path, monkeypatch):
     monkeypatch.setattr(runner.time, 'sleep', lambda seconds: None)
     runner.run_queue(plan, path, launch, settings)
     status = json.loads((launch / 'status.json').read_text())
-    assert status['counts'] == dict(complete=3, failed=1, blocked=1)
+    assert status['counts'] == dict(
+        complete=3, failed=1, blocked=1, finished=5,
+        running=0, remaining=0, total=5,
+    )
     assert set(started) == {'bad', 'good', 'independent'}
     for key in started:
         matches = list((launch / 'jobs').rglob(f'*__{key}.log'))
@@ -621,24 +625,42 @@ def test_snapshot_preserves_live_graphs_and_aliases(tmp_path):
         np.testing.assert_array_equal(left, right)
 
 
-def test_source_identity_ignores_only_target_dependencies(monkeypatch):
-    """Target edits preserve source IDs; source edits invalidate them."""
-    from experiments.multisession import plan
+def test_fit_identity_uses_active_module_versions(monkeypatch):
+    """Irrelevant source edits preserve IDs; used module versions change IDs."""
+    from experiments.multisession import compatibility, plan
+    from experiments.storage.scientific_modules import MODULE_VERSIONS
 
-    original = plan.file_digest
-    baseline = plan.implementation_digest("source")
-    target = plan.implementation_digest("adaptation")
-    monkeypatch.setattr(
-        plan, "file_digest",
-        lambda path: "changed" if path.name == "target.py" else original(path),
+    settings = read_yaml(
+        ROOT / "assets/config/nhp/experiments/multi_session_training.yaml"
     )
-    assert plan.implementation_digest("source") == baseline
-    assert plan.implementation_digest("adaptation") != target
+    model = read_yaml(Path(settings["modules"]["model"]))
+    source = plan.implementation_digest("source")
+    target = plan.implementation_digest("adaptation", model)
     monkeypatch.setattr(
-        plan, "file_digest",
-        lambda path: "changed" if path.name == "source.py" else original(path),
+        compatibility, "source_code_digest", lambda: "changed"
     )
-    assert plan.implementation_digest("source") != baseline
+    assert plan.implementation_digest("source") == source
+    assert plan.implementation_digest("adaptation", model) == target
+    monkeypatch.setitem(
+        MODULE_VERSIONS, "braid.dynamics.causal_transformer", 2
+    )
+    assert plan.implementation_digest("adaptation", model) == target
+    monkeypatch.setitem(MODULE_VERSIONS, "multisession.source", 2)
+    assert plan.implementation_digest("source") != source
+    assert plan.implementation_digest("adaptation", model) == target
+    monkeypatch.setitem(
+        MODULE_VERSIONS, "braid.dynamics.multilayer_perceptron", 2
+    )
+    assert plan.implementation_digest("adaptation", model) != target
+
+
+def test_non_neural_tail_does_not_activate_second_dynamics():
+    """A post-stage width does not contribute stage-two dynamics."""
+    from experiments.storage.scientific_modules import active_stages
+
+    assert active_stages({"nx": 64, "n1": 32, "n3": 32}) == (1,)
+    assert active_stages({"nx": 64, "n1": 32, "n3": 16}) == (1, 2)
+    assert active_stages({"nx": 64, "n1": 0, "n3": 32}) == (1, 2)
 
 
 def test_quarantine_incomplete_components(tmp_path):
@@ -665,3 +687,69 @@ def test_quarantine_incomplete_components(tmp_path):
     assert (complete / "complete.json").exists()
     assert not interrupted.exists()
     assert quarantine_incomplete_components(fit) == []
+
+
+def test_status_does_not_report_exited_workers_as_running(
+    tmp_path, monkeypatch,
+):
+    """Status derives current running counts from PID start ticks."""
+    from experiments.multisession import queue_status
+
+    status = dict(
+        coordinator_pid=100,
+        coordinator_start_ticks="old",
+        updated_at_utc="2026-10-20T00:00:00+00:00",
+        phase="active",
+        counts=dict(
+            total=4, complete=1, failed=0, blocked=0,
+            running=2, remaining=1,
+        ),
+        active={
+            "0": dict(pid=200, start_ticks="same"),
+            "1": dict(pid=201, start_ticks="reused"),
+        },
+    )
+    (tmp_path / "status.json").write_text(json.dumps(status))
+    states = {
+        100: ("Z", "old"),
+        200: ("S", "same"),
+        201: ("S", "different"),
+    }
+    monkeypatch.setattr(
+        queue_status, "process_state", lambda pid: states.get(pid)
+    )
+    actual = queue_status.inspect_status(tmp_path)
+    assert actual["phase"] == "stopped"
+    assert actual["counts"]["running"] == 1
+    assert actual["counts"]["remaining"] == 2
+    assert set(actual["active"]) == {"0"}
+
+
+def test_frozen_launch_source_survives_worktree_edits(
+    tmp_path, monkeypatch,
+):
+    """A later repository edit cannot change a pinned launch's code."""
+    from experiments import campaign_source as compatibility
+
+    repository = tmp_path / "repository"
+    source = repository / "source"
+    config = repository / "assets" / "config"
+    source.mkdir(parents=True)
+    config.mkdir(parents=True)
+    original = source / "numerical.py"
+    original.write_text("VERSION = 1\n")
+    (config / "default.yaml").write_text("model: {}\n")
+    monkeypatch.setattr(compatibility, "SOURCE_ROOT", source)
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    digest = compatibility.freeze_source(launch)
+    original.write_text("VERSION = 2\n")
+    assert compatibility.source_code_digest() != digest
+    assert compatibility.source_code_digest(launch / "source") == digest
+    monkeypatch.setattr(
+        compatibility, "SOURCE_ROOT", launch / "source"
+    )
+    compatibility.verify_source_code(digest)
+    snapshot_config = launch / "assets" / "config" / "default.yaml"
+    snapshot_config.write_text("model: {changed: true}\n")
+    assert compatibility.source_code_digest() != digest
