@@ -42,3 +42,13 @@ For the CPU tasks, lower-priority should be assigned to avoid the laucnhed pytho
 You should parallelise independent neural fits whenever possible. Independent experiments should ALWAYS be launched without waiting other (or even a single stage of ) irrelevant experiments to finish.
 
 For multi-stage experiment with cross-stage dependencies, DONT parallelise.
+
+## Configurations and compaign identity
+
+ONLY hash a model's fit using its scientific parameters (e.g., batch size, number of epochs, architectural parameters).
+
+NEVER use invocation parameters (number of devices, GPU/CPU settings, etc.) that doesn't affect the scientific definition of model fits to generate hash identity.
+
+NEVER use the entire python tree to hash the fit identity. If implementation of a scientific module changes and that has significant effect on the results (test by minimal validation), then reflect this scientific change in the configuration.
+
+Changing the hashing mechanism or minor code implementations (e.g., file tree organisation) should NOT invalidate previous completed fits.
