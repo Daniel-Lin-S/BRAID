@@ -30,6 +30,10 @@ except Exception:
 import matplotlib.pyplot as plt
 import numpy as np
 
+from .causal_transformer import (
+    CausalTransformerCell, CausalTransformerSequence,
+    WINDOW_BINS,
+)
 from .sequence import independent_indices
 from .RegressionModel import RegressionModel
 from .tools.model_base_classes import ModelWithFitWithRetry, Reconstructable
@@ -716,6 +720,8 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
                     log_dir = '', # If not empty, will save logs with tensorboard
                     linear_cell=False, LSTM_cell=False,
                     state_transition_architecture=None,
+                    transformer_arguments=None,
+                    neural_dims=None, stage_one_dims=0,
                     missing_marker=None, cell_args={},
                     initLSSM = None, # An LSSM to initialize the RNN with
                     optimizer_name = 'Adam', # Name of optimizer
@@ -747,6 +753,9 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
             'linear_cell': linear_cell, 
             'LSTM_cell': LSTM_cell, 
             'state_transition_architecture': state_transition_architecture,
+            'transformer_arguments': transformer_arguments,
+            'neural_dims': neural_dims,
+            'stage_one_dims': stage_one_dims,
             'missing_marker': missing_marker, 
             'cell_args': cell_args, 
             'initLSSM': initLSSM,
@@ -817,6 +826,9 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
         self.state_transition_architecture = (
             state_transition_architecture
         )
+        self.transformer_arguments = transformer_arguments or {}
+        self.neural_dims = neural_dims
+        self.stage_one_dims = stage_one_dims
         self.build()
         if initLSSM is not None:
             self.setToLSSM(initLSSM)
@@ -828,7 +840,8 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
             'ny_out', 'nft', 'out_dist', 'n1_in', 'has_prior_pred', 
             'log_dir', 'linear_cell', 'LSTM_cell',
             'state_transition_architecture',
-            'missing_marker', 'cell_args', 'initLSSM',
+            'transformer_arguments', 'neural_dims',
+            'stage_one_dims', 'missing_marker', 'cell_args', 'initLSSM',
             'optimizer_name', 'optimizer_args',
             'lr_scheduler_name', 'lr_scheduler_args',
             'stateful',
@@ -873,6 +886,35 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
                     name=self.name,
                     **self.cell_args,
                 )
+            elif self.state_transition_architecture == (
+                'causal_transformer'
+            ):
+                if self.neural_dims is None:
+                    raise ValueError(
+                        'Transformer requires neural_dims.'
+                    )
+                if self.ny - self.neural_dims - (
+                    self.stage_one_dims
+                ) != 2:
+                    raise ValueError(
+                        'Transformer expects exactly two target '
+                        'coordinate inputs.'
+                    )
+                cell = CausalTransformerCell(
+                    self.nx, self.ny_out, self.neural_dims,
+                    self.stage_one_dims, self.nft, self.n1_in,
+                    self.steps_ahead, self.cell_args['CSettings'],
+                    self.cell_args['KSettings'],
+                    self.missing_marker, self.has_prior_pred,
+                    self.observable_U_in_Cfw,
+                    sequence_bins=self.block_samples,
+                    include_stage_one_state=(
+                        self.transformer_arguments.get(
+                            'include_stage_one_state', True
+                        )
+                    ),
+                    name=self.name,
+                )
             else:
                 raise ValueError(
                     'Unsupported state-transition architecture: '
@@ -913,7 +955,16 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
             prior_pred = tf.keras.Input(shape=(self.block_samples, self.ny_out, num_steps_ahead, ), batch_size=self.batch_size, name='rnn_prior_pred')
             y_in += (prior_pred,)
         self.y_in = y_in
-        self.rnn = tf.keras.layers.RNN(cell, return_sequences=True, stateful=self.stateful)
+        if isinstance(cell, CausalTransformerCell):
+            if self.stateful:
+                raise ValueError(
+                    'Sequence Transformer requires stateful=False.'
+                )
+            self.rnn = CausalTransformerSequence(cell)
+        else:
+            self.rnn = tf.keras.layers.RNN(
+                cell, return_sequences=True, stateful=self.stateful
+            )
         self.rnn_outs = self.rnn(self.y_in)           # y_k+1|k is the output
         self.y_out = self.rnn_outs[0]
         if self.steps_ahead is None:
@@ -930,6 +981,9 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
 
         self._apply_frozen_modules()
         self.compile()
+        if hasattr(self, "_stream_state"):
+            del self._stream_state
+            del self._stream_steps
 
     def set_frozen_modules(self, weights: dict) -> None:
         """Import named native mapping arrays and exclude them from fitting.
@@ -951,6 +1005,13 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
         weights = getattr(self, 'frozen_module_weights', None) or {}
         if set(weights) - {'A', 'Afw', 'Kfw', 'C'}:
             raise ValueError('Only A, Afw, Kfw, and C can be imported.')
+        if weights and isinstance(
+            self.rnn.cell, CausalTransformerCell
+        ):
+            raise ValueError(
+                'Frozen mapping transfer is unavailable for '
+                'causal_transformer.'
+            )
         for name, values in weights.items():
             if not hasattr(self.rnn.cell, name):
                 raise ValueError(f'Cannot freeze missing mapping {name}.')
@@ -1206,6 +1267,119 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
         self.build()
         self.set_cell_weights(weights)
 
+    def reset_stream(self, initial_state=None) -> None:
+        """Start a fresh independent Transformer sequence.
+
+        Parameters
+        ----------
+        initial_state : ndarray, optional
+            Latent seed of shape ``(nx,)``; default is the fitted seed.
+        """
+        if not isinstance(self.rnn.cell, CausalTransformerCell):
+            raise ValueError(
+                "Streaming is available only for causal_transformer."
+            )
+        if initial_state is None:
+            seed = self.rnn.cell.initial_state.numpy().copy()
+        else:
+            seed = np.asarray(initial_state, dtype=np.float32).reshape(-1)
+            if seed.shape != (self.nx,):
+                raise ValueError(
+                    f"Expected x0 shape ({self.nx},), got {seed.shape}."
+                )
+            if not np.isfinite(seed).all():
+                raise ValueError("x0 contains nonfinite values.")
+        self._stream_seed = seed
+        self._stream_inputs = []
+        self._stream_steps = 0
+
+    def stream_step(
+        self, observed, future=None, feedthrough=None, prior=None
+    ) -> tuple[np.ndarray, ...]:
+        """Predict one bin from the accumulated causal sequence.
+
+        Parameters
+        ----------
+        observed : ndarray
+            Current stage input with shape ``(ny,)``.
+        future : ndarray, optional
+            Known forecast inputs with shape
+            ``(n1_in, max_horizon)``. Default is None.
+        feedthrough : ndarray, optional
+            Decoder input with shape ``(nft,)`` or
+            ``(nft, horizons)``. Default is None.
+        prior : ndarray, optional
+            Stage-one predictions with shape
+            ``(ny_out, horizons)``. Default is None.
+
+        Returns
+        -------
+        tuple of ndarray
+            BRAID predictions and latents for the current bin.
+        """
+        if not isinstance(self.rnn.cell, CausalTransformerCell):
+            raise ValueError(
+                "Streaming is available only for causal_transformer."
+            )
+        if not hasattr(self, "_stream_inputs") or (
+            self._stream_steps == self.block_samples
+        ):
+            self.reset_stream()
+        steps = self.steps_ahead or [1]
+        expected = [("observed", observed, (self.ny,))]
+        if self.nft:
+            shape = (
+                (self.nft, len(steps))
+                if self.observable_U_in_Cfw else (self.nft,)
+            )
+            expected.append(("feedthrough", feedthrough, shape))
+        if self.n1_in:
+            expected.append((
+                "future", future, (self.n1_in, max(steps))
+            ))
+        if self.has_prior_pred:
+            expected.append((
+                "prior", prior, (self.ny_out, len(steps))
+            ))
+        arrays = []
+        for name, value, shape in expected:
+            if value is None:
+                raise ValueError(f"Streaming requires {name}.")
+            array = np.asarray(value, dtype=np.float32)
+            if array.shape != shape:
+                raise ValueError(
+                    f"Expected {name} shape {shape}, got {array.shape}."
+                )
+            if not np.isfinite(array).all():
+                raise ValueError(f"{name} contains nonfinite values.")
+            arrays.append(array)
+        self._stream_inputs.append(arrays)
+        self._stream_steps += 1
+        predictor = []
+        for index, array in enumerate(arrays):
+            shape = (1, self.block_samples, *array.shape)
+            padded = np.zeros(shape, dtype=np.float32)
+            if index == 0:
+                padded.fill(self.missing_marker)
+            for position, values in enumerate(self._stream_inputs):
+                padded[0, position] = values[index]
+            predictor.append(tf.convert_to_tensor(padded))
+        previous = self.rnn.cell.initial_state.numpy().copy()
+        self.rnn.cell.initial_state.assign(self._stream_seed)
+        try:
+            outputs = self.model(tuple(predictor), training=False)
+        finally:
+            self.rnn.cell.initial_state.assign(previous)
+        result = tuple(
+            output.numpy()[0, self._stream_steps - 1]
+            for output in outputs
+        )
+        if any(not np.isfinite(value).all() for value in result):
+            raise FloatingPointError(
+                "Transformer streaming produced nonfinite output."
+            )
+        return result
+
     def set_cell_weights(self, weights, skip_missing=False):
         if isinstance(self.rnn.cell, NLRegRNNCell):
             self.rnn.cell.set_cell_weights(weights, skip_missing=skip_missing)
@@ -1396,7 +1570,33 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
             eagerly_flag_backup = set_global_tf_eagerly_flag(False)   
             if self.rnn.stateful:
                 self.rnn.reset_states(states=initial_state)   # Set the initial RNN state to zero
-            rnn_outs = self.model.predict(predictor_input, batch_size=self.batch_size, verbose=verbose) # xHat_{1|0} to xHat_{Ndat|Ndat-1} and yHat_{1|0} to yHat_{Ndat|Ndat-1}
+            transformer_seed = None
+            if (
+                isinstance(self.rnn.cell, CausalTransformerCell)
+                and initial_state is not None
+            ):
+                seed = np.asarray(initial_state).reshape(-1)
+                if seed.shape != (self.nx,):
+                    raise ValueError(
+                        f"Expected x0 shape ({self.nx},), got "
+                        f"{seed.shape}."
+                    )
+                if not np.isfinite(seed).all():
+                    raise ValueError("x0 contains nonfinite values.")
+                transformer_seed = (
+                    self.rnn.cell.initial_state.numpy().copy()
+                )
+                self.rnn.cell.initial_state.assign(seed)
+            try:
+                rnn_outs = self.model.predict(
+                    predictor_input, batch_size=self.batch_size,
+                    verbose=verbose,
+                )
+            finally:
+                if transformer_seed is not None:
+                    self.rnn.cell.initial_state.assign(
+                        transformer_seed
+                    )
             set_global_tf_eagerly_flag(eagerly_flag_backup)
             steps_ahead = self.steps_ahead if self.steps_ahead is not None else [1]
             y_hat_steps = rnn_outs[:len(steps_ahead)]
@@ -1440,11 +1640,29 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
             if steps_ahead is not None:
                 x0T = x0[np.newaxis, :]
                 x0_fullT = x0_full[np.newaxis, :]
+                transformer_batches = (
+                    isinstance(self.rnn.cell, CausalTransformerCell)
+                    and not self.rnn.stateful
+                )
+                if transformer_batches:
+                    initial_count = num_batch * self.batch_size
+                    x0T = np.repeat(x0T, initial_count, axis=0)
+                    x0_fullT = np.repeat(
+                        x0_fullT, initial_count, axis=0
+                    )
                 if self.nft > 0 and FT_in is not None and FT_in_shift_by_one:
                     FT0T = FT0
-                    if not self.rnn.stateful and (FT0.shape[0] == feedthrough_res.shape[0]): # If trial based
-                        x0T = np.tile(x0T.T, [1, feedthrough_res.shape[0]]).T
-                        x0_fullT = np.tile(x0_fullT.T, [1, feedthrough_res.shape[0]]).T
+                    if (
+                        not transformer_batches
+                        and not self.rnn.stateful
+                        and FT0.shape[0] == feedthrough_res.shape[0]
+                    ):
+                        x0T = np.tile(
+                            x0T.T, [1, feedthrough_res.shape[0]]
+                        ).T
+                        x0_fullT = np.tile(
+                            x0_fullT.T, [1, feedthrough_res.shape[0]]
+                        ).T
                 else:
                     FT0T = None
                 if self.n1_in > 0:
@@ -1458,9 +1676,21 @@ class RNNModel(ModelWithFitWithRetry, Reconstructable):
                 outs = self.rnn.cell.propagate_steps_ahead(x0_fullT, x0T, n1_in0, FT0T, 
                             np.array(prior_pred_step1, dtype=x0_fullT.dtype)) # Propagate x0 through the dynamics
                 # steps_ahead_x0s = [np.array(x)[0,:] for x in outs[len(steps_ahead):]]
-                steps_ahead_x0s = [np.array(x)[0:1,...] for x in outs[len(steps_ahead):(2*len(steps_ahead))]]
-                steps_ahead_internal_x0s = [np.array(x)[0:1,...] for x in outs[(2*len(steps_ahead)):(3*len(steps_ahead))]]
-                steps_ahead_y_hat0 = [np.array(y)[0:1,...] for y in outs[:len(steps_ahead)]]
+                initial_rows = (
+                    slice(None) if transformer_batches else slice(0, 1)
+                )
+                steps_ahead_x0s = [
+                    np.array(x)[initial_rows, ...]
+                    for x in outs[len(steps_ahead):2 * len(steps_ahead)]
+                ]
+                steps_ahead_internal_x0s = [
+                    np.array(x)[initial_rows, ...]
+                    for x in outs[2 * len(steps_ahead):3 * len(steps_ahead)]
+                ]
+                steps_ahead_y_hat0 = [
+                    np.array(y)[initial_rows, ...]
+                    for y in outs[:len(steps_ahead)]
+                ]
                 allXp_steps = []
                 Xp_steps = []
                 allYp_steps = []

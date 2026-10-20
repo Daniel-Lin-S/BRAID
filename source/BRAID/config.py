@@ -360,6 +360,9 @@ def _load_stage_arguments(stage_name: str, settings: Any) -> Dict[str, Any]:
         f"{stage_name}_state_transition_architecture":
             transition["architecture"],
         f"{stage_name}_lstm_arguments": transition["lstm_arguments"],
+        f"{stage_name}_transformer_arguments": (
+            transition["transformer_arguments"]
+        ),
         names["neural_decoder"]: _load_mlp_arguments(
             settings["neural_decoder"],
             f"{location}.neural_decoder",
@@ -397,6 +400,7 @@ def _load_transition_arguments(settings: Any, location: str) -> Dict[str, Any]:
             "architecture": architecture,
             "mapping": _load_mlp_arguments(mapping, location),
             "lstm_arguments": None,
+            "transformer_arguments": None,
         }
     if architecture == "lstm":
         _reject_unknown_keys(
@@ -415,9 +419,33 @@ def _load_transition_arguments(settings: Any, location: str) -> Dict[str, Any]:
                 lstm_settings,
                 location,
             ),
+            "transformer_arguments": None,
+        }
+    if architecture == "causal_transformer":
+        _reject_unknown_keys(
+            settings,
+            {"architecture", "include_stage_one_state"}
+            | MLP_SETTINGS | {"hidden_size", "depth"},
+            location,
+        )
+        include_stage_one = settings.get(
+            "include_stage_one_state", True
+        )
+        if not isinstance(include_stage_one, bool):
+            raise ValueError(
+                f"{location}.include_stage_one_state must be Boolean."
+            )
+        return {
+            "architecture": architecture,
+            "mapping": {},
+            "lstm_arguments": None,
+            "transformer_arguments": {
+                "include_stage_one_state": include_stage_one,
+            },
         }
     raise ValueError(
-        f"{location}.architecture must be multilayer_perceptron or lstm."
+        f"{location}.architecture must be multilayer_perceptron, "
+        "lstm, or causal_transformer."
     )
 
 

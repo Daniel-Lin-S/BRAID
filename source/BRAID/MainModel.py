@@ -836,6 +836,8 @@ class MainModel(PredictorModel):
             linear_cell = False, # If true, will use a linear cell instead of general regression cell (JUST FOR TESTS)
             LSTM_cell=False,     # If true, will use an LSTM cell in the RNNs instead of general regression cell
             stage_1_state_transition_architecture = None,
+            stage_1_transformer_arguments = None,
+            stage_2_transformer_arguments = None,
             stage_2_state_transition_architecture = None,
             stage_1_lstm_arguments = None,
             stage_2_lstm_arguments = None,
@@ -1123,6 +1125,12 @@ class MainModel(PredictorModel):
         )
         self.stage_2_state_transition_architecture = (
             stage_2_state_transition_architecture
+        )
+        self.stage_1_transformer_arguments = copy.deepcopy(
+            stage_1_transformer_arguments
+        )
+        self.stage_2_transformer_arguments = copy.deepcopy(
+            stage_2_transformer_arguments
         )
         self.stage_1_lstm_arguments = copy.deepcopy(
             stage_1_lstm_arguments
@@ -2009,6 +2017,11 @@ class MainModel(PredictorModel):
                         state_transition_architecture=(
                             self.stage_1_state_transition_architecture
                         ),
+                        transformer_arguments=(
+                            self.stage_1_transformer_arguments
+                        ),
+                        neural_dims=self.ny,
+                        stage_one_dims=0,
                         stateful=self.stateful,
                         out_dist=zDist, 
                         optimizer_name=self.optimizer_name, optimizer_args=self.optimizer_args, 
@@ -2049,6 +2062,11 @@ class MainModel(PredictorModel):
                         state_transition_architecture=(
                             self.stage_2_state_transition_architecture
                         ),
+                        transformer_arguments=(
+                            self.stage_2_transformer_arguments
+                        ),
+                        neural_dims=self.ny,
+                        stage_one_dims=self.n1,
                         stateful=self.stateful,
                         has_prior_pred=True, # From stage 1
                         out_dist=yDist, 
