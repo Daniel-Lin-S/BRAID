@@ -27,3 +27,18 @@ DO NOT overwhelm documentations at public interfaces (shell scripts, major funct
 NEVER directly remove or modify a previous completed run artifacts. Appending to an incomplete run directory is allowed, but NOT modifying previous rows.
 
 NEVER reveal local paths (e.g., model checkpoints, dataset paths) in files tracked by GitHub.
+
+## Experiment launch and hand-off
+
+Whenever you are asked to launch a compaign of experiments, please detach and leave it running after smoke test and confirming one fit works successfully.
+
+- DONT save artifacts on the one-fit audit, it is for you to check whether the training works.
+- For multi-stage, large-scale pre-training, you DONT need to audit until the last stage. Auditing few updates of the first stage suffices.
+
+## Experiment parallelisation
+
+For the CPU tasks, lower-priority should be assigned to avoid the laucnhed python programme interfering with the server's core operational programmes.
+
+You should parallelise independent neural fits whenever possible. Independent experiments should ALWAYS be launched without waiting other (or even a single stage of ) irrelevant experiments to finish.
+
+For multi-stage experiment with cross-stage dependencies, DONT parallelise.
