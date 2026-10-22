@@ -3,7 +3,8 @@
 Inputs are a StatusPlan of preprocessing paths, fit paths, reuse rules, and
 coordinator module name. Job directories contain status.json and complete.json;
 launch.json contains process metadata. Outputs are live counts in launch.json
-and TensorBoard event directories under the supplied log directory.
+with artifact references resolved by the supplied plan. Status monitoring
+never moves checkpoints, figures, or TensorBoard streams.
 """
 
 from __future__ import annotations
@@ -18,15 +19,12 @@ import json
 from pathlib import Path
 from threading import Event
 import time
-from uuid import uuid4
 
 from experiments.storage.cache import atomic_json
 
 
 POLL_SECONDS = 15
 STATES = ("finished", "running", "interrupted", "failed", "pending")
-EVENT_SPLITS = ("train", "validation")
-EVENT_PREFIX = "events.out.tfevents."
 
 
 @dataclass(frozen=True)
@@ -47,7 +45,6 @@ class StatusPlan:
     fits: tuple[FitJob, ...]
     report_marker: Path
     coordinator_module: str
-    component_root: Path | None = None
 
     def __post_init__(self) -> None:
         if not self.preprocessing or not self.fits:
@@ -219,7 +216,10 @@ def refresh(root: Path, plan: StatusPlan) -> dict:
     """Atomically add current planned-job counts to launch.json."""
     path = root / "launch.json"
     record = json.loads(path.read_text()) if path.is_file() else {}
-    visible = _process_active(record, plan.coordinator_module)
+    visible = (
+        "ended_at_utc" not in record
+        and _process_active(record, plan.coordinator_module)
+    )
     active = visible or _any_writer_active(plan)
     active_since_ns = (
         _process_start_ns(record) if visible
@@ -233,74 +233,12 @@ def refresh(root: Path, plan: StatusPlan) -> dict:
     return record
 
 
-def relocate_events(
-    components: Path, log_directory: Path,
-) -> int:
-    """Move TensorBoard streams into logs and leave component links."""
-    if not components.is_dir():
-        return 0
-    moved = 0
-    for metadata in components.rglob("component.json"):
-        component = metadata.parent
-        for split in EVENT_SPLITS:
-            source = component / split
-            if source.is_symlink():
-                target = source.resolve()
-                if not target.is_relative_to(log_directory.resolve()):
-                    raise ValueError(
-                        f"TensorBoard link leaves log directory: {source}"
-                    )
-                continue
-            if not source.is_dir():
-                continue
-            entries = list(source.iterdir())
-            if not entries:
-                continue
-            if any(
-                not entry.is_file()
-                or not entry.name.startswith(EVENT_PREFIX)
-                for entry in entries
-            ):
-                raise ValueError(
-                    f"Expected only TensorBoard events in "
-                    f"{source.resolve()}."
-                )
-            other = component / (
-                "validation" if split == "train" else "train"
-            )
-            if other.is_symlink():
-                destination_root = other.resolve().parent
-            else:
-                destination_root = (
-                    log_directory / "events"
-                    / component.relative_to(components) / uuid4().hex
-                )
-            destination = destination_root / split
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            if destination.exists():
-                raise FileExistsError(
-                    f"TensorBoard destination exists: "
-                    f"{destination.resolve()}"
-                )
-            source.rename(destination)
-            try:
-                source.symlink_to(destination, target_is_directory=True)
-            except OSError:
-                destination.rename(source)
-                raise
-            moved += 1
-    return moved
-
-
 def watch(
     root: Path, plan: StatusPlan, stop: Event | None = None,
 ) -> None:
     """Refresh status until the coordinator exits or stop is set."""
     while True:
         record = refresh(root, plan)
-        log_directory = record.get("log_directory")
-        if log_directory is not None and plan.component_root is not None:
-            relocate_events(plan.component_root, Path(log_directory))
         if stop is None and not record["campaign_active"]:
             return
         if stop is None:

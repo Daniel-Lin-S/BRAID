@@ -39,6 +39,16 @@ from experiments.execution.tensorflow_gpu import (
 from experiments.multisession.data import stable_seed, target_selection
 from experiments.multisession.plan import implementation_digest
 from experiments.storage.scientific_modules import fit_module_versions
+from experiments.storage.artifacts import (
+    PRESENTATION_KEYS, active_stage_arguments, publish_model_settings,
+    recipe_directory, scientific_source,
+)
+from experiments.storage.analysis import (
+    initialize_specification, read_manifest,
+)
+from experiments.storage.campaign import (
+    bind_analysis, campaign_analysis, campaign_member, validate_roots,
+)
 from experiments.multisession.preprocessing import validate_predictions
 from experiments.multisession.runner import dataset, resolve
 from experiments.multisession.store import completed, job, load_pickle
@@ -146,8 +156,15 @@ def case_configuration(base: dict, case: str) -> dict:
     return result
 
 
-def _settings(experiment: Path, root: Path) -> dict:
-    """Load local settings with a writable campaign-local data cache."""
+def _settings(experiment: Path) -> dict:
+    """Load explicit shared artifact/cache paths and separate log storage."""
+    settings = resolve(experiment)
+    validate_roots(settings["paths"])
+    return settings
+
+
+def _audit_settings(experiment: Path, root: Path) -> dict:
+    """Use temporary cache writes for a no-artifact training audit."""
     settings = resolve(experiment)
     source = Path(settings["paths"]["cache_root"])
     cache = (root / "cache").resolve()
@@ -171,6 +188,133 @@ def _settings(experiment: Path, root: Path) -> dict:
                         raise
     settings["paths"]["cache_root"] = str(cache)
     return settings
+
+
+def storage_settings(settings: dict) -> dict:
+    """Describe the comparison independently of storage and launch options."""
+    return dict(
+        name="dynamics_model_comparison", sessions=list(SESSIONS),
+        folds=list(FOLDS), seeds=list(SEEDS), fraction=FRACTION,
+        latent=LATENT, horizons=list(HORIZONS),
+        data=scientific_source(settings["data"]),
+        cases={
+            case: case_configuration(settings["model"], case)
+            for case in CASES
+        },
+        target_training=settings["target_training"],
+        modules={
+            case: fit_module_versions(
+                "adaptation", case_configuration(settings["model"], case)
+            ) for case in CASES
+        },
+    )
+
+
+def _storage_recipe(
+    settings: dict, arguments: dict, configuration: dict, role: str,
+) -> dict:
+    """Describe the numerical fitting recipe for a shared model directory."""
+    model = active_stage_arguments(arguments)
+    base = model["args_base"]
+    for key in PRESENTATION_KEYS:
+        base.pop(key, None)
+    for stage in (1, 2):
+        architecture = base.get(f"stage_{stage}_state_transition_architecture")
+        for option, selected in (
+            ("transformer_arguments", "causal_transformer"),
+            ("lstm_arguments", "lstm"),
+        ):
+            if architecture != selected:
+                base.pop(f"stage_{stage}_{option}", None)
+    return dict(
+        model_plugin="experiments.models.braid_backend:BRAIDBackend",
+        model=model, data=scientific_source(settings["data"]),
+        fraction=FRACTION, role=role,
+        modules=fit_module_versions("adaptation", configuration),
+    )
+
+
+def storage_members(settings: dict) -> dict[str, dict]:
+    """Register fit locations using the shared scientific-recipe store.
+
+    Parameters
+    ----------
+    settings : dict
+        Resolved local settings with explicit artifact and cache roots.
+
+    Returns
+    -------
+    dict of str to dict
+        Membership records with relative fit paths, stable IDs and roles.
+        Existing reference fits are checksum and selection validated.
+    """
+    from experiments.multisession.target import fit_arguments
+
+    artifact = Path(settings["paths"]["artifact_root"]).resolve()
+    members = {}
+    for session, fold, seed in _tasks():
+        key = target_key(session, fold, seed)
+        _, _, indices, selection = _selected(settings, session, fold, seed)
+        for case in ("preprocessing", *CASES):
+            role = "preprocessing" if case == "preprocessing" else "fit"
+            configuration = case_configuration(
+                settings["model"], "linear" if role == "preprocessing"
+                else case,
+            )
+            arguments = fit_arguments(
+                configuration, selection["batch_size"], LATENT,
+                settings["target_training"]["maximum_epochs"],
+            )
+            reused = case == REFERENCE_CASE and seed == REFERENCE_SEED
+            if reused:
+                directory, _ = _existing_scratch(
+                    settings, session, fold, indices, arguments
+                )
+            else:
+                recipe = _storage_recipe(
+                    settings, arguments, configuration, role
+                )
+                model = recipe_directory(artifact, recipe)
+                publish_model_settings(model, recipe)
+                identifier = key if role == "preprocessing" else (
+                    f"{case}__{key}"
+                )
+                directory = model / session / f"fold_{fold}" / identifier
+            members[f"{case}/{key}"] = dict(
+                fit=str(directory.relative_to(artifact)),
+                fit_id=directory.name, role=role, reused=reused,
+            )
+    return members
+
+
+def initialize_storage(experiment: Path, root: Path) -> Path:
+    """Bind this launch to the repository's shared artifact store."""
+    settings = _settings(experiment)
+    launch = root / "launch.json"
+    record = json.loads(launch.read_text()) if launch.exists() else {}
+    specification = storage_settings(settings)
+    if "analysis_directory" in record:
+        analysis = campaign_analysis(root)
+        saved = read_manifest(analysis)["specification"]["settings"]
+        if saved != specification:
+            raise ValueError(
+                f"Scientific settings differ from {analysis}; "
+                "use a separate launch for a different comparison."
+            )
+    else:
+        if any((root / name).exists() for name in (
+            "fits", "preprocessing", "target_components", "report_complete.json"
+        )):
+            raise ValueError(
+                f"Unmigrated artifacts in {root.resolve()}; "
+                "relocate and validate them before launching."
+            )
+        analysis = initialize_specification(
+            Path(settings["paths"]["artifact_root"]), specification,
+            storage_members(settings), {},
+        )
+    bind_analysis(root, settings["paths"], analysis)
+    return analysis
 
 
 def log_directory(experiment: Path, root: Path) -> Path:
@@ -264,7 +408,7 @@ def _prepare_one(
 
     os.nice(CPU_NICE)
     root = Path(root_name)
-    settings = _settings(Path(experiment), root)
+    settings = _settings(Path(experiment))
     _, arrays, indices, selection = _selected(
         settings, session, fold, seed
     )
@@ -303,7 +447,8 @@ def _prepare_one(
                     session, fold, seed, "preprocessing"
                 )
                 fit_preprocessing(
-                    arrays, arguments, directory, prep_seed
+                    arrays, arguments, directory, prep_seed,
+                    components=directory / "components",
                 )
     return str(directory.resolve())
 
@@ -319,7 +464,7 @@ def _fit_one(
 
     os.nice(CPU_NICE)
     root = Path(root_name)
-    settings = _settings(Path(experiment), root)
+    settings = _settings(Path(experiment))
     features, arrays, indices, selection = _selected(
         settings, session, fold, seed
     )
@@ -362,11 +507,18 @@ def _fit_one(
             from experiments.multisession.store import (
                 quarantine_incomplete_components,
             )
-            quarantine_incomplete_components(directory)
+            quarantine_incomplete_components(
+                directory, directory / "components"
+            )
             fit_seed = stable_seed(session, fold, seed, "main")
             model = fit_target(
                 arrays, arguments, directory, preprocessing, {},
                 fit_seed, identity["implementation"]["target"],
+                components=directory / "components",
+                prediction_cache=(
+                    Path(settings["paths"]["artifact_root"])
+                    / "experiments" / "BRAID_preprocessing_predictions"
+                ),
             )
             evaluation = dict(
                 session=session, fold=fold, kind=case,
@@ -437,7 +589,7 @@ def audit(experiment: Path, root: Path) -> None:
     with tempfile.TemporaryDirectory(
         prefix="braid-transformer-audit-"
     ) as scratch:
-        settings = _settings(experiment, Path(scratch))
+        settings = _audit_settings(experiment, Path(scratch))
         _audit_selected(settings)
         _audit_io_shapes(settings)
 
@@ -663,35 +815,25 @@ def _audit_selected(settings: dict) -> None:
     print("Nonsaving full-I/O Transformer audit completed.", flush=True)
 
 
-def report(experiment: Path, root: Path) -> None:
-    """Report the selected NHP dynamics cases using shared comparisons."""
-    from experiments.multisession.target import fit_arguments
+def report(
+    experiment: Path, root: Path, *, redraw_figures: bool = False,
+) -> None:
+    """Report the selected NHP dynamics cases using shared comparisons.
 
-    settings = None
-
+    Parameters
+    ----------
+    experiment : Path
+        Local settings already validated by the campaign runner.
+    root : Path
+        Launch log directory referencing a shared analysis manifest.
+    redraw_figures : bool, optional
+        Replace owned figure renderings from saved tables; default False.
+    """
     def fit_path(
         session: str, fold: int, seed: int, case: str,
     ) -> Path:
-        """Resolve one validated local or scratch fit directory."""
-        nonlocal settings
-        if case != REFERENCE_CASE or seed != REFERENCE_SEED:
-            return _fit_directory(
-                root, case, target_key(session, fold, seed)
-            )
-        if settings is None:
-            settings = _settings(experiment, root)
-        _, _, indices, selection = _selected(
-            settings, session, fold, seed
-        )
-        arguments = fit_arguments(
-            case_configuration(settings["model"], case),
-            selection["batch_size"], LATENT,
-            settings["target_training"]["maximum_epochs"],
-        )
-        directory, _ = _existing_scratch(
-            settings, session, fold, indices, arguments
-        )
-        return directory
+        """Resolve a previously registered shared fit without loading data."""
+        return _fit_directory(root, case, target_key(session, fold, seed))
 
     plan = ComparisonPlan(
         tasks=tuple(_tasks()), sessions=SESSIONS,
@@ -703,7 +845,10 @@ def report(experiment: Path, root: Path) -> None:
         smaller_is_better=("mse",), bin_ms=BIN_MS,
         iqr_multiplier=IQR_MULTIPLIER,
     )
-    comparison_report(root, plan, fit_path)
+    comparison_report(
+        campaign_analysis(root), plan, fit_path,
+        redraw_figures=redraw_figures,
+    )
 
 
 
@@ -759,27 +904,17 @@ def verified_reused_keys(experiment: Path) -> list[str]:
     return sorted(found)
 
 def status_plan(root: Path, reused_keys: set[str] | None) -> StatusPlan:
-    """Map this comparison's jobs into a model-independent status plan."""
+    """Map shared analysis members into the generic live status service."""
     preprocessing = []
     fits = []
     for session, fold, seed in _tasks():
         key = target_key(session, fold, seed)
-        index = len(preprocessing)
         preprocessing.append(_preprocessing_directory(root, key))
         for case in CASES:
-            if case == REFERENCE_CASE and seed == REFERENCE_SEED:
-                fits.append(FitJob(
-                    directory=None, preprocessing_index=index,
-                    verified_reuse=(
-                        reused_keys is not None and key in reused_keys
-                    ),
-                    reused=True,
-                ))
-            else:
-                fits.append(FitJob(_fit_directory(root, case, key)))
+            directory, member = campaign_member(root, f"{case}/{key}")
+            fits.append(FitJob(directory, reused=member["reused"]))
     return StatusPlan(
         preprocessing=tuple(preprocessing), fits=tuple(fits),
-        report_marker=root / "report_complete.json",
+        report_marker=campaign_analysis(root) / "report_complete.json",
         coordinator_module="experiments.campaign_runner",
-        component_root=root / "target_components",
     )

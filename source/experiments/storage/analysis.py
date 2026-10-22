@@ -57,13 +57,39 @@ def initialize_analysis(
     root: Path, snapshots: dict, members: dict[str, dict],
 ) -> Path:
     """Publish a specification-addressed manifest of all requested fits."""
+    return initialize_specification(
+        root, analysis_settings(snapshots), members, snapshots["plotting"],
+    )
+
+
+def initialize_specification(
+    root: Path, settings: dict, members: dict[str, dict], plotting: dict,
+) -> Path:
+    """Publish a resolved analysis through the shared manifest protocol.
+
+    Parameters
+    ----------
+    root : Path
+        User-configured artifact root.
+    settings : dict
+        Scientific analysis settings, including a filesystem-safe name.
+    members : dict of str to dict
+        Requested members with fit references relative to the artifact root.
+    plotting : dict
+        Rendering settings recorded separately from scientific membership.
+
+    Returns
+    -------
+    Path
+        Absolute analysis/<name>/<specification-hash> directory.
+    """
     if not members:
         raise ValueError("Cannot publish analysis with no requested fits.")
-    spec = dict(settings=analysis_settings(snapshots), members=members)
-    directory = (
-        root / "analysis" / snapshots["experiment"]["name"]
-        / fingerprint(spec)
-    ).resolve()
+    name = settings["name"]
+    if not name or Path(name).name != name or name in (".", ".."):
+        raise ValueError(f"Invalid analysis name: {name!r}.")
+    spec = dict(settings=settings, members=members)
+    directory = (root / "analysis" / name / fingerprint(spec)).resolve()
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "manifest.json"
     with writer_lock(directory / "manifest.lock"):
@@ -76,7 +102,7 @@ def initialize_analysis(
                 specification=spec, members=copy.deepcopy(members),
             )
         rendering = dict(
-            plotting=analysis_plotting(snapshots["plotting"])
+            plotting=analysis_plotting(plotting)
         )
         if manifest.get("rendering") != rendering:
             manifest["rendering"] = rendering

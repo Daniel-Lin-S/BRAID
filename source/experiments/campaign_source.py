@@ -1,6 +1,6 @@
 """Freeze and checksum campaign code and repository YAML defaults.
 
-Input is a campaign root. Output is a frozen source/ and assets/ snapshot,
+Input is an artifact provenance directory. Outputs are source/ and assets/,
 plus a digest covering Python and YAML files. The digest is audit metadata;
 scientific fit IDs use explicit active module versions.
 """
@@ -29,7 +29,7 @@ def source_code_digest(root: Path | None = None) -> str:
 
 
 def freeze_source(launch: Path) -> str:
-    """Copy code and default configs into a launch-local immutable snapshot."""
+    """Copy code and defaults into an immutable artifact snapshot."""
     destination = launch / "source"
     assets = launch / "assets"
     if SOURCE_ROOT.resolve() != destination.resolve():

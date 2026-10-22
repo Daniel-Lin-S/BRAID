@@ -16,7 +16,7 @@ from experiments.nhp_dynamics_study import (
 )
 from experiments.storage.cache import file_digest, fingerprint
 from experiments.campaign_status import (
-    refresh as refresh_plan, relocate_events as relocate_component_events,
+    refresh as refresh_plan,
     snapshot as snapshot_plan,
 )
 from experiments.nhp_dynamics_study import status_plan
@@ -31,10 +31,46 @@ def snapshot(root, reused_keys=None, active=None, active_since_ns=None):
 def refresh(root):
     return refresh_plan(root, status_plan(root, None))
 
-def relocate_events(root, log_directory):
-    return relocate_component_events(
-        root / "target_components", log_directory
+@pytest.fixture(autouse=True)
+def shared_storage(tmp_path):
+    """Register synthetic jobs through the shared analysis manifest."""
+    from experiments.nhp_dynamics_design import CASES, tasks
+    from experiments.storage.analysis import initialize_specification
+    from experiments.storage.campaign import bind_analysis
+
+    artifact = tmp_path.parent / (tmp_path.name + "-artifacts")
+    members = {}
+    for session, fold, seed in tasks():
+        key = target_key(session, fold, seed)
+        for case in ("preprocessing", *CASES):
+            identifier = f"{case}__{key}"
+            members[f"{case}/{key}"] = dict(
+                fit=(
+                    f"experiments/BRAID_test/{session}/fold_{fold}/{identifier}"
+                ),
+                fit_id=identifier,
+                role="preprocessing" if case == "preprocessing" else "fit",
+                reused=(case == "linear" and seed == 42) or (
+                    case == "mlp" and session == "indy_20160921_01"
+                    and fold == 0 and seed == 43
+                ),
+            )
+    analysis = initialize_specification(
+        artifact, dict(name="test_comparison"), members, {},
     )
+    bind_analysis(tmp_path, dict(
+        log_root=str(tmp_path), artifact_root=str(artifact),
+        cache_root=str(artifact.parent / "cache"),
+    ), analysis)
+
+
+def update_launch(root, values):
+    """Change process evidence without dropping artifact references."""
+    path = root / "launch.json"
+    record = json.loads(path.read_text())
+    record.update(values)
+    path.write_text(json.dumps(record))
+
 
 def test_snapshot_counts_reused_and_local_states(tmp_path):
     """Count reused completion, running jobs, and failed jobs separately."""
@@ -43,6 +79,9 @@ def test_snapshot_counts_reused_and_local_states(tmp_path):
     reused_directory = _preprocessing_directory(tmp_path, reused)
     reused_directory.mkdir(parents=True)
     (reused_directory / "complete.json").write_text("{}")
+    reference = _fit_directory(tmp_path, "linear", reused)
+    reference.mkdir(parents=True)
+    (reference / "complete.json").write_text("{}")
     active_directory = _preprocessing_directory(tmp_path, active)
     active_directory.mkdir(parents=True)
     (active_directory / "status.json").write_text(
@@ -72,18 +111,13 @@ def test_snapshot_counts_reused_and_local_states(tmp_path):
     }
 
 
-def test_snapshot_counts_linked_completed_control_as_reused(tmp_path):
-    """A validated control linked from a prior campaign is reused."""
+def test_snapshot_counts_registered_control_as_reused(tmp_path):
+    """Relocated completed controls retain explicit reuse membership."""
     key = target_key("indy_20160921_01", 0, 43)
-    source = tmp_path / "archive" / "mlp_control"
-    source.mkdir(parents=True)
-    (source / "complete.json").write_text("{}")
-    linked = _fit_directory(tmp_path, "mlp", key)
-    linked.parent.mkdir()
-    linked.symlink_to(source, target_is_directory=True)
-
+    directory = _fit_directory(tmp_path, "mlp", key)
+    directory.mkdir(parents=True)
+    (directory / "complete.json").write_text("{}")
     record = snapshot(tmp_path)
-
     assert record["fits"]["finished"] == 1
     assert record["fits"]["reused_finished"] == 1
     assert record["fits"]["local_finished"] == 0
@@ -92,7 +126,7 @@ def test_snapshot_counts_linked_completed_control_as_reused(tmp_path):
 def test_refresh_preserves_launch_metadata(tmp_path):
     """Keep process and log metadata when publishing progress."""
     launch = tmp_path / "launch.json"
-    launch.write_text(json.dumps({"pid": 123, "log": "campaign-log"}))
+    update_launch(tmp_path, {"pid": 123, "log": "campaign-log"})
 
     record = refresh(tmp_path)
 
@@ -130,39 +164,13 @@ def test_snapshot_excludes_old_running_markers(tmp_path):
     assert record["fits"]["interrupted"] == 1
 
 
-def test_relocate_events_preserves_component_artifacts(tmp_path):
-    """Move only TensorBoard streams while keeping checkpoint files."""
-    root = tmp_path / "outputs"
-    component = root / "target_components" / "fit" / "01_neural_dynamics"
-    component.mkdir(parents=True)
-    (component / "component.json").write_text("{}")
-    (component / "history.jsonl").write_text('{"epoch": 1}\n')
-    train = component / "train"
-    train.mkdir()
-    (train / "events.out.tfevents.test").write_bytes(b"training")
-    validation = component / "validation"
-    validation.mkdir()
-    (validation / "events.out.tfevents.test").write_bytes(b"validation")
-    logs = tmp_path / "logs"
-
-    assert relocate_events(root, logs) == 2
-    assert relocate_events(root, logs) == 0
-    assert train.is_symlink()
-    assert validation.is_symlink()
-    assert train.resolve().parent == validation.resolve().parent
-    assert (train / "events.out.tfevents.test").read_bytes() == b"training"
-    assert (validation / "events.out.tfevents.test").read_bytes() == (
-        b"validation"
-    )
-    assert (component / "history.jsonl").read_text() == (
-        '{"epoch": 1}\n'
-    )
-
-
 def test_verified_reference_counts_before_local_preprocessing(tmp_path):
     """Count validated reused fits even when local prep is pending."""
     key = target_key("indy_20160921_01", 0, 42)
 
+    directory = _fit_directory(tmp_path, "linear", key)
+    directory.mkdir(parents=True)
+    (directory / "complete.json").write_text("{}")
     record = snapshot(tmp_path, {key})
 
     assert record["preprocessing"]["finished"] == 0
@@ -179,9 +187,7 @@ def test_refresh_reports_stranded_jobs_as_interrupted(tmp_path):
     (directory / "status.json").write_text(
         json.dumps({"state": "running"})
     )
-    (tmp_path / "launch.json").write_text(
-        json.dumps({"pid": 999999999})
-    )
+    update_launch(tmp_path, {"pid": 999999999})
 
     record = refresh(tmp_path)
 
@@ -198,9 +204,7 @@ def test_refresh_detects_fit_lock_when_pid_is_hidden(tmp_path):
     (directory / "status.json").write_text(
         json.dumps({"state": "running"})
     )
-    (tmp_path / "launch.json").write_text(
-        json.dumps({"pid": 999999999})
-    )
+    update_launch(tmp_path, {"pid": 999999999})
     with directory.with_suffix(".lock").open("w") as stream:
         fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
         record = refresh(tmp_path)

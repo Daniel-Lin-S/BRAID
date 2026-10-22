@@ -64,13 +64,28 @@ def training_arrays(
     return result
 
 
-def component_directory(directory: Path) -> Path:
+def component_directory(
+    directory: Path, root: Path | None = None,
+) -> Path:
     """Preserve completed native stages independently of fit attempts.
 
     Incomplete component leaves move to quarantine before native fitting.
     Completed leaves are validated and reused by BRAID's native callbacks.
+
+    Parameters
+    ----------
+    directory : Path
+        Target fit directory.
+    root : Path, optional
+        Explicit component store; default None uses the legacy sibling store.
+
+    Returns
+    -------
+    Path
+        Validated component store, ready for native fitting.
     """
-    root = directory.parent.parent / "target_components" / directory.name
+    if root is None:
+        root = directory.parent.parent / "target_components" / directory.name
     if root.exists():
         for history in list(root.rglob("history.jsonl")):
             marker = history.parent / "complete.json"
@@ -120,11 +135,26 @@ def save_component_records(
 
 
 def fit_preprocessing(
-    arrays: dict, arguments: dict, directory: Path, seed: int
+    arrays: dict, arguments: dict, directory: Path, seed: int,
+    *, components: Path | None = None,
 ) -> None:
-    """Fit only the reusable native n_pre=150 preprocessing model."""
+    """Fit the reusable native n_pre=150 preprocessing model.
+
+    Parameters
+    ----------
+    arrays : dict
+        Y, Z, U and validation arrays, shape (coordinates, samples).
+    arguments : dict
+        Resolved BRAID fitting configuration.
+    directory : Path
+        Incomplete fit directory receiving the checkpoint and stage records.
+    seed : int
+        Explicit preprocessing initialization seed.
+    components : Path, optional
+        Stage artifact directory; default None uses the legacy sibling store.
+    """
     tf.keras.utils.set_random_seed(seed)
-    components = component_directory(directory)
+    components = component_directory(directory, components)
     model = MainModel(
         log_dir=str(components),
         artifact_role="behaviour_preprocess",
@@ -163,12 +193,42 @@ def fit_target(
     weights: dict,
     seed: int,
     implementation: str,
+    *, components: Path | None = None,
+    prediction_cache: Path | None = None,
 ) -> BRAIDModel:
-    """Fit target-private components while imported modules stay frozen."""
+    """Fit target-private components while imported modules stay frozen.
+
+    Parameters
+    ----------
+    arrays : dict
+        Y, Z, U and validation arrays, shape (coordinates, samples).
+    arguments : dict
+        Resolved BRAID fitting configuration.
+    directory : Path
+        Incomplete fit directory receiving native snapshots and stage records.
+    preprocessing : Path
+        Completed preprocessing dependency containing model.p.
+    weights : dict
+        Frozen module weights, optionally keyed by stage1 and stage2.
+    seed : int
+        Explicit main-model initialization seed.
+    implementation : str
+        Scientific implementation signature for the prediction cache.
+    components : Path, optional
+        Stage artifact directory; default None uses the legacy sibling store.
+    prediction_cache : Path, optional
+        Shared prediction-cache namespace; default None uses the legacy
+        preprocessing sibling namespace.
+
+    Returns
+    -------
+    BRAIDModel
+        Fitted model with validated transferred weights and finite outputs.
+    """
     tf.keras.utils.set_random_seed(seed)
     pre = load_pickle(preprocessing / "model.p")["model"]
     predictions = preprocessing_predictions(
-        pre, arrays, preprocessing, implementation
+        pre, arrays, preprocessing, implementation, prediction_cache
     )
     nested = "stage1" in weights or "stage2" in weights
     if nested and set(weights) != {"stage1", "stage2"}:
@@ -177,7 +237,7 @@ def fit_target(
         )
     stage1 = weights["stage1"] if nested else weights
     stage2 = weights["stage2"] if nested else {}
-    components = component_directory(directory)
+    components = component_directory(directory, components)
     model = BRAIDModel(
         log_dir=str(components),
         missing_marker=MISSING_MARKER,

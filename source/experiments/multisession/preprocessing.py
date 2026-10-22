@@ -38,6 +38,7 @@ def preprocessing_predictions(
     arrays: dict[str, np.ndarray],
     preprocessing: Path,
     implementation: str,
+    cache_root: Path | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute each selected subset's frozen predictions exactly once.
 
@@ -51,6 +52,9 @@ def preprocessing_predictions(
         Immutable dependency directory containing model.p.
     implementation : str
         Numerical implementation fingerprint for cache invalidation.
+    cache_root : Path, optional
+        Shared prediction-cache namespace; default None uses the legacy
+        preprocessing sibling namespace. Storage never enters cache identity.
 
     Returns
     -------
@@ -62,9 +66,9 @@ def preprocessing_predictions(
         implementation=implementation,
         arrays={key: array_identity(value) for key, value in arrays.items()},
     )
-    directory = preprocessing.parent.parent / CACHE_NAMESPACE / fingerprint(
-        identity
-    )
+    if cache_root is None:
+        cache_root = preprocessing.parent.parent / CACHE_NAMESPACE
+    directory = cache_root / fingerprint(identity)
     with job(directory, identity) as needed:
         if needed:
             model.restoreModels()

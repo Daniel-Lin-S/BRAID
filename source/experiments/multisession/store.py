@@ -94,20 +94,25 @@ def completed(directory: Path) -> dict | None:
     return record
 
 
-def quarantine_incomplete_components(directory: Path) -> list[Path]:
+def quarantine_incomplete_components(
+    directory: Path, root: Path | None = None,
+) -> list[Path]:
     """Isolate interrupted native stages before retrying a target fit.
 
     Parameters
     ----------
     directory : Path
-        Target fit directory; stages reside in the sibling component store.
+        Target fit directory.
+    root : Path, optional
+        Explicit component store; default None uses the legacy sibling store.
 
     Returns
     -------
     list[Path]
         Absolute quarantine paths for stages lacking a completion record.
     """
-    root = directory.parent.parent / "target_components" / directory.name
+    if root is None:
+        root = directory.parent.parent / "target_components" / directory.name
     if not root.exists():
         return []
     moved = []

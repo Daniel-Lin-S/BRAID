@@ -116,7 +116,7 @@ def test_comparison_reports_matched_oriented_gains(tmp_path: Path) -> None:
     report(tmp_path, plan, fit_path)
     marker = tmp_path / "report_complete.json"
     assert marker.is_file()
-    with (tmp_path / "paired_gains.csv").open(newline="") as stream:
+    with (tmp_path / "tables" / "paired_gains.csv").open(newline="") as stream:
         rows = list(csv.DictReader(stream))
     assert len(rows) == len(plan.tasks) * len(HORIZONS) * len(METRICS)
     assert {row["candidate"] for row in rows} == {"candidate"}
@@ -124,6 +124,19 @@ def test_comparison_reports_matched_oriented_gains(tmp_path: Path) -> None:
     original = marker.read_bytes()
     report(tmp_path, plan, fit_path)
     assert marker.read_bytes() == original
+    tables = {
+        path: path.read_bytes() for path in (tmp_path / "tables").iterdir()
+    }
+    report(tmp_path, plan, fit_path, redraw_figures=True)
+    assert all(path.read_bytes() == data for path, data in tables.items())
+    record = json.loads(marker.read_text())
+    record["checksums"] = {
+        Path(name).name: value for name, value in record["checksums"].items()
+    }
+    marker.write_text(json.dumps(record))
+    legacy = marker.read_bytes()
+    report(tmp_path, plan, fit_path)
+    assert marker.read_bytes() == legacy
 
 
 def test_comparison_rejects_incomplete_fits(tmp_path: Path) -> None:
@@ -138,4 +151,53 @@ def test_comparison_rejects_incomplete_fits(tmp_path: Path) -> None:
     _write_fit(fit_path(SESSIONS[0], 0, 0, CASES[0]), CASES[0])
     with pytest.raises(RuntimeError, match="Comparison incomplete"):
         report(tmp_path, plan, fit_path)
-    assert not (tmp_path / "raw_scores.csv").exists()
+    assert not (tmp_path / "tables" / "raw_scores.csv").exists()
+
+
+def test_horizon_figures_match_shared_typography(tmp_path, monkeypatch):
+    """Large tick labels remain separated and legends stay outside axes."""
+    from dataclasses import replace
+    import matplotlib.pyplot as plt
+    from experiments.campaign_comparison import figures
+    from experiments.visualization import presentation as rendering
+
+    cases = ("baseline", "candidate", "third", "fourth", "fifth")
+    labels = {case: f"Long model label {case}" for case in cases}
+    plan = replace(
+        _comparison_plan(), cases=cases, case_labels=labels,
+        candidate_cases=cases[1:], horizons=(1, 2, 4, 8, 16, 32),
+        metrics=("cc",), smaller_is_better=(),
+    )
+    rows = [
+        dict(session=session, case=case, target="neural", horizon=horizon,
+             metric="cc", value=0.5 + index * 0.01)
+        for session in plan.sessions for index, case in enumerate(cases)
+        for horizon in plan.horizons
+    ]
+    checked = []
+
+    def inspect(figure, path, style, signature=""):
+        figure.canvas.draw()
+        renderer = figure.canvas.get_renderer()
+        axis = figure.axes[0]
+        assert axis.xaxis.label.get_size() == style["label_font"]
+        assert axis.title.get_size() == style["title_font"]
+        assert axis.get_ylabel() == "CC"
+        ticks = axis.get_xticklabels()
+        assert all(tick.get_size() == style["tick_font"] for tick in ticks)
+        boxes = [tick.get_window_extent(renderer) for tick in ticks]
+        assert all(a.x1 < b.x0 for a, b in zip(boxes, boxes[1:]))
+        legend = axis.get_legend()
+        assert legend.get_window_extent(renderer).x0 > (
+            axis.get_window_extent(renderer).x1
+        )
+        assert all(
+            text.get_size() == style["legend_font"]
+            for text in legend.get_texts()
+        )
+        checked.append(path)
+        plt.close(figure)
+
+    monkeypatch.setattr(rendering, "save_figure", inspect)
+    figures(tmp_path, rows, plan)
+    assert checked == [tmp_path / "neural_cc.png"]

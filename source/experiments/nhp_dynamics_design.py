@@ -1,13 +1,15 @@
 """Define the matched single-session NHP dynamics comparison.
 
 Inputs are session, fold, seed, and dynamics-case identifiers. Outputs are
-planned job keys and paths beneath a supplied campaign root. Fit directories
+planned job keys and shared paths referenced by a launch manifest. Fits
 contain identity.json, metrics.json, checkpoint payloads, and complete.json.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+
+from experiments.storage.campaign import campaign_member
 
 
 SESSIONS = (
@@ -64,10 +66,10 @@ def tasks() -> list[tuple[str, int, int]]:
 
 
 def preprocessing_directory(root: Path, key: str) -> Path:
-    """Return one campaign-local preprocessing directory."""
-    return root / "preprocessing" / key
+    """Resolve one preprocessing member in the shared artifact store."""
+    return campaign_member(root, f"preprocessing/{key}")[0]
 
 
 def fit_directory(root: Path, case: str, key: str) -> Path:
-    """Return one campaign-local dynamics fit directory."""
-    return root / "fits" / f"{case}__{key}"
+    """Resolve one dynamics member in the shared artifact store."""
+    return campaign_member(root, f"{case}/{key}")[0]

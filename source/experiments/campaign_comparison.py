@@ -3,9 +3,9 @@
 Inputs are a ComparisonPlan and completed fit directories containing
 metrics.json, complete.json, and checked payloads. Outputs are raw scores,
 session means, matched gains, horizon figures, and report_complete.json under
-the requested report root. Metric rows require target, horizon, and
-mean_<metric> fields. Existing completed reports are validated and
-never overwritten.
+the requested report root, using tables/ and figures/ groups. Metric rows
+require target, horizon, and mean_<metric> fields. Completed reports are
+validated; explicit figure redraws preserve all numeric tables and fits.
 """
 
 from __future__ import annotations
@@ -16,11 +16,17 @@ import json
 import math
 from pathlib import Path
 from typing import Callable
+from textwrap import fill
 
 import numpy as np
 
 from experiments.multisession.store import completed
-from experiments.storage.cache import atomic_json, file_digest
+from experiments.storage.cache import atomic_json, file_digest, fingerprint
+
+
+TITLE_WRAP_COLUMNS = 48
+CURVE_LINE_WIDTH = 2.0
+UNCERTAINTY_ALPHA = 0.15
 
 
 @dataclass(frozen=True)
@@ -232,47 +238,80 @@ def _session_gain_rows(
     return result
 
 
+def report_payload(root: Path, name: str) -> Path:
+    """Resolve grouped outputs, including immutable legacy marker names."""
+    relative = Path(name)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError(f"Invalid report payload reference: {name!r}.")
+    if relative.parent == Path("."):
+        groups = {".csv": "tables", ".png": "figures"}
+        if relative.suffix not in groups:
+            raise ValueError(f"Unknown report output type: {name!r}.")
+        relative = Path(groups[relative.suffix]) / relative
+    return root / relative
+
+
 def report(
     root: Path, plan: ComparisonPlan,
     fit_path: Callable[[str, int, int, str], Path],
+    *, redraw_figures: bool = False,
 ) -> None:
-    """Publish validated comparison tables, figures, and completion."""
+    """Publish validated comparison tables, figures, and completion.
+
+    Parameters
+    ----------
+    root : Path
+        Shared analysis directory, with tables/ and figures/ groups.
+    plan : ComparisonPlan
+        Explicit matched-fit design and evaluation metrics.
+    fit_path : callable
+        Resolve (session, fold, seed, case) to an immutable completed fit.
+    redraw_figures : bool, optional
+        Redraw figures from validated saved tables, by default False.
+        Does not refit models or rewrite numeric tables.
+    """
     marker = root / "report_complete.json"
     if marker.exists():
         record = json.loads(marker.read_text())
         for name, digest in record["checksums"].items():
-            if file_digest(root / name) != digest:
+            path = report_payload(root, name)
+            if file_digest(path) != digest:
                 raise ValueError(
                     f"Completed report checksum mismatch: "
-                    f"{(root / name).resolve()}"
+                    f"{path.resolve()}"
                 )
+        if redraw_figures:
+            _redraw_figures(root, plan, record)
         return
     raw = _raw_rows(plan, fit_path)
-    root.mkdir(parents=True, exist_ok=True)
+    tables = root / "tables"
+    tables.mkdir(parents=True, exist_ok=True)
+    images = root / "figures"
+    images.mkdir(parents=True, exist_ok=True)
     write_csv(
-        root / "raw_scores.csv", raw,
+        tables / "raw_scores.csv", raw,
         ["session", "fold", "seed", "case", "target",
          "horizon", "metric", "value"],
     )
     session = _session_rows(raw, plan)
     write_csv(
-        root / "session_scores.csv", session,
+        tables / "session_scores.csv", session,
         ["session", "case", "target", "horizon", "metric",
          "value", "fits"],
     )
     paired = _paired_rows(raw, plan)
     write_csv(
-        root / "paired_gains.csv", paired,
+        tables / "paired_gains.csv", paired,
         ["session", "fold", "seed", plan.candidate_column,
          "control", "target", "horizon", "metric", "gain"],
     )
     gains = _session_gain_rows(paired, plan)
     write_csv(
-        root / "session_paired_gains.csv", gains,
+        tables / "session_paired_gains.csv", gains,
         ["session", plan.candidate_column, "control", "target",
          "horizon", "metric", "gain", "pairs"],
     )
-    figures(root, session, plan)
+    figures(images, session, plan)
     outputs = [
         "raw_scores.csv", "session_scores.csv",
         "paired_gains.csv", "session_paired_gains.csv",
@@ -287,10 +326,30 @@ def report(
             fits=len(plan.cases) * len(plan.tasks),
             sessions=len(plan.sessions),
             checksums={
-                name: file_digest(root / name) for name in outputs
+                str(report_payload(root, name).relative_to(root)):
+                file_digest(report_payload(root, name)) for name in outputs
             },
         ),
     )
+
+
+def _redraw_figures(root: Path, plan: ComparisonPlan, record: dict) -> None:
+    """Redraw owned figures from validated tables without rescoring fits."""
+    path = root / "tables" / "session_scores.csv"
+    with path.open(newline="") as stream:
+        rows = [dict(
+            row, horizon=int(row["horizon"]), value=float(row["value"]),
+            fits=int(row["fits"]),
+        ) for row in csv.DictReader(stream)]
+    if not rows or any(not math.isfinite(row["value"]) for row in rows):
+        raise ValueError(f"Empty or nonfinite session scores: {path}.")
+    figures(root / "figures", rows, plan)
+    record["checksums"] = {
+        str(report_payload(root, name).relative_to(root)):
+        file_digest(report_payload(root, name))
+        for name in record["checksums"]
+    }
+    atomic_json(root / "report_complete.json", record)
 
 
 def _curve_points(
@@ -329,12 +388,13 @@ def figures(
     from experiments.configuration import CONFIGURATION, read_yaml
     from experiments.reports.outliers import zoom_limits
     from experiments.visualization.presentation import (
-        configure_metric_axis, r2_display_limits,
+        METRIC_LABELS, configure_metric_axis, presentation, r2_display_limits,
+        save_figure, style_axis,
     )
 
     style = read_yaml(CONFIGURATION / "plotting" / "style.yaml")
     axes_style = style["metric_axes"]
-    display = style["presentation"]
+    display = presentation(style["presentation"])
     colors = display["horizon_colors"]
     labels = [
         f"{step}\n{step * plan.bin_ms} ms"
@@ -374,7 +434,7 @@ def figures(
                     "uncertainty_lower_fraction"
                 ]
             figure, axis = plt.subplots(
-                figsize=display["single_size"]
+                figsize=display["horizon_size"]
             )
             for index, case in enumerate(plan.cases):
                 curve = curves[case]
@@ -392,11 +452,12 @@ def figures(
                         index % len(display["group_linestyles"])
                     ],
                     color=color, label=plan.case_labels[case],
+                    linewidth=CURVE_LINE_WIDTH,
                 )
                 axis.fill_between(
                     x, np.where(inlier, y - sem, np.nan),
                     np.where(inlier, y + sem, np.nan),
-                    color=color, alpha=0.15,
+                    color=color, alpha=UNCERTAINTY_ALPHA,
                 )
                 for position in np.flatnonzero(~inlier):
                     value = y[position]
@@ -411,6 +472,7 @@ def figures(
                         f"{value:.3g}", (x[position], edge),
                         xytext=(5, 8 + index * 10),
                         textcoords="offset points", color=color,
+                        fontsize=style["outlier_rendering"]["annotation_font"],
                         clip_on=False,
                     )
             axis.set_xscale("log", base=2)
@@ -420,14 +482,25 @@ def figures(
                 plan.horizons[-1] * 1.2,
             )
             axis.set_ylim(lower, upper)
+            axis.set_ylabel(METRIC_LABELS[metric])
             configure_metric_axis(axis, metric, axes_style)
             axis.set_xlabel("Forecast horizon (steps / ms)")
-            axis.set_title(f"{target.title()} prediction: mean ± SEM")
-            axis.grid(alpha=0.2)
-            axis.legend(frameon=False)
-            figure.tight_layout()
-            figure.savefig(
-                root / f"{target}_{metric}.png",
-                dpi=display["dpi"],
+            axis.set_title(
+                fill(
+                    f"{target.title()} prediction: mean ± SEM",
+                    width=TITLE_WRAP_COLUMNS,
+                ),
+                pad=display["title_font"],
             )
-            plt.close(figure)
+            style_axis(axis, display)
+            axis.title.set_size(display["title_font"])
+            axis.legend(
+                loc="upper left", bbox_to_anchor=(1.02, 1),
+                frameon=False, fontsize=display["legend_font"],
+            )
+            figure.tight_layout()
+            save_figure(
+                figure, root / f"{target}_{metric}.png", display,
+                signature=fingerprint(dict(style=style, rows=rows)),
+            )
+    print(f"Saved comparison figures: {root.resolve()}", flush=True)

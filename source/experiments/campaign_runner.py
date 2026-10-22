@@ -11,6 +11,7 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import json
 from importlib import import_module
+from datetime import datetime, timezone
 import multiprocessing
 import os
 from pathlib import Path
@@ -72,6 +73,7 @@ def run_with_status(
     launch = root / "launch.json"
     record = json.loads(launch.read_text()) if launch.is_file() else {}
     record.update(pid=os.getpid(), **launch_metadata)
+    record.pop("ended_at_utc", None)
     atomic_json(launch, record)
     stop = Event()
     monitor = Thread(target=watch, args=(root, stop), daemon=True)
@@ -81,6 +83,12 @@ def run_with_status(
     finally:
         stop.set()
         monitor.join()
+        record = json.loads(launch.read_text())
+        record.update(
+            campaign_active=False,
+            ended_at_utc=datetime.now(timezone.utc).isoformat(),
+        )
+        atomic_json(launch, record)
 
 
 def detach(
@@ -96,14 +104,14 @@ def detach(
             stdout=stream, stderr=subprocess.STDOUT,
             start_new_session=True, env=environment,
         )
-    atomic_json(
-        root / "launch.json",
-        dict(
-            pid=process.pid, log=str(log_path),
-            log_directory=str(log_path.parent),
-            **launch_metadata,
-        ),
+    path = root / "launch.json"
+    record = json.loads(path.read_text()) if path.exists() else {}
+    record.update(
+        pid=process.pid, log=str(log_path),
+        log_directory=str(log_path.parent), **launch_metadata,
     )
+    record.pop("ended_at_utc", None)
+    atomic_json(path, record)
     return process.pid
 
 
@@ -121,6 +129,7 @@ def main() -> None:
     parser.add_argument("--gpus", nargs="+", default=[])
     parser.add_argument("--detach", action="store_true")
     parser.add_argument("--source-sha256")
+    parser.add_argument("--redraw-figures", action="store_true")
     args = parser.parse_args()
     if args.source_sha256 is not None:
         verify_source_code(args.source_sha256)
@@ -137,10 +146,14 @@ def main() -> None:
         )
     if args.detach and not args.run:
         parser.error("Detached launch requires --run.")
+    if args.redraw_figures and not args.report:
+        parser.error("Figure redraw requires --report.")
     if args.audit:
         study.audit(experiment, root)
-    elif args.report:
-        study.report(experiment, root)
+        return
+    analysis = study.initialize_storage(experiment, root)
+    if args.report:
+        study.report(experiment, root, redraw_figures=args.redraw_figures)
     else:
         workers = (
             study.DEFAULT_WORKERS if args.workers is None
@@ -158,17 +171,16 @@ def main() -> None:
                     f"Experiment YAML must be beneath {assets}; "
                     f"got {experiment}."
                 )
-            snapshot = root / "source"
+            source_sha256 = source_code_digest()
+            provenance = analysis / "provenance" / source_sha256
+            snapshot = provenance / "source"
             if snapshot.exists():
-                launch = root / "launch.json"
-                record = json.loads(launch.read_text())
-                source_sha256 = record.get("source_sha256")
                 if source_sha256 != source_code_digest(snapshot):
                     parser.error("Frozen campaign source checksum changed.")
-            else:
-                source_sha256 = freeze_source(root)
+            elif freeze_source(provenance) != source_sha256:
+                parser.error("Campaign source changed while freezing it.")
             frozen_experiment = (
-                root / "assets" / experiment.relative_to(assets)
+                provenance / "assets" / experiment.relative_to(assets)
             )
             if not frozen_experiment.is_file():
                 parser.error(
@@ -192,6 +204,7 @@ def main() -> None:
                 dict(
                     workers=workers, gpu_ids=args.gpus,
                     source_sha256=source_sha256,
+                    source_snapshot=str(provenance),
                 ), environment,
             )
             print(f"Launched PID {pid}; root {root}")

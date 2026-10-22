@@ -323,8 +323,28 @@ def model_directory(
     Path
         Absolute experiments/<model_name>_<full-settings-hash> directory.
     """
-    adapter = model_adapter(snapshots)
-    digest = fingerprint(model_settings(snapshots, case, overrides))
+    return recipe_directory(root, model_settings(snapshots, case, overrides))
+
+
+def recipe_directory(root: Path, recipe: dict) -> Path:
+    """Address resolved scientific settings in the shared model store.
+
+    Parameters
+    ----------
+    root : Path
+        User-configured artifact root.
+    recipe : dict
+        Scientific recipe with a model_plugin, excluding machine paths.
+
+    Returns
+    -------
+    Path
+        Absolute experiments/<model>_<settings-hash> directory.
+    """
+    adapter = model_adapter(dict(
+        experiment=dict(model_plugin=recipe["model_plugin"])
+    ))
+    digest = fingerprint(recipe)
     return (root / "experiments" / f"{adapter.model_name}_{digest}").resolve()
 
 
@@ -390,14 +410,31 @@ def prepare_model_settings(directory: Path, identity: dict) -> None:
     identity : dict
         Resolved fit inputs whose configured recipe must match the directory.
     """
-    expected = settings_record(identity)
-    adapter = model_adapter(identity["configurations"])
+    publish_model_settings(directory, settings_record(identity)["settings"])
+
+
+def publish_model_settings(directory: Path, recipe: dict) -> None:
+    """Publish or validate one immutable resolved scientific recipe.
+
+    Parameters
+    ----------
+    directory : Path
+        Canonical model-settings directory from recipe_directory.
+    recipe : dict
+        Scientific settings, including the model_plugin reference.
+    """
+    expected = dict(settings_hash=fingerprint(recipe), settings=recipe)
+    adapter = model_adapter(dict(
+        experiment=dict(model_plugin=recipe["model_plugin"])
+    ))
     with writer_lock(directory / SETTINGS_LOCK):
         path = directory / SETTINGS_FILENAME
         if path.exists():
             recorded = validate_model_settings(directory)
-            if recorded == expected or _compatible_model_settings(
-                recorded["settings"], expected["settings"]
+            if recorded == expected or (
+                "fitting_implementation" in recorded["settings"]
+                and "fitting_implementation" in recipe
+                and _compatible_model_settings(recorded["settings"], recipe)
             ):
                 return
             raise ValueError(f"Conflicting model settings: {path}")
