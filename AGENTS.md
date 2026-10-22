@@ -52,3 +52,28 @@ NEVER use invocation parameters (number of devices, GPU/CPU settings, etc.) that
 NEVER use the entire python tree to hash the fit identity. If implementation of a scientific module changes and that has significant effect on the results (test by minimal validation), then reflect this scientific change in the configuration.
 
 Changing the hashing mechanism or minor code implementations (e.g., file tree organisation) should NOT invalidate previous completed fits.
+
+ALWAYS ensure that a compaign launch does NOT restart already fitted models with complete, valid artifacts and results. Scientific parameter changes (e.g., changing the latent dimension) can restart new experiment.
+
+## Artifact saving and logging
+
+The `logs` folder in this repository should ONLY record launch status, logs, failure records, etc. The disk space usage of `logs` should be kept minimal. The actual model fits, checkpoints, result figures, tables, should be saved in a separate artifact root specified by the user. If you are not sure about the artifact and log structure, always ASK ME rather than guesswork.
+
+In saved artifacts, reusable model fits and checkpoints should be placed in separate folders, identified by the run hash. This is to ensure that a new compaign including some already fitted models does NOT restart repeated experiments on the already completed model fits.
+
+Within the artifact root of a compaign, you should NOT save the same information twice. e.g., write new results in a new file with previous results copied.
+
+All compaigns SHOULD share the SAME artifact / log saving logics and modules, rather than each one having its own artifact structure. Minor changes like file addition and field changes are allowed, but NEVER start a completely new artifact or log structure.
+
+## Plotting
+
+- use `seaborn` whenever possible rather than `matplotib`
+- Scatter plots: set `set_xlim` and (or) `set_ylim` to focus on the main data range.
+- Use lines thicker than default, but not too thick that distracts the main data.
+- Use `bbox_to_anchor` and `loc'`  to ensure legends are not overlapping with the main figure, not going beyond figure. Legends should have no frame: `frameon=False`.
+- Figures should be coloured, but figure legends and labels should make sense even in black-and-white prints. (for example, use different line types or hatches)
+- Titles must be wrapped by `textwrap` with suitable width to prevent the title from exceeding boundaries, and title should be kept away from the main figure with at least one line's gap.
+- Print a message after saving a figure, pointing to its file path. If a group of images are plotted, please ONLY print ONE message pointing to their common folder. 
+- Proper units should be added to the x and y axes if applicable. (DONT add units if no unit)
+
+While the plot layout may change across compaigns (e.g., different axis definitions, different number of panels, additional shaded areas, change of line style), the overall figure style (font size, legend position, colours used) should be consistent unless explicitly allowed to change. To that said -- all compaign's plotting codes should inherit from shared plotting modules rather than writing completely fresh modules.

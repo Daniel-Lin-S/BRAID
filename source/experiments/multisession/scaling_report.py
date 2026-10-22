@@ -16,6 +16,11 @@ import numpy as np
 from experiments.multisession.scaling import COUNTS
 from experiments.multisession.store import completed, fit_directory
 from experiments.visualization.multisession import curve
+from experiments.storage.cache import (
+    atomic_json,
+    file_digest,
+    fingerprint,
+)
 
 LOGGER = logging.getLogger(__name__)
 METRICS = {
@@ -26,6 +31,7 @@ METRICS = {
 COLORS = {4: "#8046a5", 8: "#2878b5", 16: "#339966", 33: "#e28528"}
 GAIN_THRESHOLD_PERCENT = 10.0
 DENOMINATOR_EPSILON = 1e-10
+SOURCE_LOSS_SMOOTHING_UPDATES = 100
 
 
 def dummy_scores(
@@ -236,7 +242,7 @@ def scaling_figures(
                         axis, summary,
                         dict(common, sharing="A2_A2_fw_K2_fw"),
                         "source_count", list(COUNTS),
-                        "A1_fw + all RNN2 dynamics", "#8046a5",
+                        "dynamic parameter sharing", "#8046a5",
                     )
                     axis.set_xscale("log", base=2)
                     axis.set_xticks(COUNTS)
@@ -253,6 +259,282 @@ def scaling_figures(
                         directory / f"h{horizon}.png", dpi=150
                     )
                 plt.close(figure)
+
+
+def source_loss_histories(plan: dict) -> tuple[dict, list[dict]]:
+    """Load and validate the saved source training loss histories.
+
+    Parameters
+    ----------
+    plan : dict
+        Completed multi-session source scaling plan.
+
+    Returns
+    -------
+    tuple[dict, list[dict]]
+        Histories keyed by component name and checksums used to identify the
+        figure inputs. Each history contains one-dimensional update and loss
+        arrays for one source count.
+    """
+    histories = {"neural": [], "residual": []}
+    checksums = []
+    for fit_id in plan.get("source_references", []):
+        spec = plan["jobs"][fit_id]
+        fit = fit_directory(plan, fit_id)
+        if completed(fit) is None:
+            raise ValueError(f"Incomplete source fit for loss plot: {fit}")
+        components = json.loads((fit / "components.json").read_text())
+        for stage in histories:
+            if stage not in components:
+                raise ValueError(
+                    f"Source fit {fit_id} has no {stage} component."
+                )
+            component_id = components[stage]["component_id"]
+            component = (
+                fit.parent.parent / "source_components" / component_id
+            )
+            if completed(component) is None:
+                raise ValueError(
+                    f"Incomplete {stage} source component: {component}"
+                )
+            history_path = component / "history.jsonl"
+            updates = []
+            losses = []
+            validation_updates = []
+            validation_losses = []
+            with history_path.open() as stream:
+                for line in stream:
+                    record = json.loads(line)
+                    updates.append(int(record["update"]))
+                    losses.append(float(record["loss"]))
+                    if "validation_loss" in record:
+                        validation_updates.append(int(record["update"]))
+                        validation_losses.append(
+                            float(record["validation_loss"])
+                        )
+            update_array = np.asarray(updates, dtype=int)
+            loss_array = np.asarray(losses, dtype=float)
+            validation_update_array = np.asarray(
+                validation_updates, dtype=int
+            )
+            validation_loss_array = np.asarray(
+                validation_losses, dtype=float
+            )
+            training = components[stage]["training"]
+            expected_updates = int(training["updates"])
+            best_index = (
+                int(np.argmin(validation_loss_array))
+                if len(validation_loss_array)
+                else -1
+            )
+            if (
+                expected_updates < 1
+                or int(training["best_update"]) < 1
+                or int(training["best_update"]) > expected_updates
+                or len(update_array) != expected_updates
+                or not np.array_equal(
+                    update_array, np.arange(1, expected_updates + 1)
+                )
+                or not np.isfinite(loss_array).all()
+                or len(validation_update_array) == 0
+                or not np.isfinite(validation_loss_array).all()
+                or int(validation_update_array[best_index])
+                != int(training["best_update"])
+                or not np.isclose(
+                    validation_loss_array[best_index],
+                    float(training["best_loss"]),
+                )
+            ):
+                raise ValueError(
+                    f"Invalid {stage} training or validation loss history "
+                    f"in {component}; expected {expected_updates} finite "
+                    "training updates and a validation minimum matching "
+                    "the selected checkpoint."
+                )
+            histories[stage].append(dict(
+                source_count=int(spec["source_count"]),
+                updates=update_array,
+                losses=loss_array,
+                validation_updates=validation_update_array,
+                validation_losses=validation_loss_array,
+                best_update=int(training["best_update"]),
+            ))
+            checksums.append(dict(
+                source_count=int(spec["source_count"]),
+                stage=stage,
+                checksum=file_digest(history_path),
+            ))
+    for stage, values in histories.items():
+        counts = [row["source_count"] for row in values]
+        if sorted(counts) != sorted(plan["settings"]["source_counts"]):
+            raise ValueError(
+                f"Expected one {stage} loss history per source count; "
+                f"found {counts}."
+            )
+    return histories, checksums
+
+
+def plot_source_loss_histories(
+    histories: dict, directory: Path
+) -> None:
+    """Plot training and validation losses by stage and source count."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    labels = {"neural": "Stage 1 neural", "residual": "Stage 2 residual"}
+    for stage, rows in histories.items():
+        figure, axis = plt.subplots(figsize=(12, 5))
+        for row in sorted(rows, key=lambda item: item["source_count"]):
+            color = COLORS[row["source_count"]]
+            updates = row["updates"]
+            losses = row["losses"]
+            window = min(SOURCE_LOSS_SMOOTHING_UPDATES, len(losses))
+            smooth = np.convolve(
+                losses, np.ones(window, dtype=float) / window, mode="valid"
+            )
+            smooth_updates = updates[window - 1:]
+            axis.plot(updates, losses, color=color, alpha=0.14)
+            axis.plot(
+                smooth_updates,
+                smooth,
+                color=color,
+                label=(
+                    f"{row['source_count']} sessions, training "
+                    f"({SOURCE_LOSS_SMOOTHING_UPDATES}-update mean)"
+                ),
+            )
+            axis.plot(
+                row["validation_updates"],
+                row["validation_losses"],
+                color=color,
+                linestyle="--",
+                marker="o",
+                markersize=3,
+                label=f"{row['source_count']} sessions, validation",
+            )
+            axis.axvline(
+                row["best_update"],
+                color=color,
+                linestyle=":",
+                alpha=0.55,
+            )
+        axis.set_title(f"{labels[stage]} source loss")
+        axis.set_xlabel("Training update")
+        axis.set_ylabel("Loss")
+        axis.grid(alpha=0.2)
+        axis.legend(
+            title="Indy source sessions",
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1.0),
+            borderaxespad=0,
+            fontsize=8,
+        )
+        figure.tight_layout(rect=(0, 0, 0.72, 1))
+        figure.savefig(
+            directory / f"{stage}_loss.png",
+            dpi=150,
+            bbox_inches="tight",
+        )
+        plt.close(figure)
+
+
+def refresh_scaling_figures(plan: dict, plan_path: Path) -> None:
+    """Publish figure-only revisions from each final scaling report.
+
+    Parameters
+    ----------
+    plan : dict
+        Completed multi-session source scaling plan.
+    plan_path : Path
+        Path to the immutable plan JSON.
+
+    Notes
+    -----
+    Existing report snapshots and their figures are left unchanged. New
+    figures are written under each analysis root and linked by a pointer.
+    """
+    import csv
+
+    from experiments.multisession.plan import analysis_directory
+    from experiments.multisession.reports import report_path
+    from experiments.multisession.store import job
+
+    renderer = Path(__file__)
+    plan_id = plan_path.parent.name
+    histories, history_checksums = source_loss_histories(plan)
+    expected_names = {
+        f"target_transfer/{target}/{metric}/h{horizon}.png"
+        for target in ("neural", "behavior")
+        for metric in METRICS
+        for horizon in plan["settings"]["evaluation_horizons"]
+    }
+    expected_names.update({
+        "source_training/neural_loss.png",
+        "source_training/residual_loss.png",
+    })
+    for direction in plan["analysis_paths"]:
+        analysis = analysis_directory(plan, direction, plan_id)
+        pointer = analysis / "latest_report.json"
+        if not pointer.is_file():
+            raise ValueError(
+                f"Missing final scaling report pointer: {pointer.resolve()}"
+            )
+        record = json.loads(pointer.read_text())
+        snapshot = report_path(analysis, record)
+        if record.get("mode") != "final" or completed(snapshot) is None:
+            raise ValueError(f"Scaling report is not final: {analysis}")
+        summary_path = snapshot / "tables" / "summary.csv"
+        with summary_path.open(newline="") as stream:
+            summary = list(csv.DictReader(stream))
+        if not summary:
+            raise ValueError(f"Final scaling summary is empty: {summary_path}")
+        for row in summary:
+            row["source_count"] = int(row["source_count"])
+            row["horizon"] = int(row["horizon"])
+            row["fraction"] = float(row["fraction"])
+            row["mean"] = float(row["mean"])
+            row["sem"] = float(row["sem"]) if row["sem"] else None
+        identity = dict(
+            analysis=direction,
+            report_checksum=file_digest(summary_path),
+            renderer_checksum=file_digest(renderer),
+            fractions=plan["settings"]["target_fractions"],
+            horizons=plan["settings"]["evaluation_horizons"],
+            source_counts=plan["settings"]["source_counts"],
+            label="dynamic parameter sharing",
+            source_history_checksums=history_checksums,
+        )
+        directory = (
+            analysis / "figures"
+            / f"dynamic-sharing-{fingerprint(identity)[:12]}"
+        )
+        with job(directory, identity) as needed:
+            if needed:
+                scaling_figures(
+                    summary, direction, directory, plan["settings"]
+                )
+                loss_directory = directory / "source_training"
+                loss_directory.mkdir(parents=True)
+                plot_source_loss_histories(histories, loss_directory)
+                missing = expected_names - {
+                    str(path.relative_to(directory))
+                    for path in directory.rglob("*.png")
+                }
+                if missing:
+                    raise ValueError(
+                        f"Missing scaling figures: {sorted(missing)}"
+                    )
+        atomic_json(
+            analysis / "latest_figures.json",
+            dict(
+                snapshot=str(directory.relative_to(analysis)),
+                source_report=record["snapshot"],
+                figure_count=len(expected_names),
+                label="dynamic parameter sharing",
+            ),
+        )
 
 
 def write_scaling_payload(
