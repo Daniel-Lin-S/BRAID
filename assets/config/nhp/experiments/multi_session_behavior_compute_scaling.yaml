@@ -1,0 +1,23 @@
+extends: multi_session_training.yaml
+name: multi_session_behavior_compute_scaling
+title: Behavioral supervision source and compute scaling
+latent: 16
+seeds: [42]
+source_counts: [4, 8, 16, 33]
+source_training:
+  maximum_updates: 5000
+  checkpoints: [1000, 2000, 3000, 4000, 5000]
+  branch_updates: 500
+  warmup_updates: 200
+  warmup_start_learning_rate: 0.0000001
+  learning_rate: 0.001
+  session_batch_sizes:
+    4: 8
+    8: 8
+    16: 8
+    33: 4
+runtime:
+  parallel_workers: 4
+  gpus_per_source: 2
+  cpu_threads: 4
+  device: auto

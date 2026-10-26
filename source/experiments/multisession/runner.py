@@ -111,6 +111,28 @@ def plan_campaign(settings: dict) -> tuple[dict, Path]:
         plan = build_scaling_plan(
             settings, sessions, reference, source_reference
         )
+    elif settings["name"] == "multi_session_behavior_compute_scaling":
+        from experiments.multisession.behavior_compute_scaling.plan import (
+            build_plan as build_compute_plan,
+        )
+
+        source_reference = json.loads(
+            Path(settings["source_reference_plan"]).resolve().read_text()
+        )
+        target_reference = json.loads(
+            Path(settings["target_reference_plan"]).resolve().read_text()
+        )
+        from experiments.multisession.behavior_compute_scaling.audit import (
+            audit_source_holdout, audit_target_folds,
+        )
+
+        audit_source_holdout(adapter, source_reference)
+        audit_target_folds(
+            adapter, target_reference, settings["held_out_sessions"]
+        )
+        plan = build_compute_plan(
+            settings, sessions, source_reference, target_reference
+        )
     elif settings["name"] == "multi_session_source_capacity_scaling":
         from experiments.multisession.capacity import build_capacity_plan
 
@@ -181,7 +203,17 @@ def run_job(
     )
 
     spec = plan["jobs"][key]
-    current = implementation_digest(spec["kind"], spec.get("model"))
+    if (
+        plan.get("name") == "multi_session_behavior_compute_scaling"
+        and spec["kind"] == "source"
+    ):
+        from experiments.multisession.behavior_compute_scaling.plan import (
+            source_implementation,
+        )
+
+        current = source_implementation()
+    else:
+        current = implementation_digest(spec["kind"], spec.get("model"))
     validate_worker(key, spec, current, compatibility)
     directory = fit_directory(plan, key)
     identity = dict(spec)
@@ -208,6 +240,22 @@ def run_job(
                 validation.append(va)
                 records[session] = record
             atomic_json(directory / "data.json", records)
+            if plan.get("name") == (
+                "multi_session_behavior_compute_scaling"
+            ):
+                from .behavior_compute_scaling.pipeline import (
+                    fit_source_campaign,
+                )
+
+                fit_source_campaign(
+                    train, validation, records, directory,
+                    directory.parent.parent / "source_components",
+                    spec, ("/GPU:0", "/GPU:1"),
+                    spec["source_training"]["session_batch_sizes"][
+                        str(spec["source_count"])
+                    ],
+                )
+                return
             fit_source(
                 train,
                 validation,
@@ -263,7 +311,7 @@ def run_job(
             fit_directory(plan, spec["preprocessing"]),
             weights,
             seed,
-            spec["implementation"],
+            plan["jobs"][spec["preprocessing"]]["implementation"],
         )
         evaluate_target(model, features, directory, spec, spec["horizons"])
 
@@ -587,7 +635,12 @@ def start_report(path: Path, launch: Path, settings: dict) -> subprocess.Popen:
 
 def publish_reports(plan: dict, path: Path) -> None:
     """Keep reporting failures from interrupting independent fitting jobs."""
-    from experiments.multisession.reports import report
+    if plan.get("name") == "multi_session_behavior_compute_scaling":
+        from .behavior_compute_scaling.report import (
+            report,
+        )
+    else:
+        from experiments.multisession.reports import report
 
     try:
         report(plan, path, final=True)
@@ -627,9 +680,28 @@ def main() -> None:
 
         if args.source_sha256 is not None:
             verify_source_code(args.source_sha256)
-        configure_device("auto", args.threads)
         path = args.plan.resolve()
         plan = json.loads(path.read_text())
+        if (
+            plan.get("name") == "multi_session_behavior_compute_scaling"
+            and plan["jobs"][args.job]["kind"] == "source"
+        ):
+            import tensorflow as tf
+
+            devices = tf.config.list_physical_devices("GPU")
+            if len(devices) != 2:
+                raise RuntimeError(
+                    f"Expected two source GPUs, got {len(devices)}."
+                )
+            for device in devices:
+                tf.config.experimental.set_memory_growth(device, True)
+            tf.config.set_soft_device_placement(False)
+            tf.config.threading.set_intra_op_parallelism_threads(
+                args.threads
+            )
+            tf.config.threading.set_inter_op_parallelism_threads(1)
+        else:
+            configure_device("auto", args.threads)
         compatibility = (
             load_compatibility(args.compatibility, path)
             if args.compatibility is not None else None
@@ -653,12 +725,28 @@ def main() -> None:
         print(path.resolve())
         return
     if args.stage == "report":
-        from experiments.multisession.reports import report
+        if settings["name"] == (
+            "multi_session_behavior_compute_scaling"
+        ):
+            from .behavior_compute_scaling.report import (
+                report,
+            )
+        else:
+            from experiments.multisession.reports import report
 
         reconcile(plan, path)
         report(plan, path)
         return
     if args.stage == "figures":
+        if settings["name"] == (
+            "multi_session_behavior_compute_scaling"
+        ):
+            from .behavior_compute_scaling.report import (
+                report,
+            )
+
+            report(plan, path, final=True)
+            return
         if settings["name"] == "multi_session_source_scaling":
             from experiments.multisession.scaling_report import (
                 refresh_scaling_figures,
@@ -720,6 +808,16 @@ def main() -> None:
             ),
         )
         print(f"Launched pid={process.pid}; logs: {launch.resolve()}")
+        return
+    if settings["name"] == "multi_session_behavior_compute_scaling":
+        from experiments.multisession.behavior_compute_scaling.queue import (
+            run_compute_queue,
+        )
+
+        run_compute_queue(
+            plan, path, launch, settings,
+            args.source_sha256, args.adopt_launch,
+        )
         return
     run_queue(
         plan, path, launch, settings, args.adopt_launch,

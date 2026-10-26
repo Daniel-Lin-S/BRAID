@@ -17,6 +17,20 @@ COLORS = {
     "AKC": "#339966",
     "scratch": "#222222",
 }
+DEFAULT_LINE_WIDTH = 2.2
+
+
+def plot_line(*, x: list, y: list, ax: object, **style: object) -> None:
+    """Draw a campaign line with shared width and available styling."""
+    style.setdefault("linewidth", DEFAULT_LINE_WIDTH)
+    try:
+        import seaborn as sns
+    except ModuleNotFoundError:
+        ax.plot(x, y, **style)
+    else:
+        sns.lineplot(x=x, y=y, ax=ax, **style)
+
+
 LABELS = {
     "A": "A1_fw",
     "AK": "A1_fw + K1_fw",
