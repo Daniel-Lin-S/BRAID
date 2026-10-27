@@ -12,6 +12,7 @@ figures and references to input tables. Fits and existing reports are untouched.
 import argparse
 import csv
 import json
+from math import ceil
 from pathlib import Path
 from textwrap import fill
 
@@ -22,14 +23,15 @@ import numpy as np
 
 from experiments.multisession.behavior_compute_scaling.plan import COUNTS
 from experiments.multisession.behavior_compute_scaling.report import (
-    RENDERING_STYLE, source_figures,
+    RENDERING_STYLE,
 )
 from experiments.multisession.scaling_report import COLORS
 from experiments.multisession.data import SAMPLE_RATE
 from experiments.multisession.store import completed, job
 from experiments.storage.cache import atomic_json, fingerprint
 from experiments.visualization.multisession import (
-    ANNOTATION_FONT_SIZE, READABLE_TEXT_STYLE, plot_line,
+    ANNOTATION_FONT_SIZE, DEFAULT_LINE_WIDTH, READABLE_TEXT_STYLE,
+    plot_line,
 )
 
 HORIZONS = (1, 2, 4, 8)
@@ -47,8 +49,21 @@ ENDPOINT_NOTE = (
     "Largest completed budget: 800 updates (4/8/16 sessions), "
     "1600 (33 sessions); 6400 draws per recording per recurrent stage. "
     "The outer holdout also selects transfer checkpoints; selected scores "
-    "are descriptive. One seed; no uncertainty estimate."
+    "are descriptive. One seed; no uncertainty estimate. "
+    "A y-value of 1 equals the constant training-mean dummy predictor; "
+    "values above 1 are worse than dummy."
 )
+COMPUTE_NOTE = (
+    "Five completed budgets per source count. The same outer holdout "
+    "selects transfer checkpoints; selected scores are descriptive. "
+    "One seed; no uncertainty estimate. A y-value of 1 equals the "
+    "constant training-mean dummy predictor; values above 1 are worse."
+)
+BASELINE_RATIO = 1.0
+Y_AXIS_ORIGIN = 0.0
+RATIO_TICK_STEP = 0.25
+DUMMY_REFERENCE_COLOR = "#333333"
+BASELINE_LABEL = "MSE / dummy MSE"
 
 
 def read_rows(path: Path) -> list[dict]:
@@ -85,24 +100,76 @@ def loss_curve(
     return values
 
 
-def configure_axis(axis: object, ylabel: str) -> None:
-    """Apply source-count ticks and the shared log-axis presentation."""
-    axis.set_xscale("log", base=2)
-    axis.set_yscale("log")
-    axis.set_xticks(COUNTS, labels=[str(count) for count in COUNTS])
-    axis.set_xlim(min(COUNTS) / 1.08, max(COUNTS) * 1.08)
-    axis.set_xlabel("Source sessions")
-    axis.set_ylabel(ylabel)
+def ratio_curve(
+    rows: list[dict], filters: dict, column: str,
+    horizons: tuple[int, ...] = HORIZONS,
+) -> list[float]:
+    """Divide per-count mean MSE by its matching dummy predictor MSE."""
+    numerator = np.asarray(loss_curve(rows, filters, column, horizons))
+    dummy_column = (
+        "dummy_loss" if column == "combined_loss" else "mean_dummy_loss"
+    )
+    denominator = np.asarray(
+        loss_curve(rows, filters, dummy_column, horizons)
+    )
+    if not np.allclose(
+        denominator, denominator[0], rtol=1e-8, atol=1e-8
+    ):
+        raise ValueError(
+            "Dummy predictor changed across source counts; "
+            "a shared reference is required."
+        )
+    ratio = numerator / denominator
+    if not np.isfinite(ratio).all() or np.any(ratio <= 0):
+        raise ValueError("Expected finite positive dummy-normalized loss.")
+    return ratio.tolist()
+
+
+def ratio_axis(axis: object) -> None:
+    """Start at zero and include all valid ratios above the dummy level."""
+    values = np.asarray([
+        value for line in axis.lines for value in line.get_ydata()
+    ], dtype=float)
+    if not values.size or not np.isfinite(values).all():
+        raise ValueError("Ratio plot requires finite nonempty values.")
+    if np.any(values <= 0):
+        raise ValueError("Ratio plot requires positive model MSE ratios.")
+    maximum = max(BASELINE_RATIO, float(values.max()))
+    upper = max(
+        BASELINE_RATIO,
+        ceil(maximum / RATIO_TICK_STEP) * RATIO_TICK_STEP,
+    )
+    axis.set_yscale("linear")
+    axis.set_ylim(Y_AXIS_ORIGIN, upper)
+    ticks = np.arange(
+        Y_AXIS_ORIGIN, upper + RATIO_TICK_STEP / 2, RATIO_TICK_STEP
+    )
+    axis.set_yticks(ticks)
+    axis.axhline(
+        BASELINE_RATIO, color=DUMMY_REFERENCE_COLOR,
+        linestyle=":", linewidth=1.5,
+    )
+    axis.set_ylabel(BASELINE_LABEL)
     axis.grid(alpha=0.2)
 
 
+def configure_axis(axis: object) -> None:
+    """Use source-count ticks and the shared dummy-anchored MSE scale."""
+    axis.set_xscale("log", base=2)
+    axis.set_xticks(COUNTS, labels=[str(count) for count in COUNTS])
+    axis.set_xlim(min(COUNTS) / 1.08, max(COUNTS) * 1.08)
+    axis.set_xlabel("Source sessions")
+    ratio_axis(axis)
+
+
 def finish_figure(
-    figure: object, path: Path, title: str, legend: bool = False,
+    figure: object, path: Path, title: str,
+    legend: bool = False, note: str = ENDPOINT_NOTE,
 ) -> None:
     """Save one endpoint view with readable title and selection disclosure."""
     figure.suptitle(fill(title, TITLE_WIDTH), y=0.99)
     figure.text(
-        0.04, 0.02, fill(ENDPOINT_NOTE, NOTE_WIDTH),
+        0.04, 0.02, fill(note, NOTE_WIDTH),
         fontsize=ANNOTATION_FONT_SIZE, va="bottom",
     )
     if legend:
@@ -121,12 +188,12 @@ def endpoint_figures(
     """Render horizon, stage, split and recording-specific endpoint views."""
     figure, axes = plt.subplots(2, 2, figsize=PANEL_SIZE)
     for axis, horizon in zip(axes.flat, HORIZONS):
-        values = loss_curve(
+        values = ratio_curve(
             summary, {"role": "outer_test"}, "mean_combined_loss",
             (horizon,),
         )
         plot_line(x=COUNTS, y=values, ax=axis, color=BLUE, marker="o")
-        configure_axis(axis, "Neural prediction MSE")
+        configure_axis(axis)
         milliseconds = horizon * MILLISECONDS_PER_SECOND / SAMPLE_RATE
         axis.set_title(f"Horizon {horizon} ({milliseconds:g} ms)", pad=22)
     finish_figure(
@@ -139,10 +206,10 @@ def endpoint_figures(
         ("mean_combined_loss", "Readout + RNN2", BLUE, "-"),
     ):
         plot_line(
-            x=COUNTS, y=loss_curve(summary, {"role": "outer_test"}, column),
+            x=COUNTS, y=ratio_curve(summary, {"role": "outer_test"}, column),
             ax=axis, color=color, linestyle=style, marker="o", label=label,
         )
-    configure_axis(axis, "Summed neural prediction MSE")
+    configure_axis(axis)
     finish_figure(
         figure, out / "neural_readout_and_combined_loss.png",
         "Neural readout versus combined prediction on the outer holdout",
@@ -156,10 +223,10 @@ def endpoint_figures(
     ):
         plot_line(
             x=COUNTS,
-            y=loss_curve(summary, {"role": role}, "mean_combined_loss"),
+            y=ratio_curve(summary, {"role": role}, "mean_combined_loss"),
             ax=axis, color=color, linestyle=style, marker="o", label=label,
         )
-    configure_axis(axis, "Summed neural prediction MSE")
+    configure_axis(axis)
     finish_figure(
         figure, out / "neural_generalization.png",
         "Training and holdout losses on the same four source recordings",
@@ -171,19 +238,97 @@ def endpoint_figures(
     figure, axis = plt.subplots(figsize=SINGLE_SIZE)
     for name, count, style in zip(names, COUNTS, LINE_STYLES):
         plot_line(
-            x=COUNTS, y=loss_curve(
+            x=COUNTS, y=ratio_curve(
                 sessions, {"role": "outer_test", "session": name},
                 "combined_loss",
             ), ax=axis, color=COLORS[count], linestyle=style,
             marker="o", label=name,
         )
-    configure_axis(axis, "Summed neural prediction MSE")
+    configure_axis(axis)
     finish_figure(
         figure, out / "neural_session_scaling.png",
         "Outer-holdout neural prediction for each common recording",
         legend=True,
     )
 
+
+@plt.rc_context(READABLE_TEXT_STYLE)
+def readout_compute_figures(
+    source: list[dict], sessions: list[dict], out: Path,
+) -> None:
+    """Draw five readout budgets per count against full-path FLOPs."""
+    figure, axis = plt.subplots(figsize=SINGLE_SIZE)
+    baseline_by_session = {}
+    for count, style in zip(COUNTS, LINE_STYLES):
+        selected = sorted(
+            (row for row in source if row["stage"] == "neural_readout"
+             and row["source_count"] == count),
+            key=lambda row: row["full_path_flops"],
+        )
+        if len(selected) != 5:
+            raise ValueError(
+                f"Expected five readout budgets for {count} sessions."
+            )
+        xs, ys = [], []
+        for row in selected:
+            matching = [item for item in sessions
+                        if item["stage"] == "neural_readout"
+                        and int(item["source_count"]) == count
+                        and int(item["budget"]) == row["budget"]]
+            if len(matching) != 4:
+                raise ValueError(
+                    f"Expected four readout dummy scores for {count} "
+                    f"sessions and budget {row['budget']}."
+                )
+            names = [item["session"] for item in matching]
+            if len(set(names)) != 4:
+                raise ValueError("Readout dummy scores need four sessions.")
+            for item in matching:
+                name = item["session"]
+                value = float(item["dummy_loss"])
+                if not np.isfinite(value) or value <= 0:
+                    raise ValueError(
+                        "Readout dummy scores must be finite positive."
+                    )
+                if name in baseline_by_session and not np.isclose(
+                    value, baseline_by_session[name], rtol=1e-8, atol=1e-8
+                ):
+                    raise ValueError(
+                        f"Readout dummy baseline changed for {name}."
+                    )
+                baseline_by_session[name] = value
+            if set(names) != set(baseline_by_session):
+                raise ValueError("Readout dummy sessions changed by budget.")
+            dummy = np.asarray(
+                [float(item["dummy_loss"]) for item in matching]
+            )
+            loss = row["chronological_source_test_loss"]
+            ratio = loss / float(dummy.mean())
+            if not np.isfinite(ratio) or ratio <= 0:
+                raise ValueError("Invalid readout dummy-normalized loss.")
+            xs.append(row["full_path_flops"])
+            ys.append(ratio)
+        plot_line(
+            x=xs, y=ys, ax=axis, color=COLORS[count],
+            linestyle=style, marker="o", linewidth=DEFAULT_LINE_WIDTH,
+            label=f"{count} source sessions",
+        )
+        chosen = [index for index, row in enumerate(selected)
+                  if row["transfer_selected"]]
+        if len(chosen) != 1:
+            raise ValueError("Expected one selected checkpoint per count.")
+        axis.scatter(
+            xs[chosen[0]], ys[chosen[0]], s=80, marker="s",
+            color=COLORS[count], edgecolor="black", zorder=5,
+        )
+    axis.set_xscale("log")
+    axis.set_xlabel("Full-pipeline source model FLOPs")
+    ratio_axis(axis)
+    finish_figure(
+        figure, out / "source_neural_readout.png",
+        "Neural readout versus full-pipeline training FLOPs",
+        legend=True, note=COMPUTE_NOTE,
+    )
 
 def publish(report: Path, diagnostics: Path) -> Path:
     """Validate completed inputs and publish five derived diagnostic views."""
@@ -202,6 +347,9 @@ def publish(report: Path, diagnostics: Path) -> Path:
     summary = read_rows(diagnostics / "summary.csv")
     sessions = read_rows(diagnostics / "session_horizon_losses.csv")
     source = read_rows(report / "tables" / "source_loss.csv")
+    source_sessions = read_rows(
+        report / "tables" / "source_session_loss.csv"
+    )
     for row in source:
         for key in ("source_count", "budget", "full_path_flops"):
             row[key] = int(row[key])
@@ -212,6 +360,13 @@ def publish(report: Path, diagnostics: Path) -> Path:
     identity = dict(
         group="source_neural_diagnostics", inputs=inputs,
         rendering=RENDERING_STYLE, endpoint_note=ENDPOINT_NOTE,
+        compute_note=COMPUTE_NOTE, baseline_axis=dict(
+            measure=BASELINE_LABEL,
+            reference=BASELINE_RATIO,
+            minimum=Y_AXIS_ORIGIN,
+            maximum="at least 1 and includes every finite positive ratio",
+            dummy="constant training-target mean on the matching windows",
+        ),
         figures=["horizon", "readout", "generalization", "session", "compute"],
     )
     destination = report.parent / fingerprint(identity)
@@ -221,7 +376,7 @@ def publish(report: Path, diagnostics: Path) -> Path:
             figures.mkdir()
             atomic_json(destination / "input_references.json", inputs)
             endpoint_figures(summary, sessions, figures)
-            source_figures(source, figures, stages=("neural_readout",))
+            readout_compute_figures(source, source_sessions, figures)
     atomic_json(report.parent.parent / "latest_diagnostics.json", dict(
         snapshot=str(destination.resolve()), identity=fingerprint(identity),
     ))
