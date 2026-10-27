@@ -18,6 +18,17 @@ COLORS = {
     "scratch": "#222222",
 }
 DEFAULT_LINE_WIDTH = 2.2
+READABLE_TEXT_STYLE = {
+    "font.size": 16,
+    "axes.labelsize": 18,
+    "axes.titlesize": 20,
+    "xtick.labelsize": 16,
+    "ytick.labelsize": 16,
+    "legend.fontsize": 16,
+    "legend.title_fontsize": 16,
+    "figure.titlesize": 20,
+}
+ANNOTATION_FONT_SIZE = 14
 
 
 def plot_line(*, x: list, y: list, ax: object, **style: object) -> None:

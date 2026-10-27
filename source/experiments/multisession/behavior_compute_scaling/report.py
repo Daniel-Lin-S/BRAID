@@ -26,12 +26,17 @@ from experiments.multisession.store import completed, fit_directory, job
 from experiments.storage.cache import atomic_json, fingerprint
 from experiments.multisession.scaling_report import COLORS
 from experiments.visualization.multisession import (
-    DEFAULT_LINE_WIDTH, plot_line,
+    ANNOTATION_FONT_SIZE, DEFAULT_LINE_WIDTH, READABLE_TEXT_STYLE, plot_line,
 )
 
 EXPECTED_COMMON_WINDOWS = 87
 SOURCE_FIGURE_SIZE = (8, 5)
-TITLE_WIDTH = 58
+TITLE_WIDTH = 42
+NOTE_WIDTH = 78
+RENDERING_STYLE = dict(
+    text=READABLE_TEXT_STYLE, annotation_font=ANNOTATION_FONT_SIZE,
+    title_width=TITLE_WIDTH, note_width=NOTE_WIDTH,
+)
 TARGET_COLOR = "#2878b5"
 SCRATCH_COLOR = "#222222"
 SELECTED_MARKER = "s"
@@ -153,6 +158,7 @@ def source_tables(
     return losses, sessions, choices
 
 
+@plt.rc_context(READABLE_TEXT_STYLE)
 def source_figures(
     rows: list[dict], directory: Path,
     counts: tuple[int, ...] = COUNTS,
@@ -217,11 +223,12 @@ def source_figures(
             pad=22,
         )
         axis.text(
-            0, -0.25,
-            "The same holdout selects transfer checkpoints; selected "
-            "source scores are descriptive."
-            + (f"\n{INTERIM_NOTE}" if counts != COUNTS else ""),
-            transform=axis.transAxes, fontsize=9,
+            0, -0.32,
+            fill(
+                "The same holdout selects transfer checkpoints; selected "
+                "source scores are descriptive.", NOTE_WIDTH,
+            ) + (f"\n{INTERIM_NOTE}" if counts != COUNTS else ""),
+            transform=axis.transAxes, fontsize=ANNOTATION_FONT_SIZE,
         )
         axis.legend(
             loc="upper left", bbox_to_anchor=(1.01, 1),
@@ -234,6 +241,7 @@ def source_figures(
         plt.close(figure)
 
 
+@plt.rc_context(READABLE_TEXT_STYLE)
 def target_figures(
     summary: list[dict], gain_summary: list[dict], directory: Path,
     settings: dict, counts: tuple[int, ...] = COUNTS,
@@ -325,6 +333,7 @@ def target_figures(
                 )
 
 
+@plt.rc_context(READABLE_TEXT_STYLE)
 def draw_gains(
     summary: list[dict], directory: Path, target: str,
     metric: str, fraction: float, settings: dict,
@@ -492,6 +501,7 @@ def source_report(
     root = analysis_directory(plan, CAMPAIGN, plan_path.parent.name)
     identity = dict(
         group="recurrent_source", source_counts=list(counts),
+        rendering=RENDERING_STYLE,
         protocol=plan["settings"]["source_training"],
         sources=[(row["source_fit"], row["component_checksum"])
                  for row in sources],
@@ -540,6 +550,7 @@ def source_report(
             write_table(tables / "component_diagnostics.csv", diagnostics)
             atomic_json(snapshot / "design.json", dict(
                 source_counts=list(counts), source_components=RECURRENT_STAGES,
+                rendering=RENDERING_STYLE,
                 planned_source_counts=list(COUNTS),
                 report_scope=("complete" if counts == COUNTS else "interim"),
                 expected_common_windows=EXPECTED_COMMON_WINDOWS,
@@ -617,7 +628,7 @@ def report(
             (row["source_fit"], row["component_checksum"])
             for row in sources
         ],
-        targets=identities,
+        targets=identities, rendering=RENDERING_STYLE,
     )
     if counts != COUNTS:
         identity["interim_source_counts"] = list(counts)
