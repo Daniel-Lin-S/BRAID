@@ -8,10 +8,9 @@ Inputs are immutable plan.json, the original launch's status.json and source
 worker logs, and checksum-validated source fits. Output status.json records
 per-count completion and last log values; TensorBoard scalar events under the
 campaign analysis root contain training loss, inner validation, learning rate,
-source test loss and full-path FLOPs. An interim source-only snapshot is
-published after the 4/8/16 fits; the complete figure replaces its latest
-pointer after all four source fits complete. This observer never launches
-model or adaptation workers.
+source test loss and full-path FLOPs. Figures publish after all four source
+fits complete. --allow-interim additionally permits a 4/8/16 snapshot.
+This observer never launches model or adaptation workers.
 """
 
 import argparse
@@ -28,10 +27,13 @@ from tensorboard.compat.proto.summary_pb2 import Summary
 from tensorboard.summary.writer.event_file_writer import EventFileWriter
 
 from experiments.multisession.behavior_compute_scaling.plan import (
-    CAMPAIGN, COUNTS,
+    CAMPAIGN, COUNTS, TOTAL_UPDATES,
 )
 from experiments.multisession.behavior_compute_scaling.report import (
     INTERIM_COUNTS, source_report,
+)
+from experiments.multisession.behavior_compute_scaling.ancestry import (
+    inherited_paths,
 )
 from experiments.multisession.plan import analysis_directory
 from experiments.multisession.store import completed, fit_directory
@@ -89,7 +91,11 @@ def write_scalar(
 class SourceLogReader:
     """Read appended worker log lines without accessing training state."""
 
-    def __init__(self, path: Path, count: int, writer: EventFileWriter):
+    def __init__(
+        self, path: Path, count: int, writer: EventFileWriter,
+        budgets: tuple[int, ...] = TOTAL_UPDATES,
+    ):
+        """Configure the ordered budgets actually fitted by this worker."""
         self.path = path
         self.count = count
         self.writer = writer
@@ -97,7 +103,7 @@ class SourceLogReader:
         self.budget_index = 0
         self.previous_stage = None
         self.last = {}
-        self.budgets = (50, 100, 200, 400, 800)
+        self.budgets = budgets
         if count == 33:
             self.budgets = tuple(value * 2 for value in self.budgets)
 
@@ -190,10 +196,13 @@ def publish_source_scores(
                 raise ValueError(
                     f"Source completion disappeared: {fit.resolve()}."
                 )
-            budgets = json.loads((fit / "budgets.json").read_text())
-            if len(budgets) != 5:
+            budgets = inherited_paths(fit)
+            expected = len(
+                plan["jobs"][key]["source_training"]["total_updates"]
+            )
+            if len(budgets) != expected:
                 raise ValueError(
-                    f"Expected five completed source budgets for {count}."
+                    f"Expected {expected} completed budgets for {count}."
                 )
             writer = writers[count]
             now = datetime.now(timezone.utc).timestamp()
@@ -233,7 +242,7 @@ def worker_running(worker: dict) -> bool:
 
 def observe(
     plan: dict, plan_path: Path, launch: Path, output: Path,
-    interval: int,
+    interval: int, allow_interim: bool = False,
 ) -> None:
     """Stream source metrics, then publish the complete source figure group."""
     if interval <= 0:
@@ -250,7 +259,13 @@ def observe(
     }
     readers = {
         count: SourceLogReader(
-            Path(workers[count]["log"]), count, writers[count]
+            Path(workers[count]["log"]), count, writers[count],
+            budgets=tuple(
+                value for value in plan["jobs"][workers[count]["job"]]
+                ["source_training"]["total_updates"]
+                if value not in plan["jobs"][workers[count]["job"]]
+                .get("continuation", {}).get("completed_total_updates", [])
+            ),
         ) for count in COUNTS
     }
     published = set()
@@ -261,7 +276,7 @@ def observe(
                 reader.scan()
             complete = publish_source_scores(plan, writers, published)
             if (
-                not all(complete.values())
+                allow_interim and not all(complete.values())
                 and all(complete[count] for count in INTERIM_COUNTS)
                 and partial_snapshot is None
             ):
@@ -321,6 +336,7 @@ def main() -> None:
     parser.add_argument(
         "--interval-seconds", type=int, default=DEFAULT_INTERVAL_SECONDS
     )
+    parser.add_argument("--allow-interim", action="store_true")
     args = parser.parse_args()
     for path in (args.plan, args.source_launch, args.output):
         if not path.is_absolute():
@@ -329,7 +345,7 @@ def main() -> None:
     plan = json.loads(args.plan.read_text())
     observe(
         plan, args.plan, args.source_launch, args.output,
-        args.interval_seconds,
+        args.interval_seconds, args.allow_interim,
     )
 
 

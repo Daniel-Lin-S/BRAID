@@ -119,7 +119,9 @@ def plan_campaign(settings: dict) -> tuple[dict, Path]:
         )
 
         source_reference = json.loads(
-            Path(settings["source_reference_plan"]).resolve().read_text()
+            Path(settings.get(
+                "source_continuation_plan", settings["source_reference_plan"]
+            )).resolve().read_text()
         )
         target_reference = json.loads(
             Path(settings["target_reference_plan"]).resolve().read_text()
@@ -134,9 +136,14 @@ def plan_campaign(settings: dict) -> tuple[dict, Path]:
             adapter, target_reference, settings["held_out_sessions"]
         )
         audit_inner_splits(adapter, source_reference, settings)
-        plan = build_compute_plan(
-            settings, sessions, source_reference, target_reference
-        )
+        if "source_continuation_plan" in settings:
+            from .behavior_compute_scaling.plan import build_extension_plan
+
+            plan = build_extension_plan(settings, sessions, source_reference)
+        else:
+            plan = build_compute_plan(
+                settings, sessions, source_reference, target_reference
+            )
     elif settings["name"] == "multi_session_source_capacity_scaling":
         from experiments.multisession.capacity import build_capacity_plan
 

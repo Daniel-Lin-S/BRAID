@@ -15,6 +15,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from experiments.multisession.behavior_compute_scaling.ancestry import (
+    inherited_paths,
+)
 from experiments.multisession.behavior_compute_scaling.plan import (
     CAMPAIGN, COMPONENTS, COUNTS, RECURRENT_STAGES,
 )
@@ -105,9 +108,7 @@ def source_tables(
                 "the same holdout selected the transfer checkpoint."
             ),
         ))
-        for path in json.loads(
-            (directory / "budgets.json").read_text()
-        ):
+        for path in inherited_paths(directory):
             total = path["full_path_flops"]
             if not isinstance(total, int) or total <= 0:
                 raise ValueError("Invalid full-pipeline FLOP axis.")
@@ -163,6 +164,7 @@ def source_figures(
     rows: list[dict], directory: Path,
     counts: tuple[int, ...] = COUNTS,
     stages: tuple[str, ...] = COMPONENTS,
+    expected_points: int = 5,
 ) -> None:
     """Draw complete log-log source panels for requested stages."""
     if not rows:
@@ -178,9 +180,10 @@ def source_figures(
                 ),
                 key=lambda row: row["full_path_flops"],
             )
-            if len(selected) != 5:
+            if len(selected) != expected_points:
                 raise ValueError(
-                    f"Expected five source FLOP points for {count} sessions."
+                    f"Expected {expected_points} source FLOP points "
+                    f"for {count} sessions, got {len(selected)}."
                 )
             xs = [row["full_path_flops"] for row in selected]
             ys = [
@@ -519,7 +522,7 @@ def source_report(
             for key in keys:
                 spec = plan["jobs"][key]
                 fit = fit_directory(plan, key)
-                paths = json.loads((fit / "budgets.json").read_text())
+                paths = inherited_paths(fit)
                 seen = set()
                 for path in paths:
                     for stage, row in path["stages"].items():
@@ -561,6 +564,9 @@ def source_report(
             ))
             source_figures(
                 sources, figures, counts=counts, stages=RECURRENT_STAGES,
+                expected_points=len(
+                    plan["settings"]["source_training"]["total_updates"]
+                ),
             )
             print(f"Saved source figures: {figures.resolve()}")
     pointer = dict(
@@ -584,6 +590,8 @@ def report(
                 "Interim figures are not authorized for this protocol."
             )
         source_snapshot = source_report(plan, plan_path)
+    if plan.get("source_only"):
+        return
     if not campaign_complete(plan, final or counts != COUNTS, counts):
         return
     root = analysis_directory(

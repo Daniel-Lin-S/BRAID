@@ -1,7 +1,7 @@
 """Build matched behavioral source paths and score the fixed source holdout.
 
 Inputs are normalized training, inner-validation and chronological-test
-windows for nested Indy sessions. Fixed preprocessing is shared by all five
+windows for nested Indy sessions. Fixed preprocessing is shared by all
 recurrent budgets within a source count; each RNN1 branch has its own fixed
 readout and matched RNN2 branch. Immutable segments live in source_components.
 The source fit stores data.json (indices/scales), preprocessing.json (fixed
@@ -26,7 +26,11 @@ from experiments.multisession.source import (
     BEHAVIOR_WIDTH, NEURAL_WIDTH, PREPROCESSING_SIZE,
     behavior_targets, readout_data, residual_data,
 )
-from experiments.multisession.store import dump_pickle
+from experiments.multisession.store import dump_pickle, load_pickle
+from experiments.multisession.behavior_compute_scaling.ancestry import (
+    inherited_paths, main_prefix, prefix_flops, restore_component,
+    validate_continuation,
+)
 from experiments.multisession.training import (
     ReadoutStage, recurrent_data, stage_predictions,
 )
@@ -52,12 +56,18 @@ def fit_component_budget(
     model: object, train: list[dict], root: Path, identity: dict,
     settings: dict, seed: int, budget: int,
     devices: tuple[str, str], microbatch: int,
+    resume: Path | None = None,
 ) -> tuple[Path, int]:
     """Restore or train main prefix and one budget-matched decay branch."""
-    parent = None
-    total = 0
-    start = 0
+    parent = resume
+    total = prefix_flops(resume) if resume is not None else 0
+    start = (load_pickle(resume / "checkpoint.pkl")["update"]
+             if resume is not None else 0)
+    if start >= budget:
+        raise ValueError("Continuation budget must exceed its main prefix.")
     for stop in settings["checkpoints"]:
+        if stop <= start:
+            continue
         if stop > budget:
             break
         directory, _ = fit_segment(
@@ -162,8 +172,12 @@ def run_stage(
     root: Path, parent: str | None, budget: int,
     devices: tuple[str, str], microbatch: int,
     validation: list[dict] | None = None,
+    reuse: dict | None = None, resume: Path | None = None,
 ) -> tuple[dict, str]:
     """Fit one matched stage branch and record fixed-set stage loss."""
+    if reuse is not None:
+        restore_component(model, root / reuse["component_id"])
+        return reuse, reuse["component_id"]
     stage_index = COMPONENTS.index(stage)
     identity = stage_identity(spec, stage, parent)
     settings = spec["source_training"]
@@ -171,6 +185,7 @@ def run_stage(
         directory, flops = fit_component_budget(
             model, training, root, identity, settings,
             spec["seed"] + stage_index, budget, devices, microbatch,
+            resume=resume,
         )
     else:
         if validation is None:
@@ -215,7 +230,7 @@ def fit_source_campaign(
     devices: tuple[str, str], microbatch: int,
     validation: list[dict],
 ) -> None:
-    """Fit fixed preprocessing and five matched recurrent budget paths.
+    """Fit fixed preprocessing and matched recurrent budget paths.
 
     Parameters
     ----------
@@ -237,6 +252,17 @@ def fit_source_campaign(
             spec["source_training"], spec["source_count"]
         ), data_identity=fingerprint(records),
     )
+    inherited = []
+    reused = {}
+    resume = None
+    if "continuation" in spec:
+        ancestor = validate_continuation(spec, records, directory.parent)
+        inherited = inherited_paths(ancestor)
+        reused = inherited[-1]["stages"]
+        resume = main_prefix(
+            component_root / reused["behavior_relevant"]["component_id"]
+        )
+        atomic_json(directory / "continuation.json", spec["continuation"])
     names = spec["sessions"][:4]
     if len(names) != 4 or len(set(names)) != 4:
         raise ValueError("Expected four distinct common source sessions.")
@@ -257,7 +283,7 @@ def fit_source_campaign(
     pre_record, parent = run_stage(
         "preprocessing_neural", pre, neural[0], neural[2], names,
         spec, component_root, None, 0, devices, microbatch,
-        validation=neural[1],
+        validation=neural[1], reuse=reused.get("preprocessing_neural"),
     )
     pre_states = [stage_predictions(pre, part)[1] for part in neural]
     pre_readout = ReadoutStage(
@@ -272,7 +298,7 @@ def fit_source_campaign(
     behavior_record, pre_parent = run_stage(
         "preprocessing_behavior", pre_readout, behavior[0], behavior[2],
         names, spec, component_root, parent, 0, devices, microbatch,
-        validation=behavior[1],
+        validation=behavior[1], reuse=reused.get("preprocessing_behavior"),
     )
     prepared = [
         behavior_targets(pre_readout, states, part)
@@ -294,6 +320,15 @@ def fit_source_campaign(
             parent=pre_parent, scales=scales, data=spec["data_identity"],
         )),
     ))
+    if inherited:
+        saved_preprocessing = json.loads(
+            (ancestor / "preprocessing.json").read_text()
+        )
+        current_preprocessing = json.loads(
+            (directory / "preprocessing.json").read_text()
+        )
+        if saved_preprocessing != current_preprocessing:
+            raise ValueError("Continuation changed fixed generated targets.")
     main = MixedForecaster(
         [(row["Y"].shape[-1], row["Z"].shape[-1]) for row in train],
         spec["latent"], STAGE1_SHARING,
@@ -301,11 +336,14 @@ def fit_source_campaign(
         session_devices=devices,
     )
     main_initial = main.weights()
-    paths, transferable = [], {}
+    paths = []
+    prior_budget = inherited[-1]["budget"] if inherited else 0
     settings = spec["source_training"]
     for budget, total in zip(
         settings["checkpoints"], settings["total_updates"]
     ):
+        if budget <= prior_budget:
+            continue
         main.restore(main_initial)
         stages = dict(
             preprocessing_neural=pre_record,
@@ -314,6 +352,7 @@ def fit_source_campaign(
         record, parent = run_stage(
             "behavior_relevant", main, stage_data[0], stage_data[2], names,
             spec, component_root, pre_parent, budget, devices, microbatch,
+            resume=resume,
         )
         stages["behavior_relevant"] = record
         main_states = [stage_predictions(main, part)[1] for part in stage_data]
@@ -358,13 +397,17 @@ def fit_source_campaign(
             selection_score=criterion,
             preprocessing_reference="preprocessing.json",
         ))
-        transferable[budget] = dict(
-            stage1=main.transferable(), stage2=residual.transferable(),
-        )
     selected = min(
-        paths, key=lambda row: (row["selection_score"], row["full_path_flops"])
+        inherited + paths,
+        key=lambda row: (row["selection_score"], row["full_path_flops"]),
     )
-    dump_pickle(directory / "shared.pkl", transferable[selected["budget"]])
+    for model, stage in ((main, "behavior_relevant"), (residual, "residual")):
+        restore_component(
+            model, component_root / selected["stages"][stage]["component_id"]
+        )
+    dump_pickle(directory / "shared.pkl", dict(
+        stage1=main.transferable(), stage2=residual.transferable(),
+    ))
     atomic_json(directory / "budgets.json", paths)
     atomic_json(directory / "selection.json", dict(
         selected_budget=selected["budget"],

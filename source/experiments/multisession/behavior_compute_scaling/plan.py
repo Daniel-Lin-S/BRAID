@@ -40,6 +40,8 @@ RECURRENT_STAGES = ("behavior_relevant", "residual")
 WARMUP_START = 1e-7
 LEARNING_RATE = 1e-3
 LOCAL_WINDOWS = {4: 8, 8: 8, 16: 8, 33: 4}
+EXTENSION_CHECKPOINTS = (1280, 1920)
+EXTENSION_TOTAL_UPDATES = (1600, 2400)
 
 
 def source_implementation() -> str:
@@ -58,6 +60,8 @@ def source_implementation() -> str:
         / "behavior_compute_scaling" / "training.py",
         root / "experiments" / "multisession"
         / "behavior_compute_scaling" / "pipeline.py",
+        root / "experiments" / "multisession"
+        / "behavior_compute_scaling" / "ancestry.py",
         root / "experiments" / "multisession"
         / "behavior_compute_scaling" / "flops.py",
     )
@@ -253,4 +257,73 @@ def build_plan(
         analysis_paths={CAMPAIGN: CAMPAIGN},
         held_out_sessions=list(held_out),
         source_references=[sources[count] for count in COUNTS],
+    )
+
+
+def build_extension_plan(
+    settings: dict, sessions: dict, reference: dict,
+) -> dict:
+    """Plan only four source continuations with pinned completed ancestors.
+
+    Parameters
+    ----------
+    settings : dict
+        Original experiment settings with the two agreed larger budgets.
+    sessions : dict
+        Current input data fingerprints indexed by recording name.
+    reference : dict
+        Completed five-budget campaign; target jobs are not queued.
+
+    Returns
+    -------
+    dict
+        Standard source-only plan referencing immutable parent fits.
+    """
+    previous = reference["settings"]
+    for name in ("data", "model", "latent", "seeds", "source_counts",
+                 "held_out_sessions", "evaluation_horizons"):
+        if settings[name] != previous[name]:
+            raise ValueError(f"Continuation setting changed: {name}.")
+    old_schedule = previous["source_training"]
+    schedule = settings["source_training"]
+    expected = dict(
+        old_schedule,
+        maximum_updates=EXTENSION_CHECKPOINTS[-1],
+        checkpoints=list(CHECKPOINTS + EXTENSION_CHECKPOINTS),
+        total_updates=list(TOTAL_UPDATES + EXTENSION_TOTAL_UPDATES),
+    )
+    if schedule != expected:
+        raise ValueError("Continuation differs from the agreed 2x/3x ladder.")
+    if old_schedule["total_updates"] != list(TOTAL_UPDATES):
+        raise ValueError("Expected the completed five-budget source campaign.")
+    jobs, sources = {}, []
+    for old_key in reference["source_references"]:
+        original = reference["jobs"][old_key]
+        for name in original["sessions"]:
+            if sessions[name] != original["sources"][name]:
+                raise ValueError(f"Source input changed: {name}.")
+        marker = completed(fit_directory(reference, old_key))
+        if marker is None:
+            raise ValueError(f"Incomplete source ancestor: {old_key}.")
+        spec = deepcopy(original)
+        spec.update(
+            source_training=deepcopy(schedule),
+            implementation=source_implementation(), dependencies=[],
+            continuation=dict(
+                source_fit=old_key, checksums=marker["checksums"],
+                completed_total_updates=list(TOTAL_UPDATES),
+                mode="matched_pipeline_rnn1_main_prefix",
+            ),
+        )
+        key = fingerprint(spec)
+        jobs[key] = spec
+        sources.append(key)
+    if sorted(job["source_count"] for job in jobs.values()) != list(COUNTS):
+        raise ValueError("Continuation requires all four source counts.")
+    return dict(
+        name=CAMPAIGN, settings=deepcopy(settings), source_only=True,
+        storage=deepcopy(reference.get("storage", {})), jobs=jobs,
+        analyses={CAMPAIGN: sources}, analysis_paths={CAMPAIGN: CAMPAIGN},
+        held_out_sessions=list(settings["held_out_sessions"]),
+        source_references=sources,
     )
