@@ -12,7 +12,6 @@ figures and references to input tables. Fits and existing reports are untouched.
 import argparse
 import csv
 import json
-from math import ceil
 from pathlib import Path
 from textwrap import fill
 
@@ -41,27 +40,31 @@ TITLE_WIDTH = 54
 NOTE_WIDTH = 100
 DPI = 180
 MILLISECONDS_PER_SECOND = 1000
+RATIO_PADDING = 0.02
+RELATIVE_PADDING = 0.10
 BLUE = "#2878b5"
 ORANGE = "#e28528"
 GREEN = "#339966"
 LINE_STYLES = ("-", "--", "-.", ":")
+RATIO_NOTE = (
+    "Y-axis focuses on observed MSE/dummy values. Dummy is 1 and may "
+    "fall outside the displayed range; values above 1 are worse."
+)
 ENDPOINT_NOTE = (
     "Largest completed budget: 800 updates (4/8/16 sessions), "
     "1600 (33 sessions); 6400 draws per recording per recurrent stage. "
     "The outer holdout also selects transfer checkpoints; selected scores "
     "are descriptive. One seed; no uncertainty estimate. "
-    "A y-value of 1 equals the constant training-mean dummy predictor; "
-    "values above 1 are worse than dummy."
+    + RATIO_NOTE
 )
 COMPUTE_NOTE = (
     "Five completed budgets per source count. The same outer holdout "
     "selects transfer checkpoints; selected scores are descriptive. "
-    "One seed; no uncertainty estimate. A y-value of 1 equals the "
-    "constant training-mean dummy predictor; values above 1 are worse."
+    "One seed; no uncertainty estimate. "
+    + RATIO_NOTE
 )
 BASELINE_RATIO = 1.0
 Y_AXIS_ORIGIN = 0.0
-RATIO_TICK_STEP = 0.25
 DUMMY_REFERENCE_COLOR = "#333333"
 BASELINE_LABEL = "MSE / dummy MSE"
 
@@ -126,7 +129,7 @@ def ratio_curve(
 
 
 def ratio_axis(axis: object) -> None:
-    """Start at zero and include all valid ratios above the dummy level."""
+    """Focus on observed ratios while retaining above-dummy outcomes."""
     values = np.asarray([
         value for line in axis.lines for value in line.get_ydata()
     ], dtype=float)
@@ -134,21 +137,21 @@ def ratio_axis(axis: object) -> None:
         raise ValueError("Ratio plot requires finite nonempty values.")
     if np.any(values <= 0):
         raise ValueError("Ratio plot requires positive model MSE ratios.")
-    maximum = max(BASELINE_RATIO, float(values.max()))
-    upper = max(
-        BASELINE_RATIO,
-        ceil(maximum / RATIO_TICK_STEP) * RATIO_TICK_STEP,
+    smallest, largest = float(values.min()), float(values.max())
+    padding = max(
+        RATIO_PADDING, (largest - smallest) * RELATIVE_PADDING
     )
+    lower = max(Y_AXIS_ORIGIN, smallest - padding)
+    upper = largest + padding
+    if largest > BASELINE_RATIO:
+        lower = min(lower, BASELINE_RATIO)
     axis.set_yscale("linear")
-    axis.set_ylim(Y_AXIS_ORIGIN, upper)
-    ticks = np.arange(
-        Y_AXIS_ORIGIN, upper + RATIO_TICK_STEP / 2, RATIO_TICK_STEP
-    )
-    axis.set_yticks(ticks)
-    axis.axhline(
-        BASELINE_RATIO, color=DUMMY_REFERENCE_COLOR,
-        linestyle=":", linewidth=1.5,
-    )
+    axis.set_ylim(lower, upper)
+    if lower <= BASELINE_RATIO <= upper:
+        axis.axhline(
+            BASELINE_RATIO, color=DUMMY_REFERENCE_COLOR,
+            linestyle=":", linewidth=1.5,
+        )
     axis.set_ylabel(BASELINE_LABEL)
     axis.grid(alpha=0.2)
 
@@ -363,8 +366,9 @@ def publish(report: Path, diagnostics: Path) -> Path:
         compute_note=COMPUTE_NOTE, baseline_axis=dict(
             measure=BASELINE_LABEL,
             reference=BASELINE_RATIO,
-            minimum=Y_AXIS_ORIGIN,
-            maximum="at least 1 and includes every finite positive ratio",
+            focus_padding=RATIO_PADDING,
+            relative_padding=RELATIVE_PADDING,
+            includes_reference_if_model_is_worse_than_dummy=True,
             dummy="constant training-target mean on the matching windows",
         ),
         figures=["horizon", "readout", "generalization", "session", "compute"],
