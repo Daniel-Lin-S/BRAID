@@ -471,17 +471,28 @@ def revised_protocol(plan: dict) -> bool:
     ))
 
 
-def source_report(plan: dict, plan_path: Path) -> Path | None:
-    """Publish source panels once all four source fits are complete."""
-    keys = plan["source_references"]
+def source_report(
+    plan: dict, plan_path: Path,
+    counts: tuple[int, ...] = COUNTS,
+) -> Path | None:
+    """Publish one source-only snapshot after its counts finish."""
+    if counts not in (COUNTS, INTERIM_COUNTS):
+        raise ValueError(f"Unsupported source-only counts: {counts}.")
+    keys = [
+        key for key in plan["source_references"]
+        if plan["jobs"][key]["source_count"] in counts
+    ]
     if any(completed(fit_directory(plan, key)) is None for key in keys):
         return None
-    sources, sessions, choices = source_tables(plan)
-    if len(choices) != len(COUNTS):
-        raise ValueError("Source figure group requires all four source counts.")
+    sources, sessions, choices = source_tables(plan, counts)
+    if len(choices) != len(counts):
+        raise ValueError(
+            f"Source figure group requires counts {counts}."
+        )
     root = analysis_directory(plan, CAMPAIGN, plan_path.parent.name)
     identity = dict(
-        group="recurrent_source", protocol=plan["settings"]["source_training"],
+        group="recurrent_source", source_counts=list(counts),
+        protocol=plan["settings"]["source_training"],
         sources=[(row["source_fit"], row["component_checksum"])
                  for row in sources],
     )
@@ -528,22 +539,25 @@ def source_report(plan: dict, plan_path: Path) -> Path | None:
                             ))
             write_table(tables / "component_diagnostics.csv", diagnostics)
             atomic_json(snapshot / "design.json", dict(
-                source_counts=list(COUNTS), source_components=RECURRENT_STAGES,
+                source_counts=list(counts), source_components=RECURRENT_STAGES,
+                planned_source_counts=list(COUNTS),
+                report_scope=("complete" if counts == COUNTS else "interim"),
                 expected_common_windows=EXPECTED_COMMON_WINDOWS,
                 x_axis="Full-pipeline training FLOPs through actual stopping",
                 holdout_role="Chronological source test and transfer selection",
                 selected_score_interpretation="Descriptive after selection",
                 evaluation_flops_in_training_axis=False,
             ))
-            source_figures(sources, figures, stages=RECURRENT_STAGES)
+            source_figures(
+                sources, figures, counts=counts, stages=RECURRENT_STAGES,
+            )
             print(f"Saved source figures: {figures.resolve()}")
     pointer = dict(
         snapshot=str((snapshot / "figures").resolve()),
         identity=fingerprint(identity),
     )
     atomic_json(root / "latest_source_figures.json", pointer)
-    if not (root / "latest_figures.json").exists():
-        atomic_json(root / "latest_figures.json", pointer)
+    atomic_json(root / "latest_figures.json", pointer)
     return snapshot
 
 
