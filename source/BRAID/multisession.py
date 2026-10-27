@@ -8,6 +8,7 @@ Checkpoints contain named mapping weight arrays, never channel substitutions.
 """
 
 from copy import deepcopy
+from contextlib import nullcontext
 
 import numpy as np
 import tensorflow as tf
@@ -92,6 +93,7 @@ class MixedForecaster:
         decoder_width: int = NEURAL_WIDTH,
         input_dimensions: list[int] | None = None,
         forward_dimensions: int = 2,
+        session_devices: tuple[str, ...] | None = None,
     ) -> None:
         """Build one source stage with explicit shared module identity.
 
@@ -111,6 +113,9 @@ class MixedForecaster:
             Filtering input widths; default neural + 2.
         forward_dimensions : int, optional
             Observable forward-input width; default 2.
+        session_devices : tuple of str, optional
+            Pin private maps by session index modulo device count; default
+            None preserves the caller's TensorFlow device scope.
         """
         if sharing not in SHARED_MODULES:
             raise ValueError(f"Unknown sharing profile {sharing}.")
@@ -154,21 +159,26 @@ class MixedForecaster:
                 Kfw=(forward_dimensions, latent, 0),
                 C=(latent, output, decoder_width),
             )
-            maps = {}
-            for key, (ni, no, hidden) in widths.items():
-                maps[key] = (
-                    self.shared[key]
-                    if key in self.shared
-                    else mapping(
-                        ni,
-                        no,
-                        hidden,
-                        f"s{index}_{key}",
-                        "uniform"
-                        if decoder_width == BEHAVIOR_WIDTH
-                        else "glorot_uniform",
+            scope = (
+                tf.device(session_devices[index % len(session_devices)])
+                if session_devices else nullcontext()
+            )
+            with scope:
+                maps = {}
+                for key, (ni, no, hidden) in widths.items():
+                    maps[key] = (
+                        self.shared[key]
+                        if key in self.shared
+                        else mapping(
+                            ni,
+                            no,
+                            hidden,
+                            f"s{index}_{key}",
+                            "uniform"
+                            if decoder_width == BEHAVIOR_WIDTH
+                            else "glorot_uniform",
+                        )
                     )
-                )
             self.sessions.append(maps)
         self.shared_variables = unique_variables(list(self.shared.values()))
         refs = {v.ref() for v in self.shared_variables}

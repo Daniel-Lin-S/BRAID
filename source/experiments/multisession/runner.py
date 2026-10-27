@@ -3,6 +3,8 @@
 Usage: python -m experiments.multisession.runner --experiment YAML --detach
 Figure revision:
   python -m experiments.multisession.runner --plan PLAN --stage figures
+One-time compute-scaling interim:
+  python -m experiments.multisession.runner --plan PLAN --stage interim-figures
 Stages: plan, run, report, figures; worker is an internal subprocess interface.
 The artifact root contains multi_session_training/fits and immutable plans.
 Three separate analysis roots reference shared fit IDs. status.json and
@@ -124,12 +126,14 @@ def plan_campaign(settings: dict) -> tuple[dict, Path]:
         )
         from experiments.multisession.behavior_compute_scaling.audit import (
             audit_source_holdout, audit_target_folds,
+            audit_inner_splits,
         )
 
         audit_source_holdout(adapter, source_reference)
         audit_target_folds(
             adapter, target_reference, settings["held_out_sessions"]
         )
+        audit_inner_splits(adapter, source_reference, settings)
         plan = build_compute_plan(
             settings, sessions, source_reference, target_reference
         )
@@ -146,6 +150,7 @@ def plan_campaign(settings: dict) -> tuple[dict, Path]:
         plan = build_capacity_plan(settings, sessions, reference, prior)
     else:
         plan = build_plan(settings, sessions)
+    plan = json.loads(json.dumps(plan))
     identifier = fingerprint(dict(
         jobs=plan["jobs"], analyses=plan["analyses"],
         storage_overrides=plan.get("storage_overrides", {}),
@@ -229,13 +234,23 @@ def run_job(
             return
         adapter = dataset(plan["settings"])
         if spec["kind"] == "source":
-            train, validation, records = [], [], {}
+            train, validation, inner, records = [], [], [], {}
+            revised = "protocol" in spec["source_training"]
             for session in spec["sessions"]:
-                features = source_features(adapter.load(session), spec["data"])
-                tr, va, record = session_windows(
-                    features,
-                    spec["objective"] == "behavior",
+                features = source_features(
+                    adapter.load(session), spec["data"],
+                    spec["source_training"]["inner_validation_fraction"]
+                    if revised else None,
                 )
+                prepared = session_windows(
+                    features, spec["objective"] == "behavior",
+                    include_test=revised,
+                )
+                if revised:
+                    tr, iv, va, record = prepared
+                    inner.append(iv)
+                else:
+                    tr, va, record = prepared
                 train.append(tr)
                 validation.append(va)
                 records[session] = record
@@ -253,7 +268,7 @@ def run_job(
                     spec, ("/GPU:0", "/GPU:1"),
                     spec["source_training"]["session_batch_sizes"][
                         str(spec["source_count"])
-                    ],
+                    ], validation=inner,
                 )
                 return
             fit_source(
@@ -654,7 +669,8 @@ def main() -> None:
     parser.add_argument("--experiment", type=Path)
     parser.add_argument(
         "--stage", choices=(
-            "plan", "run", "worker", "report", "figures", "status"
+            "plan", "run", "worker", "report", "figures",
+            "interim-figures", "status",
         ),
         default="run"
     )
@@ -736,6 +752,15 @@ def main() -> None:
 
         reconcile(plan, path)
         report(plan, path)
+        return
+    if args.stage == "interim-figures":
+        if settings["name"] != "multi_session_behavior_compute_scaling":
+            parser.error("Interim figures require compute scaling.")
+        from .behavior_compute_scaling.report import (
+            INTERIM_COUNTS, report,
+        )
+
+        report(plan, path, final=True, counts=INTERIM_COUNTS)
         return
     if args.stage == "figures":
         if settings["name"] == (

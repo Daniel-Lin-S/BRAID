@@ -5,10 +5,16 @@ latent: 16
 seeds: [42]
 source_counts: [4, 8, 16, 33]
 source_training:
-  maximum_updates: 5000
-  checkpoints: [1000, 2000, 3000, 4000, 5000]
-  branch_updates: 500
-  warmup_updates: 200
+  maximum_updates: 640
+  checkpoints: [40, 80, 160, 320, 640]
+  total_updates: [50, 100, 200, 400, 800]
+  warmup_updates: 10
+  protocol: recurrent_compute_fixed_preprocessing_v1
+  fixed_exposure: 64000
+  validation_exposure: 800
+  fixed_patience: 10
+  inner_validation_fraction: 0.1
+  update_multipliers: {4: 1, 8: 1, 16: 1, 33: 2}
   warmup_start_learning_rate: 0.0000001
   learning_rate: 0.001
   session_batch_sizes:

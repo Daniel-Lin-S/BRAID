@@ -9,12 +9,15 @@ The common component store supplies checksum-validated immutable completion.
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from pathlib import Path
+import logging
 
 import numpy as np
 import tensorflow as tf
 
 from BRAID.multisession import HORIZONS, MixedForecaster
-from experiments.multisession.behavior_compute_scaling.flops import update_flops
+from experiments.multisession.behavior_compute_scaling.flops import (
+    session_ops, update_flops,
+)
 from experiments.multisession.store import (
     completed, dump_pickle, job, load_pickle,
 )
@@ -22,6 +25,8 @@ from experiments.multisession.training import ReadoutStage, select_batch
 from experiments.storage.cache import atomic_json, fingerprint
 
 MAX_HORIZON = max(HORIZONS)
+EVALUATION_BATCH = 16
+LOGGER = logging.getLogger(__name__)
 
 
 def session_loss(model: object, session: int, batch: tuple) -> tf.Tensor:
@@ -195,13 +200,80 @@ def balanced_update(
     return value, [chosen.tolist() for chosen in indices]
 
 
+def checkpoint_state(
+    model: object, optimizers: list, rng: np.random.Generator,
+    update: int,
+) -> dict:
+    """Capture weights, Adam slots and sampling state at one update."""
+    return dict(
+        weights=model.weights(),
+        optimizers=[optimizer.get_weights() for optimizer in optimizers],
+        sampling_state=deepcopy(rng.bit_generator.state),
+        update=update,
+    )
+
+
+def evaluate_sessions(model: object, data: list[dict]) -> tuple[list, int]:
+    """Return per-session mean loss and forward FLOPs for held-out windows.
+
+    Parameters
+    ----------
+    model : object
+        Native recurrent or readout model with one private map per session.
+    data : list of dict
+        I/F/T/P arrays; T has shape (windows, 128, output_channels).
+
+    Returns
+    -------
+    losses : list of float
+        Mean window loss per session, summed over native forecast horizons.
+    flops : int
+        Model and loss forward arithmetic; no gradients or optimizer work.
+    """
+    functions = getattr(model, "_evaluation_functions", None)
+    if functions is None:
+        functions = [
+            tf.function(
+                lambda batch, index=index: session_loss(model, index, batch),
+                reduce_retracing=True,
+            ) for index in range(len(model.private_variables))
+        ]
+        model._evaluation_functions = functions
+    losses, flops = [], 0
+    for index, row in enumerate(data):
+        count, length, width = row["T"].shape
+        if not count:
+            raise ValueError(f"Empty evaluation windows for session {index}.")
+        loss = 0.0
+        for start in range(0, count, EVALUATION_BATCH):
+            chosen = np.arange(start, min(start + EVALUATION_BATCH, count))
+            loss += float(functions[index](selected_batch(row, chosen)))
+            flops += session_ops(model, index, len(chosen), length, width)[0]
+        losses.append(loss / count)
+    if not losses or not np.isfinite(losses).all():
+        raise FloatingPointError("Expected nonempty finite evaluation losses.")
+    return losses, flops
+
+
+def validation_due(update: int, batch: int, interval: int, cap: int) -> bool:
+    """Check after crossing an exposure threshold and at the final update."""
+    if min(update, batch, interval, cap) <= 0 or update > cap:
+        raise ValueError("Invalid positive exposure cadence or update cap.")
+    return update == cap or (
+        update * batch // interval > (update - 1) * batch // interval
+    )
+
+
 def fit_segment(
     model: object, data: list[dict], root: Path, identity: dict,
     settings: dict, seed: int, start: int, stop: int,
     parent: Path | None, devices: tuple[str, str], microbatch: int,
     branch: bool = False,
+    validation: list[dict] | None = None,
 ) -> tuple[Path, dict]:
     """Complete or reuse one immutable segment and its full state."""
+    if validation is not None and (branch or parent is not None or start):
+        raise ValueError("Fixed stages must start without a branch or parent.")
     if stop <= start:
         raise ValueError(f"Invalid update segment {start} to {stop}.")
     parent_record = completed(parent) if parent is not None else None
@@ -214,6 +286,15 @@ def fit_segment(
             parent_record["checksums"] if parent_record is not None else None
         ),
     )
+    if validation is not None:
+        scientific["fixed_stage"] = True
+    if parent is not None:
+        parent_payload = load_pickle(parent / "checkpoint.pkl")
+        if parent_payload["update"] != start:
+            raise ValueError(
+                f"Expected parent at update {start}, "
+                f"got {parent_payload['update']}."
+            )
     directory = root / fingerprint(scientific)
     with job(directory, scientific) as needed:
         if needed:
@@ -224,11 +305,7 @@ def fit_segment(
                 payload = load_pickle(parent / "checkpoint.pkl")
                 rng = restore_state(model, optimizers, payload)
             local = settings["session_batch_sizes"][str(len(data))]
-            initial = dict(
-                weights=model.weights(),
-                optimizers=[x.get_weights() for x in optimizers],
-                sampling_state=deepcopy(rng.bit_generator.state),
-            )
+            initial = checkpoint_state(model, optimizers, rng, start)
             attempt = min(local, microbatch)
             while True:
                 rng = restore_state(model, optimizers, initial)
@@ -240,22 +317,62 @@ def fit_segment(
                     ]
                     model._balanced_functions = functions
                 history = []
+                best, stale = float("inf"), 0
+                best_payload = None
+                evaluation_flops = 0
                 try:
                     with ThreadPoolExecutor(max_workers=2) as pool:
                         for update in range(start + 1, stop + 1):
                             relative = update - start if branch else update
-                            rate = learning_rate(relative, settings, branch)
+                            rate = (
+                                settings["learning_rate"]
+                                if validation is not None else
+                                learning_rate(relative, settings, branch)
+                            )
                             for optimizer in optimizers:
                                 optimizer.learning_rate.assign(rate)
                             loss, selected = balanced_update(
                                 model, data, optimizers, rng, local,
                                 attempt, devices, functions, pool,
                             )
-                            history.append(dict(
+                            row = dict(
                                 update=update, loss=loss,
                                 sampled_windows=selected,
                                 learning_rate=rate,
-                            ))
+                            )
+                            history.append(row)
+                            if validation is not None and validation_due(
+                                update, local * len(data),
+                                settings["validation_exposure"], stop,
+                            ):
+                                losses, work = evaluate_sessions(
+                                    model, validation
+                                )
+                                evaluation_flops += work
+                                value = float(np.mean(losses))
+                                row["validation_loss"] = value
+                                row["session_validation_losses"] = losses
+                                if value < best:
+                                    best, stale = value, 0
+                                    best_payload = checkpoint_state(
+                                        model, optimizers, rng, update
+                                    )
+                                else:
+                                    stale += 1
+                                LOGGER.info(
+                                    "%s update=%d train=%.6g inner=%.6g "
+                                    "best=%d stale=%d",
+                                    identity["stage"], update, loss, value,
+                                    best_payload["update"], stale,
+                                )
+                                if stale >= settings["fixed_patience"]:
+                                    break
+                            elif update == stop or update % 25 == 0:
+                                LOGGER.info(
+                                    "%s update=%d/%d loss=%.6g lr=%.4g",
+                                    identity.get("stage", "component"),
+                                    update, stop, loss, rate,
+                                )
                 except tf.errors.ResourceExhaustedError:
                     if attempt == 1:
                         raise
@@ -263,20 +380,26 @@ def fit_segment(
                     continue
                 break
             arithmetic = update_flops(model, data, local, attempt)
-            payload = dict(
-                weights=model.weights(),
-                optimizers=[x.get_weights() for x in optimizers],
-                sampling_state=deepcopy(rng.bit_generator.state),
-                update=stop,
-            )
+            actual_stop = history[-1]["update"]
+            payload = checkpoint_state(model, optimizers, rng, actual_stop)
+            if validation is not None:
+                if best_payload is None:
+                    raise RuntimeError("Fixed stage has no valid checkpoint.")
+                payload = best_payload
+                restore_state(model, optimizers, payload)
             dump_pickle(directory / "checkpoint.pkl", payload)
             atomic_json(directory / "training.json", dict(
-                start=start, stop=stop, branch=branch,
+                start=start, stop=actual_stop, requested_stop=stop,
+                selected_update=payload["update"], branch=branch,
+                selection=("inner_validation" if validation is not None
+                           else "scheduled_endpoint"),
+                best_validation_loss=(best if validation is not None else None),
+                evaluation_flops=evaluation_flops,
                 effective_batch=local * len(data),
                 session_batch=local, microbatch=attempt,
                 devices=list(devices), history=history,
                 flops_per_update=arithmetic,
-                total_flops=arithmetic["total"] * (stop - start),
+                total_flops=arithmetic["total"] * len(history),
             ))
         else:
             model.restore(

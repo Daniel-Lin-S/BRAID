@@ -112,3 +112,37 @@ def audit_target_folds(
                         f"Target {role} overlaps test: {session} fold {fold}."
                     )
     return len(templates)
+
+
+def audit_inner_splits(
+    adapter: object, reference: dict, settings: dict,
+) -> dict:
+    """Validate every source's nested roles against its original outer test.
+
+    Returns
+    -------
+    dict
+        Session names mapped to training, inner-validation and test counts.
+        Raises on any overlap, changed outer windows, or empty role.
+    """
+    spec = max(
+        (reference["jobs"][key] for key in reference["source_references"]),
+        key=lambda row: row["source_count"],
+    )
+    fraction = settings["source_training"]["inner_validation_fraction"]
+    result = {}
+    for name in spec["sessions"]:
+        raw = adapter.load(name)
+        original = source_features(raw, settings["data"])
+        _, _, old = session_windows(original, True)
+        features = source_features(raw, settings["data"], fraction)
+        _, _, _, record = session_windows(features, True, include_test=True)
+        if old["validation"] != record["validation"]:
+            raise ValueError(f"Outer test window identity changed: {name}.")
+        roles = ("training", "inner_validation", "validation")
+        for index, role in enumerate(roles):
+            for other in roles[index + 1:]:
+                if np.intersect1d(record[role], record[other]).size:
+                    raise ValueError(f"Source roles overlap: {name} {role}.")
+        result[name] = {role: len(record[role]) for role in roles}
+    return result

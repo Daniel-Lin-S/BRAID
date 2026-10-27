@@ -28,9 +28,15 @@ COMPONENTS = (
     "neural_readout",
     "residual",
 )
-CHECKPOINTS = (1000, 2000, 3000, 4000, 5000)
-BRANCH_UPDATES = 500
-WARMUP_UPDATES = 200
+CHECKPOINTS = (40, 80, 160, 320, 640)
+TOTAL_UPDATES = (50, 100, 200, 400, 800)
+WARMUP_UPDATES = 10
+PROTOCOL = "recurrent_compute_fixed_preprocessing_v1"
+FIXED_EXPOSURE = 64000
+VALIDATION_EXPOSURE = 800
+FIXED_PATIENCE = 10
+INNER_FRACTION = 0.1
+RECURRENT_STAGES = ("behavior_relevant", "residual")
 WARMUP_START = 1e-7
 LEARNING_RATE = 1e-3
 LOCAL_WINDOWS = {4: 8, 8: 8, 16: 8, 33: 4}
@@ -132,7 +138,13 @@ def build_plan(
     expected = dict(
         maximum_updates=CHECKPOINTS[-1],
         checkpoints=list(CHECKPOINTS),
-        branch_updates=BRANCH_UPDATES,
+        total_updates=list(TOTAL_UPDATES),
+        protocol=PROTOCOL,
+        fixed_exposure=FIXED_EXPOSURE,
+        validation_exposure=VALIDATION_EXPOSURE,
+        fixed_patience=FIXED_PATIENCE,
+        inner_validation_fraction=INNER_FRACTION,
+        update_multipliers={4: 1, 8: 1, 16: 1, 33: 2},
         warmup_updates=WARMUP_UPDATES,
         warmup_start_learning_rate=WARMUP_START,
         learning_rate=LEARNING_RATE,
@@ -156,7 +168,10 @@ def build_plan(
     templates = target_templates(target_reference, held_out)
     jobs, members, sources = {}, [], {}
     schedule_keys = (
-        "maximum_updates", "checkpoints", "branch_updates",
+        "maximum_updates", "checkpoints", "total_updates",
+        "protocol", "fixed_exposure", "validation_exposure",
+        "fixed_patience", "inner_validation_fraction",
+        "update_multipliers",
         "warmup_updates", "warmup_start_learning_rate",
         "learning_rate", "session_batch_sizes",
     )

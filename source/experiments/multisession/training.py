@@ -9,6 +9,7 @@ hold native BRAID mapping arrays, constructor arguments, and update counts.
 import json
 import logging
 from pathlib import Path
+from contextlib import nullcontext
 from time import monotonic
 
 import numpy as np
@@ -69,20 +70,40 @@ class ReadoutStage:
         width: int,
         seed: int,
         behavior: bool = False,
+        session_devices: tuple[str, ...] | None = None,
     ) -> None:
-        """Create native readouts for horizon-first latent input arrays."""
+        """Create readouts for horizon-first latent input arrays.
+
+        Parameters
+        ----------
+        dimensions : list of tuple of int
+            Per-session (input, output) channel counts.
+        width : int
+            Decoder hidden width.
+        seed : int
+            Initialization seed, offset deterministically per session.
+        behavior : bool, optional
+            Default False; True selects the behavioral initializer.
+        session_devices : tuple of str, optional
+            Private-map device cycle; default None retains caller placement.
+        """
         self.models = []
         for i, (ni, no) in enumerate(dimensions):
             tf.keras.utils.set_random_seed(seed + i + 1)
-            self.models.append(
-                mapping(
-                    ni,
-                    no,
-                    width,
-                    f"readout_{i}",
-                    "uniform" if behavior else "glorot_uniform",
-                )
+            scope = (
+                tf.device(session_devices[i % len(session_devices)])
+                if session_devices else nullcontext()
             )
+            with scope:
+                self.models.append(
+                    mapping(
+                        ni,
+                        no,
+                        width,
+                        f"readout_{i}",
+                        "uniform" if behavior else "glorot_uniform",
+                    )
+                )
         self.shared_variables = []
         self.private_variables = [m.trainable_weights for m in self.models]
         self.variables = [v for group in self.private_variables for v in group]

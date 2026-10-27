@@ -13,7 +13,7 @@ import logging
 import numpy as np
 
 from experiments.contracts import FeatureSet
-from experiments.datasets.nhp import TRAIN, VALIDATION
+from experiments.datasets.nhp import TRAIN, VALIDATION, TEST
 from experiments.datasets.windows import window_indices
 
 LOGGER = logging.getLogger(__name__)
@@ -86,8 +86,22 @@ class Scale:
         )
 
 
-def source_features(session: FeatureSet, settings: dict) -> FeatureSet:
-    """Create chronological 80/20 source roles with existing smoothing."""
+def source_features(
+    session: FeatureSet, settings: dict,
+    inner_fraction: float | None = None,
+) -> FeatureSet:
+    """Create guarded source segments with isolated smoothing.
+
+    Parameters
+    ----------
+    session : FeatureSet
+        Raw time-first arrays, including original sample indices.
+    settings : dict
+        Guard duration and spike smoothing parameters.
+    inner_fraction : float, optional
+        Final fraction of outer training reserved for validation;
+        default None retains the two-role 80/20 protocol.
+    """
     # Five blocks: first four are training, final block is validation.
     from experiments.datasets import nhp
 
@@ -98,6 +112,16 @@ def source_features(session: FeatureSet, settings: dict) -> FeatureSet:
         (0, boundary - guard, TRAIN),
         (boundary + guard, count, VALIDATION),
     ]
+    if inner_fraction is not None:
+        if not 0 < inner_fraction < 1:
+            raise ValueError("Inner fraction must lie in (0, 1).")
+        train_stop = boundary - guard
+        inner = int(np.floor(train_stop * (1 - inner_fraction)))
+        segments = [
+            (0, inner - guard, TRAIN),
+            (inner + guard, train_stop, VALIDATION),
+            (boundary + guard, count, TEST),
+        ]
     from scipy.ndimage import gaussian_filter1d
 
     pieces = {
@@ -214,11 +238,32 @@ def target_selection(
 def session_windows(
     features: FeatureSet,
     supervised: bool,
-) -> tuple[dict, dict, dict]:
-    """Return normalized train/validation windows and fitted provenance."""
+    include_test: bool = False,
+) -> tuple[dict, ...]:
+    """Return train-only normalized windows and provenance.
+
+    Parameters
+    ----------
+    features : FeatureSet
+        Time-first arrays with guarded segment and role labels.
+    supervised : bool
+        Include four-dimensional behavioral targets.
+    include_test : bool, optional
+        Default False returns train, validation, record. True
+        returns train, inner validation, outer test, record.
+
+    Returns
+    -------
+    tuple of dict
+        Data arrays have shape (windows, 128, channels). The record
+        contains scales and original sample indices for each role;
+        its validation key always identifies the outer holdout.
+    """
+    roles = (TRAIN, VALIDATION, TEST) if include_test else (
+        TRAIN, VALIDATION
+    )
     indices = {
-        role: window_indices(features, role, LENGTH)
-        for role in (TRAIN, VALIDATION)
+        role: window_indices(features, role, LENGTH) for role in roles
     }
     names = ("Y", "U", "Z") if supervised else ("Y", "U")
     for name, width in (("U", 2), ("Z", 4)):
@@ -227,19 +272,26 @@ def session_windows(
                 f"{name}: expected {width} task coordinates, got "
                 f"{features.arrays[name].shape[1]}."
             )
-    train, validation, maps = {}, {}, {}
+    prepared = {role: {} for role in roles}
+    maps = {}
     for name in names:
         raw = features.arrays[name][indices[TRAIN]]
         scaling = Scale.fit(raw, name)
-        train[name] = scaling.apply(raw)
-        validation[name] = scaling.apply(
-            features.arrays[name][indices[VALIDATION]]
-        )
+        for role in roles:
+            prepared[role][name] = scaling.apply(
+                features.arrays[name][indices[role]]
+            )
         maps[name] = scaling.record()
     record = dict(
         scales=maps,
         training=features.arrays["indices"][indices[TRAIN]].tolist(),
-        validation=features.arrays["indices"][indices[VALIDATION]].tolist(),
+        validation=features.arrays["indices"][
+            indices[TEST if include_test else VALIDATION]
+        ].tolist(),
         channel_ids=features.arrays["ids"].tolist(),
     )
-    return train, validation, record
+    if include_test:
+        record["inner_validation"] = features.arrays["indices"][
+            indices[VALIDATION]
+        ].tolist()
+    return (*[prepared[role] for role in roles], record)

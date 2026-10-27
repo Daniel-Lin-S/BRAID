@@ -1,22 +1,26 @@
 """Build matched behavioral source paths and score the fixed source holdout.
 
-Inputs are normalized train/chronological-holdout arrays for nested Indy
-sessions. Immutable component segments live in source_components; the source
-fit stores data.json, budgets.json, selection.json and shared.pkl. Every
-budget path has five components whose data depend on that budget's upstream
-branch. The four common recordings' held-out windows select transfer weights.
+Inputs are normalized training, inner-validation and chronological-test
+windows for nested Indy sessions. Fixed preprocessing is shared by all five
+recurrent budgets within a source count; each RNN1 branch has its own fixed
+readout and matched RNN2 branch. Immutable segments live in source_components.
+The source fit stores data.json (indices/scales), preprocessing.json (fixed
+checkpoint/target identity), budgets.json (component references, losses,
+exposure and FLOPs), selection.json (outer-holdout selection) and shared.pkl
+(selected transferable weights).
 """
 
 from pathlib import Path
+import json
 
 import numpy as np
 
 from BRAID.multisession import HORIZONS, MixedForecaster
 from experiments.multisession.behavior_compute_scaling.plan import (
-    CHECKPOINTS, COMPONENTS, STAGE1_SHARING, STAGE2_SHARING,
+    COMPONENTS, RECURRENT_STAGES, STAGE1_SHARING, STAGE2_SHARING,
 )
 from experiments.multisession.behavior_compute_scaling.training import (
-    fit_segment, selected_batch, session_loss,
+    evaluate_sessions, fit_segment,
 )
 from experiments.multisession.source import (
     BEHAVIOR_WIDTH, NEURAL_WIDTH, PREPROCESSING_SIZE,
@@ -29,7 +33,19 @@ from experiments.multisession.training import (
 from experiments.multisession.data import Scale
 from experiments.storage.cache import atomic_json, fingerprint
 
-EVALUATION_BATCH = 16
+
+def resolved_schedule(settings: dict, count: int) -> dict:
+    """Resolve per-count updates without changing session-local sampling."""
+    result = dict(settings)
+    multiplier = settings["update_multipliers"][str(count)]
+    result["checkpoints"] = [x * multiplier for x in settings["checkpoints"]]
+    result["total_updates"] = [
+        x * multiplier for x in settings["total_updates"]
+    ]
+    result["warmup_updates"] *= multiplier
+    batch = count * settings["session_batch_sizes"][str(count)]
+    result["fixed_update_cap"] = settings["fixed_exposure"] // batch
+    return result
 
 
 def fit_component_budget(
@@ -40,19 +56,24 @@ def fit_component_budget(
     """Restore or train main prefix and one budget-matched decay branch."""
     parent = None
     total = 0
-    for stop in CHECKPOINTS:
+    start = 0
+    for stop in settings["checkpoints"]:
         if stop > budget:
             break
         directory, _ = fit_segment(
             model, train, root, identity, settings, seed,
-            stop - CHECKPOINTS[0], stop, parent,
+            start, stop, parent,
             devices, microbatch,
         )
         parent = directory
+        start = stop
         total += load_flops(directory)
+    index = settings["checkpoints"].index(budget)
+    end = settings["total_updates"][index]
+    branch_settings = dict(settings, branch_updates=end - budget)
     branch, _ = fit_segment(
-        model, train, root, identity, settings, seed,
-        budget, budget + settings["branch_updates"], parent,
+        model, train, root, identity, branch_settings, seed,
+        budget, end, parent,
         devices, microbatch, branch=True,
     )
     return branch, total + load_flops(branch)
@@ -60,8 +81,6 @@ def fit_component_budget(
 
 def load_flops(directory: Path) -> int:
     """Read validated component arithmetic from a completed segment."""
-    import json
-
     value = json.loads(
         (directory / "training.json").read_text()
     )["total_flops"]
@@ -77,6 +96,9 @@ def score_component(
     """Evaluate native stage loss and training-mean dummy on common four."""
     if len(names) != 4:
         raise ValueError("Expected exactly four common source sessions.")
+    losses, evaluation_flops = evaluate_sessions(
+        model, holdout[:len(names)]
+    )
     rows = []
     for index, name in enumerate(names):
         target = training[index]["T"]
@@ -84,14 +106,7 @@ def score_component(
         if not len(target) or not len(truth):
             raise ValueError(f"Empty source train or holdout: {name}.")
         mean = target.mean(axis=(0, 1))
-        loss_sum = 0.0
-        for start in range(0, len(truth), EVALUATION_BATCH):
-            chosen = np.arange(
-                start, min(start + EVALUATION_BATCH, len(truth))
-            )
-            batch = selected_batch(holdout[index], chosen)
-            loss_sum += float(session_loss(model, index, batch).numpy())
-        loss = loss_sum / len(truth)
+        loss = losses[index]
         dummy = 0.0
         for horizon in HORIZONS:
             error = mean - truth[:, horizon:]
@@ -115,7 +130,7 @@ def score_component(
         raise FloatingPointError("Nonfinite average source test loss.")
     return dict(
         per_session=rows, mean_loss=mean_loss,
-        mean_ratio=mean_ratio,
+        mean_ratio=mean_ratio, evaluation_flops=evaluation_flops,
     )
 
 
@@ -137,6 +152,7 @@ def stage_identity(spec: dict, stage: str, parent: str | None) -> dict:
         implementation=spec["implementation"],
         stage=stage,
         upstream_checkpoint=parent,
+        data_identity=spec["data_identity"],
     )
 
 
@@ -145,170 +161,210 @@ def run_stage(
     holdout: list[dict], names: list[str], spec: dict,
     root: Path, parent: str | None, budget: int,
     devices: tuple[str, str], microbatch: int,
+    validation: list[dict] | None = None,
 ) -> tuple[dict, str]:
     """Fit one matched stage branch and record fixed-set stage loss."""
     stage_index = COMPONENTS.index(stage)
     identity = stage_identity(spec, stage, parent)
-    directory, flops = fit_component_budget(
-        model, training, root, identity, spec["source_training"],
-        spec["seed"] + stage_index, budget, devices, microbatch,
-    )
+    settings = spec["source_training"]
+    if stage in RECURRENT_STAGES:
+        directory, flops = fit_component_budget(
+            model, training, root, identity, settings,
+            spec["seed"] + stage_index, budget, devices, microbatch,
+        )
+    else:
+        if validation is None:
+            raise ValueError(f"Fixed stage {stage} requires inner validation.")
+        directory, _ = fit_segment(
+            model, training, root, identity, settings,
+            spec["seed"] + stage_index, 0, settings["fixed_update_cap"],
+            None, devices, microbatch, validation=validation,
+        )
+        flops = load_flops(directory)
     score = score_component(model, training, holdout, names)
     record = dict(
         stage=stage, component_id=directory.name,
         component_flops=flops, score=score,
+        exposure=component_exposure(directory, training),
     )
     return record, directory.name
+
+
+def component_exposure(directory: Path, data: list[dict]) -> list[dict]:
+    """Audit draws and distinct training windows along one stage path."""
+    counts = [np.zeros(len(row["T"]), dtype=np.int64) for row in data]
+    while directory is not None:
+        record = json.loads((directory / "training.json").read_text())
+        for row in record["history"]:
+            for values, selected in zip(counts, row["sampled_windows"]):
+                np.add.at(values, selected, 1)
+        identity = json.loads((directory / "identity.json").read_text())
+        parent = identity["parent"]
+        directory = directory.parent / parent if parent else None
+    return [dict(
+        available_windows=len(values), total_draws=int(values.sum()),
+        distinct_windows=int(np.count_nonzero(values)),
+        mean_repetitions=float(values.mean()),
+        maximum_repetitions=int(values.max()),
+    ) for values in counts]
 
 
 def fit_source_campaign(
     train: list[dict], holdout: list[dict], records: dict,
     directory: Path, component_root: Path, spec: dict,
     devices: tuple[str, str], microbatch: int,
+    validation: list[dict],
 ) -> None:
-    """Fit five dependency-consistent paths and publish selected maps."""
+    """Fit fixed preprocessing and five matched recurrent budget paths.
+
+    Parameters
+    ----------
+    train, holdout, validation : list of dict
+        Per-session Y/U/Z arrays shaped (windows, 128, channels).
+    records : dict
+        Original window indices and train-only normalization per session.
+    directory, component_root : Path
+        Source fit and reusable immutable component store.
+    spec : dict
+        Scientific source definition, including schedules and sharing.
+    devices : tuple of str
+        Two devices; sessions remain assigned by index modulo two.
+    microbatch : int
+        Maximum session-local windows before adaptive accumulation.
+    """
+    spec = dict(
+        spec, source_training=resolved_schedule(
+            spec["source_training"], spec["source_count"]
+        ), data_identity=fingerprint(records),
+    )
     names = spec["sessions"][:4]
     if len(names) != 4 or len(set(names)) != 4:
         raise ValueError("Expected four distinct common source sessions.")
     split_identity = fingerprint({
         name: records[name]["validation"] for name in names
     })
-    if any(
-        not records[name]["validation"] for name in names
-    ):
-        raise ValueError("Common source holdout has empty windows.")
+    if sum(len(records[name]["validation"]) for name in names) != 87:
+        raise ValueError("Expected exactly 87 common outer test windows.")
     dimensions = [
         (row["Y"].shape[-1], row["Y"].shape[-1]) for row in train
     ]
-    neural_train = [recurrent_data(row) for row in train]
-    neural_test = [recurrent_data(row) for row in holdout]
+    partitions = (train, validation, holdout)
+    neural = [[recurrent_data(row) for row in part] for part in partitions]
     pre = MixedForecaster(
-        dimensions, PREPROCESSING_SIZE, "none", spec["seed"]
+        dimensions, PREPROCESSING_SIZE, "none", spec["seed"],
+        session_devices=devices,
     )
-    paths = []
-    transferable = {}
-    for budget in CHECKPOINTS:
-        stages = {}
+    pre_record, parent = run_stage(
+        "preprocessing_neural", pre, neural[0], neural[2], names,
+        spec, component_root, None, 0, devices, microbatch,
+        validation=neural[1],
+    )
+    pre_states = [stage_predictions(pre, part)[1] for part in neural]
+    pre_readout = ReadoutStage(
+        [(PREPROCESSING_SIZE, row["Z"].shape[-1]) for row in train],
+        BEHAVIOR_WIDTH, spec["seed"] + 1, behavior=True,
+        session_devices=devices,
+    )
+    behavior = [
+        readout_data([recurrent_data(row, "Z") for row in part], states)
+        for part, states in zip(partitions, pre_states)
+    ]
+    behavior_record, pre_parent = run_stage(
+        "preprocessing_behavior", pre_readout, behavior[0], behavior[2],
+        names, spec, component_root, parent, 0, devices, microbatch,
+        validation=behavior[1],
+    )
+    prepared = [
+        behavior_targets(pre_readout, states, part)
+        for states, part in zip(pre_states, partitions)
+    ]
+    scales = []
+    for index, source in enumerate(prepared[0]):
+        scale = Scale.fit(source["Z"], "Z")
+        for part in prepared:
+            part[index]["Z"] = scale.apply(part[index]["Z"])
+        scales.append(scale.record())
+    stage_data = [
+        [recurrent_data(row, "Z") for row in part] for part in prepared
+    ]
+    atomic_json(directory / "preprocessing.json", dict(
+        neural=pre_record["component_id"],
+        behavior=behavior_record["component_id"], scales=scales,
+        target_identity=fingerprint(dict(
+            parent=pre_parent, scales=scales, data=spec["data_identity"],
+        )),
+    ))
+    main = MixedForecaster(
+        [(row["Y"].shape[-1], row["Z"].shape[-1]) for row in train],
+        spec["latent"], STAGE1_SHARING,
+        spec["seed"] + 2, decoder_width=BEHAVIOR_WIDTH,
+        session_devices=devices,
+    )
+    main_initial = main.weights()
+    paths, transferable = [], {}
+    settings = spec["source_training"]
+    for budget, total in zip(
+        settings["checkpoints"], settings["total_updates"]
+    ):
+        main.restore(main_initial)
+        stages = dict(
+            preprocessing_neural=pre_record,
+            preprocessing_behavior=behavior_record,
+        )
         record, parent = run_stage(
-            "preprocessing_neural", pre, neural_train,
-            neural_test, names, spec, component_root,
-            None, budget, devices, microbatch,
-        )
-        stages["preprocessing_neural"] = record
-        _, pre_train = stage_predictions(pre, neural_train)
-        _, pre_test = stage_predictions(pre, neural_test)
-        pre_readout = ReadoutStage(
-            [
-                (PREPROCESSING_SIZE, row["Z"].shape[-1])
-                for row in train
-            ],
-            BEHAVIOR_WIDTH, spec["seed"] + 1, behavior=True,
-        )
-        ztrain = [recurrent_data(row, "Z") for row in train]
-        ztest = [recurrent_data(row, "Z") for row in holdout]
-        record, parent = run_stage(
-            "preprocessing_behavior", pre_readout,
-            readout_data(ztrain, pre_train),
-            readout_data(ztest, pre_test),
-            names, spec, component_root, parent,
-            budget, devices, microbatch,
-        )
-        stages["preprocessing_behavior"] = record
-        prepared_train = behavior_targets(
-            pre_readout, pre_train, train
-        )
-        prepared_test = behavior_targets(
-            pre_readout, pre_test, holdout
-        )
-        scales = []
-        for source, test in zip(prepared_train, prepared_test):
-            scale = Scale.fit(source["Z"], "Z")
-            source["Z"] = scale.apply(source["Z"])
-            test["Z"] = scale.apply(test["Z"])
-            scales.append(scale.record())
-        stage_train = [
-            recurrent_data(row, "Z") for row in prepared_train
-        ]
-        stage_test = [
-            recurrent_data(row, "Z") for row in prepared_test
-        ]
-        main = MixedForecaster(
-            [
-                (row["Y"].shape[-1], row["Z"].shape[-1])
-                for row in train
-            ],
-            spec["latent"], STAGE1_SHARING,
-            spec["seed"] + 2, decoder_width=BEHAVIOR_WIDTH,
-        )
-        record, parent = run_stage(
-            "behavior_relevant", main, stage_train,
-            stage_test, names, spec, component_root,
-            parent, budget, devices, microbatch,
+            "behavior_relevant", main, stage_data[0], stage_data[2], names,
+            spec, component_root, pre_parent, budget, devices, microbatch,
         )
         stages["behavior_relevant"] = record
-        _, main_train = stage_predictions(main, stage_train)
-        _, main_test = stage_predictions(main, stage_test)
+        main_states = [stage_predictions(main, part)[1] for part in stage_data]
         readout = ReadoutStage(
-            [
-                (spec["latent"], row["Y"].shape[-1])
-                for row in train
-            ],
-            NEURAL_WIDTH, spec["seed"] + 3,
+            [(spec["latent"], row["Y"].shape[-1]) for row in train],
+            NEURAL_WIDTH, spec["seed"] + 3, session_devices=devices,
         )
+        readout_inputs = [
+            readout_data(part, states)
+            for part, states in zip(neural, main_states)
+        ]
         record, parent = run_stage(
-            "neural_readout", readout,
-            readout_data(neural_train, main_train),
-            readout_data(neural_test, main_test),
-            names, spec, component_root, parent,
-            budget, devices, microbatch,
+            "neural_readout", readout, readout_inputs[0], readout_inputs[2],
+            names, spec, component_root, parent, 0, devices, microbatch,
+            validation=readout_inputs[1],
         )
         stages["neural_readout"] = record
         residual = MixedForecaster(
             dimensions, spec["latent"], STAGE2_SHARING,
             spec["seed"] + 4,
             input_dimensions=[
-                row[0] + spec["latent"] + 2
-                for row in dimensions
+                row[0] + spec["latent"] + 2 for row in dimensions
             ],
-            forward_dimensions=spec["latent"] + 2,
+            forward_dimensions=spec["latent"] + 2, session_devices=devices,
         )
         record, _ = run_stage(
             "residual", residual,
-            residual_data(main, readout, neural_train),
-            residual_data(main, readout, neural_test),
-            names, spec, component_root,
-            parent, budget, devices, microbatch,
+            residual_data(main, readout, neural[0]),
+            residual_data(main, readout, neural[2]), names,
+            spec, component_root, parent, budget, devices, microbatch,
         )
         stages["residual"] = record
-        total_flops = sum(
-            row["component_flops"] for row in stages.values()
-        )
-        criterion = (
-            stages["behavior_relevant"]["score"]["mean_ratio"]
-            + stages["residual"]["score"]["mean_ratio"]
+        total_flops = sum(row["component_flops"] for row in stages.values())
+        criterion = sum(
+            stages[stage]["score"]["mean_ratio"] for stage in RECURRENT_STAGES
         )
         if not np.isfinite(criterion) or total_flops <= 0:
             raise ValueError("Invalid source selection score or FLOPs.")
         paths.append(dict(
-            budget=budget, branch_updates=spec["source_training"][
-                "branch_updates"
-            ],
+            budget=budget, total_updates=total, branch_updates=total - budget,
             stages=stages, full_path_flops=total_flops,
             selection_score=criterion,
-            behavior_scales=scales,
+            preprocessing_reference="preprocessing.json",
         ))
         transferable[budget] = dict(
-            stage1=main.transferable(),
-            stage2=residual.transferable(),
+            stage1=main.transferable(), stage2=residual.transferable(),
         )
     selected = min(
-        paths, key=lambda row: (
-            row["selection_score"], row["full_path_flops"]
-        )
+        paths, key=lambda row: (row["selection_score"], row["full_path_flops"])
     )
-    dump_pickle(
-        directory / "shared.pkl", transferable[selected["budget"]]
-    )
+    dump_pickle(directory / "shared.pkl", transferable[selected["budget"]])
     atomic_json(directory / "budgets.json", paths)
     atomic_json(directory / "selection.json", dict(
         selected_budget=selected["budget"],
@@ -316,8 +372,7 @@ def fit_source_campaign(
         selected_full_path_flops=selected["full_path_flops"],
         evaluation_sessions=names,
         evaluation_window_counts={
-            name: len(records[name]["validation"])
-            for name in names
+            name: len(records[name]["validation"]) for name in names
         },
         evaluation_set_id=split_identity,
         holdout_role="chronological_source_test_and_transfer_selection",
