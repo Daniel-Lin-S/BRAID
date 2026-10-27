@@ -35,6 +35,8 @@ TITLE_WIDTH = 58
 TARGET_COLOR = "#2878b5"
 SCRATCH_COLOR = "#222222"
 SELECTED_MARKER = "s"
+TARGET_TYPES = ("neural", "behavior")
+TARGET_METRICS = ("cc", "r2", "mse")
 
 
 def source_tables(plan: dict) -> tuple[list[dict], list[dict], list[dict]]:
@@ -220,8 +222,8 @@ def target_figures(
     """Plot absolute and paired transfer metrics by source session count."""
     if not summary:
         return
-    for target in ("neural", "behavior"):
-        for metric in ("cc", "r2", "mse"):
+    for target in TARGET_TYPES:
+        for metric in TARGET_METRICS:
             for fraction in settings["target_fractions"]:
                 figure, axes = plt.subplots(
                     2, 3, figsize=(14, 8), sharex=True,
@@ -354,14 +356,80 @@ def draw_gains(
     plt.close(figure)
 
 
+def validate_target_coverage(
+    summary: list[dict], gains: list[dict], settings: dict,
+) -> None:
+    """Require every source-count and scratch curve at every horizon."""
+    conditions = {
+        (target, metric, fraction, horizon)
+        for target in TARGET_TYPES
+        for metric in TARGET_METRICS
+        for fraction in settings["target_fractions"]
+        for horizon in settings["evaluation_horizons"]
+    }
+    expected_source = {
+        (*condition, count)
+        for condition in conditions for count in COUNTS
+    }
+    source = {
+        (row["target"], row["metric"], row["fraction"],
+         row["horizon"], row["source_count"])
+        for row in summary if row["sharing"] != "scratch"
+    }
+    scratch = {
+        (row["target"], row["metric"], row["fraction"],
+         row["horizon"])
+        for row in summary if row["sharing"] == "scratch"
+    }
+    paired = {
+        (row["target"], row["metric"], row["fraction"],
+         row["horizon"], row["source_count"])
+        for row in gains
+    }
+    if (
+        source != expected_source or scratch != conditions
+        or paired != expected_source
+        or len(summary) != len(expected_source) + len(conditions)
+        or len(gains) != len(expected_source)
+    ):
+        raise ValueError(
+            "Completed target fits lack full four-count, scratch, "
+            "or paired-gain figure coverage."
+        )
+
+
+def campaign_complete(plan: dict, final: bool) -> bool:
+    """Require every planned fit before publishing campaign figures."""
+    members = plan["analyses"][CAMPAIGN]
+    if not members:
+        raise ValueError("Compute-scaling analysis has no planned fits.")
+    missing = [
+        key for key in members
+        if not (fit_directory(plan, key) / "complete.json").is_file()
+    ]
+    if missing:
+        if final:
+            raise ValueError(
+                f"Cannot publish compute-scaling figures: "
+                f"{len(missing)} of {len(members)} fits are incomplete."
+            )
+        return False
+    for key in members:
+        if completed(fit_directory(plan, key)) is None:
+            raise ValueError(f"Invalid completed campaign fit: {key}.")
+    return True
+
+
 def report(plan: dict, plan_path: Path, final: bool = False) -> None:
-    """Publish a new immutable analysis snapshot when fits advance."""
+    """Publish one immutable report after all campaign fits complete."""
+    if not campaign_complete(plan, final):
+        return
     root = analysis_directory(
         plan, CAMPAIGN, plan_path.parent.name
     )
     sources, sessions, choices = source_tables(plan)
     if not sources:
-        return
+        raise ValueError("Completed campaign has no source loss rows.")
     members = [
         key for key in plan["analyses"][CAMPAIGN]
         if plan["jobs"][key]["kind"] in (
@@ -369,6 +437,16 @@ def report(plan: dict, plan_path: Path, final: bool = False) -> None:
         )
     ]
     rows, dimensions, identities = collect(plan, members)
+    if len(identities) != len(members):
+        raise ValueError(
+            f"Expected {len(members)} completed target fits, "
+            f"got {len(identities)}."
+        )
+    if len(choices) != len(COUNTS):
+        raise ValueError(
+            f"Expected {len(COUNTS)} completed source fits, "
+            f"got {len(choices)}."
+        )
     summary = summarize(rows) if rows else []
     gains = paired_gains(rows) if rows else []
     for row in gains:
@@ -382,6 +460,9 @@ def report(plan: dict, plan_path: Path, final: bool = False) -> None:
     gain_summary = summarize([
         dict(row, value=row["improvement"]) for row in gains
     ]) if gains else []
+    validate_target_coverage(
+        summary, gain_summary, plan["settings"]
+    )
     identity = dict(
         source=[
             (row["source_fit"], row["component_checksum"])

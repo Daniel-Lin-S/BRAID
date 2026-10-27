@@ -65,6 +65,8 @@ Within the artifact root of a compaign, you should NOT save the same information
 
 All compaigns SHOULD share the SAME artifact / log saving logics and modules, rather than each one having its own artifact structure. Minor changes like file addition and field changes are allowed, but NEVER start a completely new artifact or log structure.
 
+DO NOT trigger figure generation after every model fit completion, it should be triggered when ALL relevant model fits are complete.
+
 ## Plotting
 
 - use `seaborn` whenever possible rather than `matplotib`

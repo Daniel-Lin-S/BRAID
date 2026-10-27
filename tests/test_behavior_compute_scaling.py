@@ -9,6 +9,7 @@ Temporary checkpoint files are removed by pytest after each test.
 import json
 
 import numpy as np
+import pytest
 
 from BRAID.multisession import MixedForecaster
 from experiments.multisession.behavior_compute_scaling.flops import (
@@ -20,6 +21,9 @@ from experiments.multisession.behavior_compute_scaling.training import (
 )
 from experiments.multisession.behavior_compute_scaling.queue import (
     hold_source_slot, runnable,
+)
+from experiments.multisession.behavior_compute_scaling import (
+    report as scaling_report,
 )
 from experiments.multisession.store import completed
 from experiments.multisession.training import select_batch
@@ -183,3 +187,70 @@ def test_waiting_source_reserves_one_gpu() -> None:
     assert hold_source_slot(adaptation, 1, True, {4})
     assert not hold_source_slot(scratch, 2, True, set())
     assert not hold_source_slot(scratch, 1, False, set())
+
+
+def test_campaign_report_waits_for_every_fit(
+    tmp_path, monkeypatch,
+) -> None:
+    """Incomplete membership cannot publish a partial report snapshot."""
+    plan = {
+        "analyses": {
+            "multi_session_behavior_compute_scaling": ["first", "second"]
+        }
+    }
+    monkeypatch.setattr(
+        scaling_report, "fit_directory",
+        lambda unused_plan, key: tmp_path / key,
+    )
+    monkeypatch.setattr(
+        scaling_report, "source_tables",
+        lambda unused_plan: pytest.fail(
+            "Incomplete report unexpectedly collected source rows."
+        ),
+    )
+    (tmp_path / "first").mkdir()
+    (tmp_path / "first" / "complete.json").write_text("{}")
+    assert not scaling_report.campaign_complete(plan, False)
+    scaling_report.report(plan, tmp_path / "plan.json")
+    assert not (tmp_path / "reports").exists()
+    with pytest.raises(ValueError, match="1 of 2 fits are incomplete"):
+        scaling_report.campaign_complete(plan, True)
+    (tmp_path / "second").mkdir()
+    (tmp_path / "second" / "complete.json").write_text("{}")
+    monkeypatch.setattr(
+        scaling_report, "completed",
+        lambda unused_path: {"checksums": {}},
+    )
+    assert scaling_report.campaign_complete(plan, True)
+
+
+def test_report_requires_every_source_count_curve() -> None:
+    """A completed report cannot draw a partial transfer comparison."""
+    settings = {
+        "target_fractions": [0.05],
+        "evaluation_horizons": [1],
+    }
+    source = [
+        dict(
+            target=target, metric=metric, fraction=0.05,
+            horizon=1, source_count=count, sharing="A1_fw_RNN2",
+        )
+        for target in ("neural", "behavior")
+        for metric in ("cc", "r2", "mse")
+        for count in (4, 8, 16, 33)
+    ]
+    scratch = [
+        dict(
+            target=target, metric=metric, fraction=0.05,
+            horizon=1, source_count=0, sharing="scratch",
+        )
+        for target in ("neural", "behavior")
+        for metric in ("cc", "r2", "mse")
+    ]
+    scaling_report.validate_target_coverage(
+        source + scratch, source, settings
+    )
+    with pytest.raises(ValueError, match="full four-count"):
+        scaling_report.validate_target_coverage(
+            source[:-1] + scratch, source[:-1], settings
+        )

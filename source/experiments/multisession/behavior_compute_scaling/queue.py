@@ -117,7 +117,7 @@ def run_compute_queue(
 ) -> None:
     """Run checksum-aware source/target queue over eight GPU slots."""
     from experiments.multisession.runner import (
-        publish_reports, reconcile, start_report,
+        publish_reports, reconcile,
     )
 
     if settings["runtime"].get("gpus_per_source") != SOURCE_GPU_COUNT:
@@ -162,8 +162,6 @@ def run_compute_queue(
         if plan["jobs"][key]["kind"] == "adaptation"
         and state in ("complete", "running")
     }
-    last_report = 0.0
-    reporting = None
     with writer_lock(path.parent / "coordinator.lock", blocking=False):
         while pending or active:
             current = {
@@ -251,18 +249,6 @@ def run_compute_queue(
             )
             if changed:
                 reconcile(plan, path, states)
-                due = time.monotonic() - last_report >= 300
-                idle = reporting is None or reporting.poll() is not None
-                if due and idle:
-                    reporting = start_report(path, launch, settings)
-                    try:
-                        os.setpriority(
-                            os.PRIO_PROCESS, reporting.pid,
-                            LOW_CPU_PRIORITY,
-                        )
-                    except ProcessLookupError:
-                        pass
-                    last_report = time.monotonic()
             if pending and not active and not runnable(
                 plan, states, pending
             ):
@@ -271,8 +257,6 @@ def run_compute_queue(
                 )
             if pending or active:
                 time.sleep(POLL_SECONDS)
-        if reporting is not None:
-            reporting.wait()
         reconcile(plan, path, states)
         publish_reports(plan, path)
         publish_status(
