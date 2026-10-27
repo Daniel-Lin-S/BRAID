@@ -156,6 +156,7 @@ def run_compute_queue(
         pending.discard(key)
         states[key] = "running"
     failed = set()
+    source_reported = False
     adaptation_started = {
         plan["jobs"][key]["source_count"]
         for key, state in states.items()
@@ -249,6 +250,11 @@ def run_compute_queue(
             )
             if changed:
                 reconcile(plan, path, states)
+            if not source_reported and all(
+                states[key] == "complete" for key in plan["source_references"]
+            ):
+                publish_reports(plan, path)
+                source_reported = True
             if pending and not active and not runnable(
                 plan, states, pending
             ):

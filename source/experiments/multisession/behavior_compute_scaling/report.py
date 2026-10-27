@@ -16,7 +16,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from experiments.multisession.behavior_compute_scaling.plan import (
-    CAMPAIGN, COMPONENTS, COUNTS,
+    CAMPAIGN, COMPONENTS, COUNTS, RECURRENT_STAGES,
 )
 from experiments.multisession.plan import analysis_directory
 from experiments.multisession.reports import (
@@ -35,20 +35,30 @@ TITLE_WIDTH = 58
 TARGET_COLOR = "#2878b5"
 SCRATCH_COLOR = "#222222"
 SELECTED_MARKER = "s"
+STAGE_LABELS = {
+    "behavior_relevant": "RNN1", "residual": "RNN2",
+}
 TARGET_TYPES = ("neural", "behavior")
 TARGET_METRICS = ("cc", "r2", "mse")
+INTERIM_COUNTS = (4, 8, 16)
+INTERIM_NOTE = "Interim: 33-session fits pending."
+LINE_STYLES = {4: "-", 8: "--", 16: "-.", 33: ":"}
 
 
-def source_tables(plan: dict) -> tuple[list[dict], list[dict], list[dict]]:
+def source_tables(
+    plan: dict, counts: tuple[int, ...] = COUNTS,
+) -> tuple[list[dict], list[dict], list[dict]]:
     """Collect checkpoint, session-loss and selection provenance."""
     losses, sessions, choices = [], [], []
     expected_set = None
     for key in plan["source_references"]:
+        spec = plan["jobs"][key]
+        if spec["source_count"] not in counts:
+            continue
         directory = fit_directory(plan, key)
         completion = completed(directory)
         if completion is None:
             continue
-        spec = plan["jobs"][key]
         selection = json.loads(
             (directory / "selection.json").read_text()
         )
@@ -143,14 +153,18 @@ def source_tables(plan: dict) -> tuple[list[dict], list[dict], list[dict]]:
     return losses, sessions, choices
 
 
-def source_figures(rows: list[dict], directory: Path) -> None:
-    """Draw one log-log four-count source test panel per stage."""
+def source_figures(
+    rows: list[dict], directory: Path,
+    counts: tuple[int, ...] = COUNTS,
+    stages: tuple[str, ...] = COMPONENTS,
+) -> None:
+    """Draw complete log-log source panels for requested stages."""
     if not rows:
-        return
-    for stage in COMPONENTS:
+        raise ValueError("Cannot plot source loss without completed rows.")
+    for stage in stages:
         figure, axis = plt.subplots(figsize=SOURCE_FIGURE_SIZE)
         stage_rows = [row for row in rows if row["stage"] == stage]
-        for count in COUNTS:
+        for count in counts:
             selected = sorted(
                 (
                     row for row in stage_rows
@@ -158,8 +172,6 @@ def source_figures(rows: list[dict], directory: Path) -> None:
                 ),
                 key=lambda row: row["full_path_flops"],
             )
-            if not selected:
-                continue
             if len(selected) != 5:
                 raise ValueError(
                     f"Expected five source FLOP points for {count} sessions."
@@ -169,8 +181,12 @@ def source_figures(rows: list[dict], directory: Path) -> None:
                 row["chronological_source_test_loss"]
                 for row in selected
             ]
+            if not np.isfinite(xs + ys).all() or min(xs + ys) <= 0:
+                raise ValueError(
+                    "Source log axes require finite positive values."
+                )
             plot_line(
-                x=xs, y=ys, ax=axis,
+                x=xs, y=ys, ax=axis, linestyle=LINE_STYLES[count],
                 color=COLORS[count], marker="o",
                 linewidth=DEFAULT_LINE_WIDTH,
                 label=f"{count} source sessions",
@@ -190,10 +206,12 @@ def source_figures(rows: list[dict], directory: Path) -> None:
         axis.set_yscale("log")
         axis.set_xlabel("Full-pipeline source model FLOPs")
         axis.set_ylabel("Chronological source test loss")
+        stage_label = STAGE_LABELS.get(stage, stage.replace("_", " ").title())
         axis.set_title(
             fill(
-                f"{stage.replace('_', ' ').title()}: fixed four-session "
-                "chronological source test",
+                f"{stage_label}: fixed four-session "
+                "chronological source test"
+                + (" (interim)" if counts != COUNTS else ""),
                 TITLE_WIDTH,
             ),
             pad=22,
@@ -201,7 +219,8 @@ def source_figures(rows: list[dict], directory: Path) -> None:
         axis.text(
             0, -0.25,
             "The same holdout selects transfer checkpoints; selected "
-            "source scores are descriptive.",
+            "source scores are descriptive."
+            + (f"\n{INTERIM_NOTE}" if counts != COUNTS else ""),
             transform=axis.transAxes, fontsize=9,
         )
         axis.legend(
@@ -217,7 +236,7 @@ def source_figures(rows: list[dict], directory: Path) -> None:
 
 def target_figures(
     summary: list[dict], gain_summary: list[dict], directory: Path,
-    settings: dict,
+    settings: dict, counts: tuple[int, ...] = COUNTS,
 ) -> None:
     """Plot absolute and paired transfer metrics by source session count."""
     if not summary:
@@ -269,8 +288,8 @@ def target_figures(
                             label="Matched scratch",
                         )
                     axis.set_title(f"Horizon {horizon}")
-                    axis.set_xticks(COUNTS)
-                    axis.set_xlim(min(COUNTS) - 1, max(COUNTS) + 1)
+                    axis.set_xticks(counts)
+                    axis.set_xlim(min(counts) - 1, max(counts) + 1)
                     axis.set_xlabel("Source sessions")
                     axis.set_ylabel(metric.upper())
                     if axis.get_legend() is not None:
@@ -284,7 +303,9 @@ def target_figures(
                 figure.suptitle(
                     fill(
                         f"{target.title()} {metric.upper()}, "
-                        f"{fraction:.0%} target labels",
+                        f"{fraction:.0%} target labels"
+                        + (f" ({INTERIM_NOTE})"
+                           if counts != COUNTS else ""),
                         TITLE_WIDTH,
                     ),
                     y=1.04,
@@ -300,13 +321,14 @@ def target_figures(
                 plt.close(figure)
                 draw_gains(
                     gain_summary, directory, target,
-                    metric, fraction, settings,
+                    metric, fraction, settings, counts,
                 )
 
 
 def draw_gains(
     summary: list[dict], directory: Path, target: str,
     metric: str, fraction: float, settings: dict,
+    counts: tuple[int, ...] = COUNTS,
 ) -> None:
     """Plot paired transfer-minus-scratch gain at all six horizons."""
     if not summary:
@@ -334,14 +356,15 @@ def draw_gains(
             )
         axis.axhline(0, color=SCRATCH_COLOR, linestyle="--")
         axis.set_title(f"Horizon {horizon}")
-        axis.set_xticks(COUNTS)
-        axis.set_xlim(min(COUNTS) - 1, max(COUNTS) + 1)
+        axis.set_xticks(counts)
+        axis.set_xlim(min(counts) - 1, max(counts) + 1)
         axis.set_xlabel("Source sessions")
         axis.set_ylabel(f"Improvement over scratch ({metric.upper()})")
     figure.suptitle(
         fill(
             f"Paired {target} {metric.upper()}, "
-            f"{fraction:.0%} target labels",
+            f"{fraction:.0%} target labels"
+            + (f" ({INTERIM_NOTE})" if counts != COUNTS else ""),
             TITLE_WIDTH,
         ),
         y=1.04,
@@ -358,6 +381,7 @@ def draw_gains(
 
 def validate_target_coverage(
     summary: list[dict], gains: list[dict], settings: dict,
+    counts: tuple[int, ...] = COUNTS,
 ) -> None:
     """Require every source-count and scratch curve at every horizon."""
     conditions = {
@@ -369,7 +393,7 @@ def validate_target_coverage(
     }
     expected_source = {
         (*condition, count)
-        for condition in conditions for count in COUNTS
+        for condition in conditions for count in counts
     }
     source = {
         (row["target"], row["metric"], row["fraction"],
@@ -393,16 +417,36 @@ def validate_target_coverage(
         or len(gains) != len(expected_source)
     ):
         raise ValueError(
-            "Completed target fits lack full four-count, scratch, "
+            "Completed target fits lack requested source-count, scratch, "
             "or paired-gain figure coverage."
         )
 
 
-def campaign_complete(plan: dict, final: bool) -> bool:
-    """Require every planned fit before publishing campaign figures."""
+def report_members(
+    plan: dict, counts: tuple[int, ...],
+) -> list[str]:
+    """Select complete-design or authorized interim report members."""
+    if counts not in (COUNTS, INTERIM_COUNTS):
+        raise ValueError(f"Unsupported report source counts: {counts}.")
+    if counts != COUNTS and revised_protocol(plan):
+        raise ValueError(
+            "Interim figures are not authorized for this protocol."
+        )
     members = plan["analyses"][CAMPAIGN]
     if not members:
         raise ValueError("Compute-scaling analysis has no planned fits.")
+    return [
+        key for key in members
+        if plan["jobs"][key]["kind"] in ("preprocessing", "scratch")
+        or plan["jobs"][key].get("source_count") in counts
+    ]
+
+
+def campaign_complete(
+    plan: dict, final: bool, counts: tuple[int, ...] = COUNTS,
+) -> bool:
+    """Require every selected fit before publishing campaign figures."""
+    members = report_members(plan, counts)
     missing = [
         key for key in members
         if not (fit_directory(plan, key) / "complete.json").is_file()
@@ -420,21 +464,112 @@ def campaign_complete(plan: dict, final: bool) -> bool:
     return True
 
 
-def report(plan: dict, plan_path: Path, final: bool = False) -> None:
-    """Publish one immutable report after all campaign fits complete."""
-    if not campaign_complete(plan, final):
+def revised_protocol(plan: dict) -> bool:
+    """Identify the explicitly configured fixed-preprocessing protocol."""
+    return bool(plan.get("settings", {}).get("source_training", {}).get(
+        "protocol"
+    ))
+
+
+def source_report(plan: dict, plan_path: Path) -> Path | None:
+    """Publish source panels once all four source fits are complete."""
+    keys = plan["source_references"]
+    if any(completed(fit_directory(plan, key)) is None for key in keys):
+        return None
+    sources, sessions, choices = source_tables(plan)
+    if len(choices) != len(COUNTS):
+        raise ValueError("Source figure group requires all four source counts.")
+    root = analysis_directory(plan, CAMPAIGN, plan_path.parent.name)
+    identity = dict(
+        group="recurrent_source", protocol=plan["settings"]["source_training"],
+        sources=[(row["source_fit"], row["component_checksum"])
+                 for row in sources],
+    )
+    snapshot = root / "reports" / fingerprint(identity)
+    with job(snapshot, identity) as needed:
+        if needed:
+            tables, figures = snapshot / "tables", snapshot / "figures"
+            tables.mkdir()
+            figures.mkdir()
+            write_table(tables / "source_loss.csv", sources)
+            write_table(tables / "source_session_loss.csv", sessions)
+            write_table(tables / "selection.csv", choices)
+            diagnostics = []
+            for key in keys:
+                spec = plan["jobs"][key]
+                fit = fit_directory(plan, key)
+                paths = json.loads((fit / "budgets.json").read_text())
+                seen = set()
+                for path in paths:
+                    for stage, row in path["stages"].items():
+                        if row["component_id"] in seen:
+                            continue
+                        seen.add(row["component_id"])
+                        component = (fit.parent.parent / "source_components"
+                                     / row["component_id"])
+                        training = json.loads(
+                            (component / "training.json").read_text()
+                        )
+                        for name, exposure in zip(
+                            spec["sessions"], row["exposure"]
+                        ):
+                            diagnostics.append(dict(
+                                source_count=spec["source_count"], stage=stage,
+                                component_id=row["component_id"], session=name,
+                                actual_stop=training["stop"],
+                                selected_update=training["selected_update"],
+                                component_flops=row["component_flops"],
+                                inner_evaluation_flops=training[
+                                    "evaluation_flops"
+                                ],
+                                outer_evaluation_flops=row["score"][
+                                    "evaluation_flops"
+                                ], **exposure,
+                            ))
+            write_table(tables / "component_diagnostics.csv", diagnostics)
+            atomic_json(snapshot / "design.json", dict(
+                source_counts=list(COUNTS), source_components=RECURRENT_STAGES,
+                expected_common_windows=EXPECTED_COMMON_WINDOWS,
+                x_axis="Full-pipeline training FLOPs through actual stopping",
+                holdout_role="Chronological source test and transfer selection",
+                selected_score_interpretation="Descriptive after selection",
+                evaluation_flops_in_training_axis=False,
+            ))
+            source_figures(sources, figures, stages=RECURRENT_STAGES)
+            print(f"Saved source figures: {figures.resolve()}")
+    pointer = dict(
+        snapshot=str((snapshot / "figures").resolve()),
+        identity=fingerprint(identity),
+    )
+    atomic_json(root / "latest_source_figures.json", pointer)
+    if not (root / "latest_figures.json").exists():
+        atomic_json(root / "latest_figures.json", pointer)
+    return snapshot
+
+
+def report(
+    plan: dict, plan_path: Path, final: bool = False,
+    counts: tuple[int, ...] = COUNTS,
+) -> None:
+    """Publish a complete design or the authorized three-count interim."""
+    source_snapshot = None
+    if revised_protocol(plan):
+        if counts != COUNTS:
+            raise ValueError(
+                "Interim figures are not authorized for this protocol."
+            )
+        source_snapshot = source_report(plan, plan_path)
+    if not campaign_complete(plan, final or counts != COUNTS, counts):
         return
     root = analysis_directory(
         plan, CAMPAIGN, plan_path.parent.name
     )
-    sources, sessions, choices = source_tables(plan)
+    sources, sessions, choices = source_tables(plan, counts)
     if not sources:
         raise ValueError("Completed campaign has no source loss rows.")
     members = [
-        key for key in plan["analyses"][CAMPAIGN]
-        if plan["jobs"][key]["kind"] in (
-            "scratch", "adaptation"
-        )
+        key for key in report_members(plan, counts)
+        if plan["jobs"][key]["kind"] in ("scratch", "adaptation")
     ]
     rows, dimensions, identities = collect(plan, members)
     if len(identities) != len(members):
@@ -442,9 +577,9 @@ def report(plan: dict, plan_path: Path, final: bool = False) -> None:
             f"Expected {len(members)} completed target fits, "
             f"got {len(identities)}."
         )
-    if len(choices) != len(COUNTS):
+    if len(choices) != len(counts):
         raise ValueError(
-            f"Expected {len(COUNTS)} completed source fits, "
+            f"Expected {len(counts)} completed source fits, "
             f"got {len(choices)}."
         )
     summary = summarize(rows) if rows else []
@@ -461,7 +596,7 @@ def report(plan: dict, plan_path: Path, final: bool = False) -> None:
         dict(row, value=row["improvement"]) for row in gains
     ]) if gains else []
     validate_target_coverage(
-        summary, gain_summary, plan["settings"]
+        summary, gain_summary, plan["settings"], counts
     )
     identity = dict(
         source=[
@@ -470,6 +605,8 @@ def report(plan: dict, plan_path: Path, final: bool = False) -> None:
         ],
         targets=identities,
     )
+    if counts != COUNTS:
+        identity["interim_source_counts"] = list(counts)
     snapshot = root / "reports" / fingerprint(identity)
     with job(snapshot, identity) as needed:
         if needed:
@@ -477,11 +614,10 @@ def report(plan: dict, plan_path: Path, final: bool = False) -> None:
             images = snapshot / "figures"
             tables.mkdir()
             images.mkdir()
-            write_table(tables / "source_loss.csv", sources)
-            write_table(
-                tables / "source_session_loss.csv", sessions
-            )
-            write_table(tables / "selection.csv", choices)
+            if source_snapshot is None:
+                write_table(tables / "source_loss.csv", sources)
+                write_table(tables / "source_session_loss.csv", sessions)
+                write_table(tables / "selection.csv", choices)
             if rows:
                 write_table(tables / "transfer_metrics.csv", rows)
                 write_table(tables / "transfer_summary.csv", summary)
@@ -503,15 +639,24 @@ def report(plan: dict, plan_path: Path, final: bool = False) -> None:
                     "the transfer checkpoint."
                 ),
                 expected_common_windows=EXPECTED_COMMON_WINDOWS,
-                source_counts=list(COUNTS),
+                source_counts=list(counts),
+                planned_source_counts=list(COUNTS),
+                report_scope=(
+                    "interim" if counts != COUNTS else "complete"
+                ),
                 source_components=list(COMPONENTS),
                 complete_target_fits=len(identities),
             ))
-            source_figures(sources, images)
+            if source_snapshot is None:
+                source_figures(sources, images, counts)
+            else:
+                atomic_json(snapshot / "source_reference.json", dict(
+                    snapshot=str(source_snapshot.resolve()),
+                ))
             if rows:
                 target_figures(
                     summary, gain_summary, images,
-                    plan["settings"],
+                    plan["settings"], counts,
                 )
     atomic_json(root / "latest_report.json", dict(
         snapshot=str(snapshot.resolve()),
@@ -519,6 +664,8 @@ def report(plan: dict, plan_path: Path, final: bool = False) -> None:
     ))
     atomic_json(root / "latest_figures.json", dict(
         snapshot=str((snapshot / "figures").resolve()),
+        source_snapshot=(str((source_snapshot / "figures").resolve())
+                         if source_snapshot is not None else None),
         identity=fingerprint(identity),
     ))
     print(f"Saved scaling figures: {(snapshot / 'figures').resolve()}")
