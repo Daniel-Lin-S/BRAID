@@ -23,7 +23,7 @@ import sys
 import time
 
 from experiments.storage.cache import atomic_json, fingerprint, writer_lock
-from experiments.configuration import read_yaml
+from experiments.configuration import merge_settings, read_yaml
 from experiments.datasets.nhp import NHPDataset
 from experiments.execution.runtime import select_gpus, thread_environment
 from experiments.multisession.log_paths import job_label, job_log_path
@@ -48,13 +48,18 @@ from experiments.multisession.store import (
 
 LOGGER = logging.getLogger(__name__)
 REPORT_INTERVAL_SECONDS = 300
+COMPUTE_CAMPAIGNS = (
+    "multi_session_behavior_compute_scaling",
+    "multi_session_behavior_scaling_no_preprocess",
+)
 
 
 def resolve(path: Path) -> dict:
     """Read portable scientific settings plus explicit machine paths."""
     settings = read_yaml(path)
     for key in ("data", "model"):
-        settings[key] = read_yaml(Path(settings["modules"][key]))
+        module = read_yaml(Path(settings["modules"][key]))
+        settings[key] = merge_settings(module, settings.get(key, {}))
     if "paths" not in settings:
         raise ValueError("Supply a local overlay with dataset/artifact paths.")
     return settings
@@ -144,6 +149,18 @@ def plan_campaign(settings: dict) -> tuple[dict, Path]:
             plan = build_compute_plan(
                 settings, sessions, source_reference, target_reference
             )
+    elif settings["name"] == "multi_session_behavior_scaling_no_preprocess":
+        from .behavior_compute_scaling.audit import (
+            audit_source_holdout, audit_inner_splits,
+        )
+        from .behavior_compute_scaling.plan import build_direct_plan
+
+        reference = json.loads(
+            Path(settings["source_reference_plan"]).resolve().read_text()
+        )
+        audit_source_holdout(adapter, reference)
+        audit_inner_splits(adapter, reference, settings)
+        plan = build_direct_plan(settings, sessions, reference)
     elif settings["name"] == "multi_session_source_capacity_scaling":
         from experiments.multisession.capacity import build_capacity_plan
 
@@ -216,14 +233,16 @@ def run_job(
 
     spec = plan["jobs"][key]
     if (
-        plan.get("name") == "multi_session_behavior_compute_scaling"
+        plan.get("name") in COMPUTE_CAMPAIGNS
         and spec["kind"] == "source"
     ):
         from experiments.multisession.behavior_compute_scaling.plan import (
             source_implementation,
         )
 
-        current = source_implementation()
+        current = source_implementation(
+            direct=plan["name"] == COMPUTE_CAMPAIGNS[1]
+        )
     else:
         current = implementation_digest(spec["kind"], spec.get("model"))
     validate_worker(key, spec, current, compatibility)
@@ -262,9 +281,7 @@ def run_job(
                 validation.append(va)
                 records[session] = record
             atomic_json(directory / "data.json", records)
-            if plan.get("name") == (
-                "multi_session_behavior_compute_scaling"
-            ):
+            if plan.get("name") in COMPUTE_CAMPAIGNS:
                 from .behavior_compute_scaling.pipeline import (
                     fit_source_campaign,
                 )
@@ -657,10 +674,8 @@ def start_report(path: Path, launch: Path, settings: dict) -> subprocess.Popen:
 
 def publish_reports(plan: dict, path: Path) -> None:
     """Keep reporting failures from interrupting independent fitting jobs."""
-    if plan.get("name") == "multi_session_behavior_compute_scaling":
-        from .behavior_compute_scaling.report import (
-            report,
-        )
+    if plan.get("name") in COMPUTE_CAMPAIGNS:
+        from .behavior_compute_scaling.report import report
     else:
         from experiments.multisession.reports import report
 
@@ -706,7 +721,7 @@ def main() -> None:
         path = args.plan.resolve()
         plan = json.loads(path.read_text())
         if (
-            plan.get("name") == "multi_session_behavior_compute_scaling"
+            plan.get("name") in COMPUTE_CAMPAIGNS
             and plan["jobs"][args.job]["kind"] == "source"
         ):
             import tensorflow as tf
@@ -748,9 +763,7 @@ def main() -> None:
         print(path.resolve())
         return
     if args.stage == "report":
-        if settings["name"] == (
-            "multi_session_behavior_compute_scaling"
-        ):
+        if settings["name"] in COMPUTE_CAMPAIGNS:
             from .behavior_compute_scaling.report import (
                 report,
             )
@@ -770,9 +783,7 @@ def main() -> None:
         report(plan, path, final=True, counts=INTERIM_COUNTS)
         return
     if args.stage == "figures":
-        if settings["name"] == (
-            "multi_session_behavior_compute_scaling"
-        ):
+        if settings["name"] in COMPUTE_CAMPAIGNS:
             from .behavior_compute_scaling.report import (
                 report,
             )
@@ -841,8 +852,8 @@ def main() -> None:
         )
         print(f"Launched pid={process.pid}; logs: {launch.resolve()}")
         return
-    if settings["name"] == "multi_session_behavior_compute_scaling":
-        from experiments.multisession.behavior_compute_scaling.queue import (
+    if settings["name"] in COMPUTE_CAMPAIGNS:
+        from experiments.multisession.compute_scaling.queue import (
             run_compute_queue,
         )
 

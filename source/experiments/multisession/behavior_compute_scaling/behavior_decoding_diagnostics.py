@@ -27,6 +27,9 @@ from experiments.multisession.behavior_compute_scaling.ancestry import (
     inherited_paths, restore_component,
 )
 from experiments.multisession.behavior_compute_scaling.plan import COUNTS
+from experiments.multisession.behavior_supervision.targets import (
+    RECORDED, target_mode,
+)
 from experiments.multisession.data import (
     Scale, session_windows, source_features,
 )
@@ -227,16 +230,21 @@ def recorded_forecasts(
     restore_component(model, root / component)
     input_data = [recurrent_data(row, "Z") for row in partitions]
     predicted, _ = stage_predictions(model, input_data)
-    preprocessing = json.loads(
-        (source["fit"] / "preprocessing.json").read_text()
-    )
-    scales = preprocessing["scales"]
-    if len(scales) != source["count"]:
-        raise ValueError("Generated behavior target scales do not match count.")
-    forecasts = [
-        target_scale(scales[index]).inverse(value)
-        for index, value in enumerate(predicted)
-    ]
+    if target_mode(source["spec"]) == RECORDED:
+        forecasts = predicted
+    else:
+        preprocessing = json.loads(
+            (source["fit"] / "preprocessing.json").read_text()
+        )
+        scales = preprocessing["scales"]
+        if len(scales) != source["count"]:
+            raise ValueError(
+                "Generated behavior target scales do not match count."
+            )
+        forecasts = [
+            target_scale(scales[index]).inverse(value)
+            for index, value in enumerate(predicted)
+        ]
     for name, row, value in zip(names, partitions, forecasts):
         expected = (len(HORIZONS), *row["Z"].shape)
         if value.shape != expected or not np.isfinite(value).all():

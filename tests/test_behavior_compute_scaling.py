@@ -469,10 +469,11 @@ def test_full_pipeline_reuses_preprocessing_across_budgets(
 ) -> None:
     """Five paths share fixed targets but retain matched readout ancestry."""
     from experiments.multisession.behavior_compute_scaling import pipeline
+    from experiments.multisession.behavior_supervision import models
 
-    monkeypatch.setattr(pipeline, "PREPROCESSING_SIZE", 2)
-    monkeypatch.setattr(pipeline, "BEHAVIOR_WIDTH", 2)
-    monkeypatch.setattr(pipeline, "NEURAL_WIDTH", 2)
+    monkeypatch.setattr(models, "PREPROCESSING_SIZE", 2)
+    monkeypatch.setattr(models, "BEHAVIOR_WIDTH", 2)
+    monkeypatch.setattr(models, "NEURAL_WIDTH", 2)
     rng = np.random.default_rng(45)
 
     def rows(sizes):
@@ -529,3 +530,47 @@ def test_full_pipeline_reuses_preprocessing_across_budgets(
             assert np.isfinite(row["score"]["mean_loss"])
             assert completed(component_root / row["component_id"])
     assert (fit / "shared.pkl").is_file()
+
+
+def test_recorded_behavior_target_keeps_training_normalization() -> None:
+    """Direct supervision uses observed Z without a generated scale."""
+    from experiments.multisession.behavior_supervision.targets import (
+        RECORDED, prepare_targets, target_mode,
+    )
+
+    partitions = tuple(
+        [dict(Z=np.full((2, 128, 4), role, dtype="f"))]
+        for role in (1.0, 2.0, 3.0)
+    )
+    assert target_mode({"behavior_supervision": {"target": RECORDED}}) == (
+        RECORDED
+    )
+    prepared, scales = prepare_targets(partitions, RECORDED)
+    assert scales is None
+    for original, selected in zip(partitions, prepared):
+        np.testing.assert_array_equal(
+            original[0]["Z"], selected[0]["Z"]
+        )
+    with pytest.raises(ValueError, match="cannot use preprocessing"):
+        prepare_targets(partitions, RECORDED, states=[])
+
+
+def test_source_target_mode_and_stage_membership_are_separate() -> None:
+    """The direct target changes components without changing the ladder."""
+    from experiments.multisession.behavior_compute_scaling.plan import (
+        DIRECT_CAMPAIGN, DIRECT_COMPONENTS, source_implementation,
+    )
+    from experiments.multisession.behavior_compute_scaling.report import (
+        source_components,
+    )
+
+    assert source_components({"name": DIRECT_CAMPAIGN}) == (
+        DIRECT_COMPONENTS
+    )
+    assert source_components(
+        {"name": "multi_session_behavior_compute_scaling"}
+    ) == (
+        "preprocessing_neural", "preprocessing_behavior",
+        "behavior_relevant", "neural_readout", "residual",
+    )
+    assert source_implementation() != source_implementation(direct=True)

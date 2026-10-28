@@ -20,6 +20,7 @@ from experiments.multisession.behavior_compute_scaling.ancestry import (
 )
 from experiments.multisession.behavior_compute_scaling.plan import (
     CAMPAIGN, COMPONENTS, COUNTS, RECURRENT_STAGES,
+    DIRECT_CAMPAIGN, DIRECT_COMPONENTS,
 )
 from experiments.multisession.plan import analysis_directory
 from experiments.multisession.reports import (
@@ -34,6 +35,7 @@ from experiments.visualization.multisession import (
 
 EXPECTED_COMMON_WINDOWS = 87
 SOURCE_FIGURE_SIZE = (8, 5)
+DIRECT_SOURCE_FIGURE_SIZE = (12, 7)
 TITLE_WIDTH = 42
 NOTE_WIDTH = 78
 RENDERING_STYLE = dict(
@@ -51,6 +53,26 @@ TARGET_METRICS = ("cc", "r2", "mse")
 INTERIM_COUNTS = (4, 8, 16)
 INTERIM_NOTE = "Interim: 33-session fits pending."
 LINE_STYLES = {4: "-", 8: "--", 16: "-.", 33: ":"}
+DIRECT_SOURCE_GUIDE = """# Direct-behavior source compute scaling
+
+RNN1 predicts training-normalized recorded behavior. RNN2 predicts the
+residual of normalized smoothed neural activity after the matched RNN1
+neural readout. Each stage's test loss sums squared error over the trained
+50, 100, 200 and 400 ms horizons and equally averages the four common
+source recordings on their 87 chronological outer-test windows.
+RNN2's source panel includes the matched RNN1 neural readout prior plus
+RNN2's residual; full neural metrics appear in the performance report.
+Each x value includes training FLOPs for RNN1, its matched fixed-stage readout and RNN2 through
+that checkpoint. The same holdout selects the matched checkpoint by the
+sum of RNN1 and RNN2 dummy-normalized losses; selected scores are descriptive.
+"""
+
+
+def source_components(plan: dict) -> tuple[str, ...]:
+    """Return the stages required by this source target definition."""
+    if plan["name"] == DIRECT_CAMPAIGN:
+        return DIRECT_COMPONENTS
+    return COMPONENTS
 
 
 def source_tables(
@@ -112,7 +134,7 @@ def source_tables(
             total = path["full_path_flops"]
             if not isinstance(total, int) or total <= 0:
                 raise ValueError("Invalid full-pipeline FLOP axis.")
-            for stage in COMPONENTS:
+            for stage in source_components(plan):
                 record = path["stages"][stage]
                 component = (
                     directory.parent.parent / "source_components"
@@ -165,12 +187,16 @@ def source_figures(
     counts: tuple[int, ...] = COUNTS,
     stages: tuple[str, ...] = COMPONENTS,
     expected_points: int = 5,
+    direct: bool = False,
 ) -> None:
     """Draw complete log-log source panels for requested stages."""
     if not rows:
         raise ValueError("Cannot plot source loss without completed rows.")
     for stage in stages:
-        figure, axis = plt.subplots(figsize=SOURCE_FIGURE_SIZE)
+        figure, axis = plt.subplots(
+            figsize=(DIRECT_SOURCE_FIGURE_SIZE
+                     if direct else SOURCE_FIGURE_SIZE)
+        )
         stage_rows = [row for row in rows if row["stage"] == stage]
         for count in counts:
             selected = sorted(
@@ -225,18 +251,23 @@ def source_figures(
             ),
             pad=22,
         )
-        axis.text(
-            0, -0.32,
-            fill(
-                "The same holdout selects transfer checkpoints; selected "
-                "source scores are descriptive.", NOTE_WIDTH,
-            ) + (f"\n{INTERIM_NOTE}" if counts != COUNTS else ""),
-            transform=axis.transAxes, fontsize=ANNOTATION_FONT_SIZE,
-        )
+        if not direct:
+            axis.text(
+                0, -0.32,
+                fill(
+                    "The same holdout selects transfer checkpoints; "
+                    "selected source scores are descriptive.", NOTE_WIDTH,
+                ) + (f"\n{INTERIM_NOTE}" if counts != COUNTS else ""),
+                transform=axis.transAxes, fontsize=ANNOTATION_FONT_SIZE,
+            )
         axis.legend(
             loc="upper left", bbox_to_anchor=(1.01, 1),
             frameon=False,
         )
+        if direct:
+            figure.subplots_adjust(
+                left=0.12, right=0.73, top=0.87, bottom=0.16
+            )
         figure.savefig(
             directory / f"source_{stage}.png",
             dpi=180, bbox_inches="tight",
@@ -501,10 +532,17 @@ def source_report(
         raise ValueError(
             f"Source figure group requires counts {counts}."
         )
-    root = analysis_directory(plan, CAMPAIGN, plan_path.parent.name)
+    root = analysis_directory(plan, plan["name"], plan_path.parent.name)
     identity = dict(
         group="recurrent_source", source_counts=list(counts),
-        rendering=RENDERING_STYLE,
+        rendering=(
+            dict(
+                RENDERING_STYLE,
+                source_figure_size=DIRECT_SOURCE_FIGURE_SIZE,
+            )
+            if plan["name"] == DIRECT_CAMPAIGN
+            else RENDERING_STYLE
+        ),
         protocol=plan["settings"]["source_training"],
         sources=[(row["source_fit"], row["component_checksum"])
                  for row in sources],
@@ -551,6 +589,10 @@ def source_report(
                                 ], **exposure,
                             ))
             write_table(tables / "component_diagnostics.csv", diagnostics)
+            if plan["name"] == DIRECT_CAMPAIGN:
+                (snapshot / "guide.md").write_text(
+                    DIRECT_SOURCE_GUIDE
+                )
             atomic_json(snapshot / "design.json", dict(
                 source_counts=list(counts), source_components=RECURRENT_STAGES,
                 rendering=RENDERING_STYLE,
@@ -558,7 +600,11 @@ def source_report(
                 report_scope=("complete" if counts == COUNTS else "interim"),
                 expected_common_windows=EXPECTED_COMMON_WINDOWS,
                 x_axis="Full-pipeline training FLOPs through actual stopping",
-                holdout_role="Chronological source test and transfer selection",
+                holdout_role=(
+                    "Chronological source test and checkpoint selection"
+                    if plan["name"] == DIRECT_CAMPAIGN else
+                    "Chronological source test and transfer selection"
+                ),
                 selected_score_interpretation="Descriptive after selection",
                 evaluation_flops_in_training_axis=False,
             ))
@@ -567,6 +613,7 @@ def source_report(
                 expected_points=len(
                     plan["settings"]["source_training"]["total_updates"]
                 ),
+                direct=plan["name"] == DIRECT_CAMPAIGN,
             )
             print(f"Saved source figures: {figures.resolve()}")
     pointer = dict(
@@ -591,6 +638,12 @@ def report(
             )
         source_snapshot = source_report(plan, plan_path)
     if plan.get("source_only"):
+        if plan.get("name") == DIRECT_CAMPAIGN and source_snapshot is not None:
+            from .direct_report import publish_direct_performance
+
+            publish_direct_performance(
+                plan, plan_path, source_snapshot
+            )
         return
     if not campaign_complete(plan, final or counts != COUNTS, counts):
         return

@@ -24,8 +24,10 @@ def test_extended_pipeline_reuses_only_matching_inputs(
     tmp_path, monkeypatch,
 ) -> None:
     """Continuation keeps fixed targets and excludes old decay FLOPs."""
+    from experiments.multisession.behavior_supervision import models
+
     for name in ("PREPROCESSING_SIZE", "BEHAVIOR_WIDTH", "NEURAL_WIDTH"):
-        monkeypatch.setattr(pipeline, name, 2)
+        monkeypatch.setattr(models, name, 2)
     rng = np.random.default_rng(45)
 
     def rows(sizes: list[int]) -> list[dict]:
