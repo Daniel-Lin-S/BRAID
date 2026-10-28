@@ -22,6 +22,14 @@ NEVER stack flat files under the repository root or a module root. Create approp
 
 If a root / module has over 10 files, then you may need to examine whether breaking into subfolders is required. (this is not hard limit, there are situations where large number of files are required, e.g., in a data root with dozens of mat files belonging to different recordings, no appropriate partition exists)
 
+### Module disentanglement
+
+REDUCE code repeat.
+
+DONT create a completely new module / pipeline for every minor modification to the current experiment pipeline. Try to extend existing modules / functions to support an additional run mode if possible. 
+
+Creation of new files and modules should ONLY be permitted if all or most steps of the new pipeline is completely different from existing ones in the repository. If there are some steps to reuse from existing modules, please import rather than rewriting.
+
 ## Documentation
 
 DO NOT document about the development cycles. If an initial implementation A is changed to B, DONT document "B is implemented, rather than A". You should ONLY document the current version (B) of the code.
@@ -97,5 +105,6 @@ DO NOT trigger figure generation after every model fit completion, it should be 
 - Titles must be wrapped by `textwrap` with suitable width to prevent the title from exceeding boundaries, and title should be kept away from the main figure with at least one line's gap.
 - Print a message after saving a figure, pointing to its file path. If a group of images are plotted, please ONLY print ONE message pointing to their common folder. 
 - Proper units should be added to the x and y axes if applicable. (DONT add units if no unit)
+-  When the figure components have some semantic relationships, e.g., two lines share the same input, while other 2 uses another input type; or the lines has a clear order (e.g., hidden size increases from 1 to 16), you should assign appropriate line / point types and styles (shape, colour, etc.) to reflect these relations rather than randomly assigning styles. Baseline components (e.g., input-independent baseline, naive model, constant prediction) should receive gray colour.
 
 While the plot layout may change across compaigns (e.g., different axis definitions, different number of panels, additional shaded areas, change of line style), the overall figure style (font size, legend position, colours used) should be consistent unless explicitly allowed to change. To that said -- all compaign's plotting codes should inherit from shared plotting modules rather than writing completely fresh modules.
