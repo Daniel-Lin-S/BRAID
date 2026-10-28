@@ -37,11 +37,10 @@ from experiments.visualization.multisession import (
 SIZES = (0, 1, 2, 4, 8, 16)
 FIT_SIZES = SIZES[1:]
 COLORS = (
-    "#222222", "#2878b5", "#e28528",
-    "#339966", "#a04fa3", "#ad5b38",
+    "#555555", "#9ecae1", "#6baed6",
+    "#4292c6", "#2171b5", "#084594",
 )
-LINE_STYLES = ("-", "--", "-.", ":", "-", "--")
-MARKERS = ("o", "s", "^", "D", "v", "P")
+MARKER_SIZES = (7.0, 7.0, 8.0, 9.0, 10.0, 11.0)
 METRICS = ("cc", "r2", "mse_ratio")
 FIGURE_SIZE = (15, 11)
 DPI = 180
@@ -165,8 +164,9 @@ def figures(summary: list[dict], directory: Path) -> None:
                         plot_line(
                             x=COUNTS, y=values, ax=axis,
                             color=COLORS[index],
-                            linestyle=LINE_STYLES[index],
-                            marker=MARKERS[index],
+                            linestyle="--" if size == 0 else "-",
+                            marker="x" if size == 0 else "o",
+                            markersize=MARKER_SIZES[index],
                             label=f"n3={size}",
                         )
                     axis.set_xscale("log", base=2)
