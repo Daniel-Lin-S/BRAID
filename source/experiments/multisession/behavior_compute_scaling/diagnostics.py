@@ -13,7 +13,6 @@ import argparse
 import csv
 import json
 from pathlib import Path
-from textwrap import fill
 
 import matplotlib
 matplotlib.use("Agg")
@@ -29,15 +28,12 @@ from experiments.multisession.data import SAMPLE_RATE
 from experiments.multisession.store import completed, job
 from experiments.storage.cache import atomic_json, fingerprint
 from experiments.visualization.multisession import (
-    ANNOTATION_FONT_SIZE, DEFAULT_LINE_WIDTH, READABLE_TEXT_STYLE,
-    plot_line,
+    DEFAULT_LINE_WIDTH, READABLE_TEXT_STYLE, plot_line,
 )
 
 HORIZONS = (1, 2, 4, 8)
 SINGLE_SIZE = (10, 6)
-PANEL_SIZE = (14, 11)
-TITLE_WIDTH = 54
-NOTE_WIDTH = 100
+PANEL_SIZE = (14, 10)
 DPI = 180
 MILLISECONDS_PER_SECOND = 1000
 RATIO_PADDING = 0.02
@@ -46,27 +42,48 @@ BLUE = "#2878b5"
 ORANGE = "#e28528"
 GREEN = "#339966"
 LINE_STYLES = ("-", "--", "-.", ":")
-RATIO_NOTE = (
-    "Y-axis focuses on observed MSE/dummy values. Dummy is 1 and may "
-    "fall outside the displayed range; values above 1 are worse."
-)
-ENDPOINT_NOTE = (
-    "Largest completed budget: 800 updates (4/8/16 sessions), "
-    "1600 (33 sessions); 6400 draws per recording per recurrent stage. "
-    "The outer holdout also selects transfer checkpoints; selected scores "
-    "are descriptive. One seed; no uncertainty estimate. "
-    + RATIO_NOTE
-)
-COMPUTE_NOTE = (
-    "Five completed budgets per source count. The same outer holdout "
-    "selects transfer checkpoints; selected scores are descriptive. "
-    "One seed; no uncertainty estimate. "
-    + RATIO_NOTE
-)
 BASELINE_RATIO = 1.0
 Y_AXIS_ORIGIN = 0.0
 DUMMY_REFERENCE_COLOR = "#333333"
-BASELINE_LABEL = "MSE / dummy MSE"
+BASELINE_LABEL = "Neural MSE / dummy MSE"
+FIGURE_GUIDE = """# Neural source-scaling diagnostics
+
+All five figures score predictions of the **smoothed spike-count signal**
+after per-recording centering and scaling fitted on source training windows.
+They do not score only the behavior-related neural variation. The full
+forecast adds the RNN1 neural readout to the RNN2 residual prediction and
+compares that sum with the normalized neural signal.
+
+For each forecast horizon, MSE averages squared error over valid time points
+and retained neural channels within a window, then averages windows within
+each of the four common recordings and averages those recordings equally.
+The dummy predicts the per-channel mean of that recording's source training
+target, evaluated on the **same windows** as the model. Each plotted ratio
+divides the mean model MSE by the matching mean dummy MSE. Figures spanning
+four horizons sum the four horizon MSEs before division. The dummy is 1;
+ratios above 1 are valid and mean that the model is worse than the dummy.
+Axes focus on the observed range, so the line at 1 may be outside the view.
+
+- `neural_loss_by_horizon.png`: Full forecast on the fixed outer
+  chronological test windows, separately at 50, 100, 200 and 400 ms.
+- `neural_readout_and_combined_loss.png`: Outer-test readout alone and full
+  forecast, both scored against the same normalized neural target.
+- `neural_generalization.png`: Full forecast re-evaluated on training,
+  inner-validation and outer-test windows of the same four recordings.
+  Each split has its own dummy MSE, so ratios across splits need not
+  order like raw MSEs.
+- `neural_session_scaling.png`: Outer-test full forecast, one line
+  for each common recording.
+- `source_neural_readout.png`: Outer-test readout ratio at five
+  completed compute budgets; squares mark transfer-selected budgets.
+
+The first four figures use each count's largest original completed budget:
+800 recurrent updates for 4, 8 and 16 source sessions, and 1600 for 33.
+Balanced sampling gave 6400 draws per recording per recurrent stage. The
+outer test windows are the same 87 windows across source counts. These plots
+use one seed and show no uncertainty interval. The outer holdout also selects
+transfer checkpoints; scores at selected checkpoints are descriptive.
+"""
 
 
 def read_rows(path: Path) -> list[dict]:
@@ -166,20 +183,29 @@ def configure_axis(axis: object) -> None:
 
 
 def finish_figure(
-    figure: object, path: Path, title: str,
-    legend: bool = False, note: str = ENDPOINT_NOTE,
+    figure: object, path: Path, title: str, subtitle: str,
+    legend: bool = False,
 ) -> None:
-    """Save one endpoint view with readable title and selection disclosure."""
-    figure.suptitle(fill(title, TITLE_WIDTH), y=0.99)
+    """Save a compact diagnostic view with an explicit target subtitle."""
+    figure.suptitle(title, fontsize=24, y=0.98)
     figure.text(
-        0.04, 0.02, fill(note, NOTE_WIDTH),
-        fontsize=ANNOTATION_FONT_SIZE, va="bottom",
+        0.5, 0.915, subtitle, fontsize=15,
+        ha="center", va="center",
     )
     if legend:
         figure.axes[0].legend(
             loc="upper left", bbox_to_anchor=(1.02, 1), frameon=False,
         )
-    figure.tight_layout(rect=(0, 0.18, 1, 0.91))
+    if len(figure.axes) == len(HORIZONS):
+        figure.subplots_adjust(
+            left=0.09, right=0.98, top=0.79, bottom=0.10,
+            hspace=0.48, wspace=0.30,
+        )
+    else:
+        figure.subplots_adjust(
+            left=0.14, right=0.65 if legend else 0.96,
+            top=0.81, bottom=0.18,
+        )
     figure.savefig(path, dpi=DPI, bbox_inches="tight")
     plt.close(figure)
 
@@ -198,15 +224,16 @@ def endpoint_figures(
         plot_line(x=COUNTS, y=values, ax=axis, color=BLUE, marker="o")
         configure_axis(axis)
         milliseconds = horizon * MILLISECONDS_PER_SECOND / SAMPLE_RATE
-        axis.set_title(f"Horizon {horizon} ({milliseconds:g} ms)", pad=22)
+        axis.set_title(f"{milliseconds:g} ms (h={horizon})", pad=10)
     finish_figure(
         figure, out / "neural_loss_by_horizon.png",
-        "Combined neural prediction: source scaling by horizon",
+        "Full neural forecast by horizon",
+        "Smoothed, train-normalized spike counts; 87 shared test windows",
     )
     figure, axis = plt.subplots(figsize=SINGLE_SIZE)
     for column, label, color, style in (
-        ("mean_readout_loss", "RNN1 neural readout", ORANGE, "--"),
-        ("mean_combined_loss", "Readout + RNN2", BLUE, "-"),
+        ("mean_readout_loss", "RNN1 readout", ORANGE, "--"),
+        ("mean_combined_loss", "Readout + RNN2 residual", BLUE, "-"),
     ):
         plot_line(
             x=COUNTS, y=ratio_curve(summary, {"role": "outer_test"}, column),
@@ -215,14 +242,15 @@ def endpoint_figures(
     configure_axis(axis)
     finish_figure(
         figure, out / "neural_readout_and_combined_loss.png",
-        "Neural readout versus combined prediction on the outer holdout",
+        "Neural readout versus full forecast",
+        "Outer test; smoothed, train-normalized spike counts",
         legend=True,
     )
     figure, axis = plt.subplots(figsize=SINGLE_SIZE)
     for role, label, color, style in (
-        ("training", "Training", BLUE, "-"),
+        ("training", "Training windows", BLUE, "-"),
         ("inner_validation", "Inner validation", GREEN, "--"),
-        ("outer_test", "Outer test", ORANGE, "-."),
+        ("outer_test", "Outer chronological test", ORANGE, "-."),
     ):
         plot_line(
             x=COUNTS,
@@ -232,7 +260,8 @@ def endpoint_figures(
     configure_axis(axis)
     finish_figure(
         figure, out / "neural_generalization.png",
-        "Training and holdout losses on the same four source recordings",
+        "Full neural forecast by data split",
+        "Smoothed, train-normalized spike counts; dummy scored per split",
         legend=True,
     )
     names = sorted({row["session"] for row in sessions})
@@ -250,7 +279,8 @@ def endpoint_figures(
     configure_axis(axis)
     finish_figure(
         figure, out / "neural_session_scaling.png",
-        "Outer-holdout neural prediction for each common recording",
+        "Full neural forecast by recording",
+        "Outer chronological test; same four recordings at every count",
         legend=True,
     )
 
@@ -329,8 +359,9 @@ def readout_compute_figures(
     ratio_axis(axis)
     finish_figure(
         figure, out / "source_neural_readout.png",
-        "Neural readout versus full-pipeline training FLOPs",
-        legend=True, note=COMPUTE_NOTE,
+        "Neural readout versus training compute",
+        "Outer test; squares mark transfer-selected checkpoints",
+        legend=True,
     )
 
 def publish(report: Path, diagnostics: Path) -> Path:
@@ -362,8 +393,8 @@ def publish(report: Path, diagnostics: Path) -> Path:
         row["transfer_selected"] = row["transfer_selected"] == "True"
     identity = dict(
         group="source_neural_diagnostics", inputs=inputs,
-        rendering=RENDERING_STYLE, endpoint_note=ENDPOINT_NOTE,
-        compute_note=COMPUTE_NOTE, baseline_axis=dict(
+        rendering=RENDERING_STYLE, guide=FIGURE_GUIDE,
+        baseline_axis=dict(
             measure=BASELINE_LABEL,
             reference=BASELINE_RATIO,
             focus_padding=RATIO_PADDING,
@@ -381,6 +412,7 @@ def publish(report: Path, diagnostics: Path) -> Path:
             atomic_json(destination / "input_references.json", inputs)
             endpoint_figures(summary, sessions, figures)
             readout_compute_figures(source, source_sessions, figures)
+            (destination / "figure_guide.md").write_text(FIGURE_GUIDE)
     atomic_json(report.parent.parent / "latest_diagnostics.json", dict(
         snapshot=str(destination.resolve()), identity=fingerprint(identity),
     ))
