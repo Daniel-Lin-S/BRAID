@@ -14,6 +14,14 @@ If the failure in one experiment is not fatal (definitely affects the following 
 
 NEVER retrain a model on a data / fold / session that already have completion records under the same configurations. (changines in invocation parameters like number of GPU/CPUs used should NOT restart already completed experiments)
 
+## Repository structure
+
+Please place files in dedicated modules. 
+
+NEVER stack flat files under the repository root or a module root. Create appropriate modules or submodules (or subfolders).
+
+If a root / module has over 10 files, then you may need to examine whether breaking into subfolders is required. (this is not hard limit, there are situations where large number of files are required, e.g., in a data root with dozens of mat files belonging to different recordings, no appropriate partition exists)
+
 ## Documentation
 
 DO NOT document about the development cycles. If an initial implementation A is changed to B, DONT document "B is implemented, rather than A". You should ONLY document the current version (B) of the code.
@@ -24,7 +32,9 @@ DO NOT overwhelm documentations at public interfaces (shell scripts, major funct
 
 ## Constraints
 
-NEVER directly remove or modify a previous completed run artifacts. Appending to an incomplete run directory is allowed, but NOT modifying previous rows.
+NEVER directly remove or modify a previous completed model fit artifacts (checkpoints, csv result tables, etc.). Appending to an incomplete run directory is allowed, but NOT modifying previous rows.
+
+- But modifying comparison figures and tables are allowed.
 
 NEVER reveal local paths (e.g., model checkpoints, dataset paths) in files tracked by GitHub.
 
@@ -40,6 +50,9 @@ Whenever you are asked to launch a compaign of experiments, please detach and le
 For the CPU tasks, lower-priority should be assigned to avoid the laucnhed python programme interfering with the server's core operational programmes.
 
 You should parallelise independent neural fits whenever possible. Independent experiments should ALWAYS be launched without waiting other (or even a single stage of ) irrelevant experiments to finish.
+
+- If there are multiple levels of parallelisms possible, select a level that doesn't create expensive cross-device communication overhead (e.g., if you assign batches across GPUs, this may have overhead)
+- Ensure that you select the minimal level permitted by task independence that doesn't create communication overhead to maximise GPU usage and avoid a single bottleneck holding the entire compaign (e.g., multi-session experiment with weight sharing cannot be parallised at session-level, but session-independent model fitting experiments can)
 
 For multi-stage experiment with cross-stage dependencies, DONT parallelise.
 
@@ -59,7 +72,12 @@ ALWAYS ensure that a compaign launch does NOT restart already fitted models with
 
 The `logs` folder in this repository should ONLY record launch status, logs, failure records, etc. The disk space usage of `logs` should be kept minimal. The actual model fits, checkpoints, result figures, tables, should be saved in a separate artifact root specified by the user. If you are not sure about the artifact and log structure, always ASK ME rather than guesswork.
 
-In saved artifacts, reusable model fits and checkpoints should be placed in separate folders, identified by the run hash. This is to ensure that a new compaign including some already fitted models does NOT restart repeated experiments on the already completed model fits.
+- Assign one log folder to each compaign, named by readable name + launch time. NEVER squash all log files under the root `logs`
+- The purpose of the log is the clearly show the lifecycle (number of experiment finished, numbers remaining, numbers failed, etc.), make it clear what the compaign is currently doing, and record information on the failures. DONT include too many irrelevant information. 
+- I recommend including a static file `status.json` with finished/pending/total/failure (etc.) job counts that updates as the experiment progresses for lifecycle tracking, and the current experiment status.
+- The diskspcae usage of log files should be kept minimal.
+
+In saved artifacts, reusable model fits and checkpoints should be placed in separate folders, identified by the run hash (with a short readable prefix, for example, at least specifying the model name). This is to ensure that a new compaign including some already fitted models does NOT restart repeated experiments on the already completed model fits.
 
 Within the artifact root of a compaign, you should NOT save the same information twice. e.g., write new results in a new file with previous results copied.
 
@@ -69,10 +87,12 @@ DO NOT trigger figure generation after every model fit completion, it should be 
 
 ## Plotting
 
+- Font sizes must be LARGE and READABLE. This includes ALL texts on the figure (legend, axis ticks, title, etc.) You can use relatively smaller font sizes for minor labels like axis ticks, but they must still remain READABLE.
 - use `seaborn` whenever possible rather than `matplotib`
 - Scatter plots: set `set_xlim` and (or) `set_ylim` to focus on the main data range.
 - Use lines thicker than default, but not too thick that distracts the main data.
 - Use `bbox_to_anchor` and `loc'`  to ensure legends are not overlapping with the main figure, not going beyond figure. Legends should have no frame: `frameon=False`.
+- DONT leave large gap between title and the main figure.
 - Figures should be coloured, but figure legends and labels should make sense even in black-and-white prints. (for example, use different line types or hatches)
 - Titles must be wrapped by `textwrap` with suitable width to prevent the title from exceeding boundaries, and title should be kept away from the main figure with at least one line's gap.
 - Print a message after saving a figure, pointing to its file path. If a group of images are plotted, please ONLY print ONE message pointing to their common folder. 
