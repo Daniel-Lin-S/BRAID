@@ -204,10 +204,15 @@ def target_scale(record: dict) -> Scale:
     return scale
 
 
-def selected_forecasts(source: dict, windows: dict) -> list[np.ndarray]:
-    """Restore RNN1 and forecast four common test recordings."""
+def recorded_forecasts(
+    source: dict, partitions: list[dict],
+    devices: tuple[str, str] | None = None,
+) -> list[np.ndarray]:
+    """Restore RNN1 and forecast recorded-Z normalized session windows."""
     spec = source["spec"]
     names = spec["sessions"]
+    if not partitions or len(partitions) > len(names):
+        raise ValueError("Expected nonempty ordered source partitions.")
     dimensions = [
         (sum(source["inventory"][name]["scales"]["Y"]["keep"]),
          len(COORDINATE_NAMES))
@@ -215,30 +220,25 @@ def selected_forecasts(source: dict, windows: dict) -> list[np.ndarray]:
     ]
     model = MixedForecaster(
         dimensions, spec["latent"], "A", spec["seed"] + 2,
-        decoder_width=64,
+        decoder_width=64, session_devices=devices,
     )
     component = source["path"]["stages"]["behavior_relevant"]["component_id"]
     root = source["fit"].parent.parent / "source_components"
     restore_component(model, root / component)
-    common = names[:COMMON_SESSION_COUNT]
-    input_data = [
-        recurrent_data(windows[name]["test"], "Z") for name in common
-    ]
+    input_data = [recurrent_data(row, "Z") for row in partitions]
     predicted, _ = stage_predictions(model, input_data)
     preprocessing = json.loads(
         (source["fit"] / "preprocessing.json").read_text()
     )
     scales = preprocessing["scales"]
     if len(scales) != source["count"]:
-        raise ValueError("Generated target scales do not match source count.")
+        raise ValueError("Generated behavior target scales do not match count.")
     forecasts = [
         target_scale(scales[index]).inverse(value)
         for index, value in enumerate(predicted)
     ]
-    for name, value in zip(common, forecasts):
-        expected = (
-            len(HORIZONS), *windows[name]["test"]["Z"].shape
-        )
+    for name, row, value in zip(names, partitions, forecasts):
+        expected = (len(HORIZONS), *row["Z"].shape)
         if value.shape != expected or not np.isfinite(value).all():
             raise ValueError(
                 f"Expected finite forecast shape {expected} for {name}, "
@@ -246,6 +246,14 @@ def selected_forecasts(source: dict, windows: dict) -> list[np.ndarray]:
             )
     tf.keras.backend.clear_session()
     return forecasts
+
+
+def selected_forecasts(source: dict, windows: dict) -> list[np.ndarray]:
+    """Forecast the four common chronological source test recordings."""
+    names = source["spec"]["sessions"][:COMMON_SESSION_COUNT]
+    return recorded_forecasts(
+        source, [windows[name]["test"] for name in names]
+    )
 
 
 def session_scores(
@@ -351,7 +359,14 @@ def focus_axis(axis: object, values: list[float], metric: str) -> None:
 
 
 @plt.rc_context(READABLE_TEXT_STYLE)
-def figures(summary: list[dict], directory: Path) -> None:
+def figures(
+    summary: list[dict], directory: Path,
+    subtitle: str = (
+        "Transfer-selected RNN1; four common chronological test sets"
+    ),
+    title_prefix: str = "Recorded behavior decoding",
+    compact: bool = False,
+) -> None:
     """Draw one panel per trained horizon for three behavior metrics."""
     for metric, label in METRIC_LABELS.items():
         figure, axes = plt.subplots(2, 2, figsize=FIGURE_SIZE)
@@ -383,18 +398,21 @@ def figures(summary: list[dict], directory: Path) -> None:
         handles, labels = axes.flat[0].get_legend_handles_labels()
         figure.legend(
             handles, labels, loc="upper center",
-            bbox_to_anchor=(0.5, 0.87), ncol=2, frameon=False,
+            bbox_to_anchor=(0.5, 0.90 if compact else 0.87),
+            ncol=2, frameon=False,
         )
         figure.suptitle(
-            f"Recorded behavior decoding: {label}", fontsize=23, y=0.98,
+            f"{title_prefix}: {label}",
+            fontsize=23, y=0.99 if compact else 0.98,
         )
         figure.text(
-            0.5, 0.92,
-            "Transfer-selected RNN1; four common chronological test sets",
+            0.5, 0.945 if compact else 0.92,
+            subtitle,
             fontsize=15, ha="center", va="center",
         )
         figure.subplots_adjust(
-            left=0.10, right=0.97, top=0.78, bottom=0.10,
+            left=0.10, right=0.97,
+            top=0.82 if compact else 0.78, bottom=0.10,
             hspace=0.47, wspace=0.31,
         )
         figure.savefig(
