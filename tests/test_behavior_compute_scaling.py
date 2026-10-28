@@ -320,7 +320,7 @@ def test_fixed_stage_stopping_restores_best_and_counts_all_work(
     tmp_path, monkeypatch,
 ) -> None:
     """A known loss sequence selects the best state but charges later work."""
-    from experiments.multisession.behavior_compute_scaling import training
+    from experiments.multisession.compute_scaling import training
 
     losses = iter([3.0, 2.0, 4.0, 5.0])
     monkeypatch.setattr(training, "evaluate_sessions", lambda model, data: (
