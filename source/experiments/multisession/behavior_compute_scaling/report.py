@@ -62,9 +62,10 @@ neural readout. Each stage's test loss sums squared error over the trained
 source recordings on their 87 chronological outer-test windows.
 RNN2's source panel includes the matched RNN1 neural readout prior plus
 RNN2's residual; full neural metrics appear in the performance report.
-Each x value includes training FLOPs for RNN1, its matched fixed-stage readout and RNN2 through
-that checkpoint. The same holdout selects the matched checkpoint by the
-sum of RNN1 and RNN2 dummy-normalized losses; selected scores are descriptive.
+Each x value includes training FLOPs for RNN1, its matched fixed-stage
+readout and RNN2 through that checkpoint. The same holdout selects the
+matched checkpoint by the sum of RNN1 and RNN2 dummy-normalized losses.
+Selected scores are descriptive.
 """
 
 

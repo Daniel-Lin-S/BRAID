@@ -1,13 +1,11 @@
-"""Build matched behavioral source paths and score the fixed source holdout.
+"""Fit matched behavioral source paths and score the fixed holdout.
 
-Inputs are normalized training, inner-validation and chronological-test
-windows for nested Indy sessions. Optional generated-target preprocessing is
-shared by all recurrent budgets within a source count; each RNN1 branch has its own fixed
-readout and matched RNN2 branch. Immutable segments live in source_components.
-The source fit stores data.json (indices/scales), budgets.json (component
-references, losses,
-exposure and FLOPs), selection.json (outer-holdout selection) and shared.pkl
-(selected transferable weights). Generated mode also stores preprocessing.json.
+Inputs are normalized train, inner-validation, and chronological-test windows
+for nested Indy sessions. Generated-target preprocessing is shared across
+budgets; each RNN1 branch has a matched readout and RNN2 branch. Immutable
+segments live in source_components. A source fit stores split/scaling records,
+component paths, losses, exposure, FLOPs, selection, and transferable weights.
+Generated mode also stores preprocessing and target-scaling records.
 """
 
 from pathlib import Path
