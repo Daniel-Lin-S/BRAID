@@ -37,6 +37,7 @@ PANEL_SIZE = (14, 10)
 DPI = 180
 MILLISECONDS_PER_SECOND = 1000
 RATIO_PADDING = 0.02
+MSE_PADDING = 0.02
 RELATIVE_PADDING = 0.10
 BLUE = "#2878b5"
 ORANGE = "#e28528"
@@ -58,20 +59,21 @@ For each forecast horizon, MSE averages squared error over valid time points
 and retained neural channels within a window, then averages windows within
 each of the four common recordings and averages those recordings equally.
 The dummy predicts the per-channel mean of that recording's source training
-target, evaluated on the **same windows** as the model. Each plotted ratio
-divides the mean model MSE by the matching mean dummy MSE. Figures spanning
-four horizons sum the four horizon MSEs before division. The dummy is 1;
-ratios above 1 are valid and mean that the model is worse than the dummy.
-Axes focus on the observed range, so the line at 1 may be outside the view.
+target, evaluated on the **same windows** as the model. Four figures show
+model MSE divided by matching dummy MSE; the generalization figure shows
+raw model MSE. The dummy-normalized figures spanning four horizons sum
+horizon MSEs before division. The dummy is 1; ratios above 1 are valid
+and mean that the model is worse than the dummy. Axes focus on the
+observed range, so the line at 1 may be outside the view.
 
-- `neural_loss_by_horizon.png`: Full forecast on the fixed outer
-  chronological test windows, separately at 50, 100, 200 and 400 ms.
+- `neural_loss_by_horizon.png`: RNN1 neural readout plus RNN2 residual
+  correction on the fixed outer chronological test windows, separately
+  at 50, 100, 200 and 400 ms.
 - `neural_readout_and_combined_loss.png`: Outer-test readout alone and full
   forecast, both scored against the same normalized neural target.
-- `neural_generalization.png`: Full forecast re-evaluated on training,
-  inner-validation and outer-test windows of the same four recordings.
-  Each split has its own dummy MSE, so ratios across splits need not
-  order like raw MSEs.
+- `neural_generalization.png`: Raw full-forecast MSE summed across
+  four horizons, re-evaluated on training, inner-validation and
+  outer-test windows of the same four recordings.
 - `neural_session_scaling.png`: Outer-test full forecast, one line
   for each common recording.
 - `source_neural_readout.png`: Outer-test readout ratio at five
@@ -145,23 +147,27 @@ def ratio_curve(
     return ratio.tolist()
 
 
-def ratio_axis(axis: object) -> None:
-    """Focus on observed ratios while retaining above-dummy outcomes."""
+def observed_limits(axis: object, minimum_padding: float) -> tuple:
+    """Find finite positive plotted values and a focused linear range."""
     values = np.asarray([
         value for line in axis.lines for value in line.get_ydata()
     ], dtype=float)
     if not values.size or not np.isfinite(values).all():
-        raise ValueError("Ratio plot requires finite nonempty values.")
+        raise ValueError("Loss plot requires finite nonempty values.")
     if np.any(values <= 0):
-        raise ValueError("Ratio plot requires positive model MSE ratios.")
+        raise ValueError("Loss plot requires positive MSE values.")
     smallest, largest = float(values.min()), float(values.max())
     padding = max(
-        RATIO_PADDING, (largest - smallest) * RELATIVE_PADDING
+        minimum_padding, (largest - smallest) * RELATIVE_PADDING
     )
-    lower = max(Y_AXIS_ORIGIN, smallest - padding)
-    upper = largest + padding
-    if largest > BASELINE_RATIO:
-        lower = min(lower, BASELINE_RATIO)
+    return max(Y_AXIS_ORIGIN, smallest - padding), largest + padding
+
+
+def ratio_axis(axis: object) -> None:
+    """Focus on observed ratios while retaining above-dummy outcomes."""
+    lower, upper = observed_limits(axis, RATIO_PADDING)
+    if upper > BASELINE_RATIO and lower > BASELINE_RATIO:
+        lower = BASELINE_RATIO
     axis.set_yscale("linear")
     axis.set_ylim(lower, upper)
     if lower <= BASELINE_RATIO <= upper:
@@ -173,13 +179,24 @@ def ratio_axis(axis: object) -> None:
     axis.grid(alpha=0.2)
 
 
-def configure_axis(axis: object) -> None:
-    """Use source-count ticks and the shared dummy-anchored MSE scale."""
+def mse_axis(axis: object) -> None:
+    """Display the four-horizon neural MSE on its original linear scale."""
+    axis.set_yscale("linear")
+    axis.set_ylim(*observed_limits(axis, MSE_PADDING))
+    axis.set_ylabel("Neural MSE, four-horizon sum")
+    axis.grid(alpha=0.2)
+
+
+def configure_axis(axis: object, normalized: bool = True) -> None:
+    """Set source-count ticks and the requested neural-loss measure."""
     axis.set_xscale("log", base=2)
     axis.set_xticks(COUNTS, labels=[str(count) for count in COUNTS])
     axis.set_xlim(min(COUNTS) / 1.08, max(COUNTS) * 1.08)
     axis.set_xlabel("Source sessions")
-    ratio_axis(axis)
+    if normalized:
+        ratio_axis(axis)
+    else:
+        mse_axis(axis)
 
 
 def finish_figure(
@@ -228,7 +245,7 @@ def endpoint_figures(
     finish_figure(
         figure, out / "neural_loss_by_horizon.png",
         "Full neural forecast by horizon",
-        "Smoothed, train-normalized spike counts; 87 shared test windows",
+        "Smoothed spikes; RNN1 readout + RNN2 residual; 87 test windows",
     )
     figure, axis = plt.subplots(figsize=SINGLE_SIZE)
     for column, label, color, style in (
@@ -254,14 +271,14 @@ def endpoint_figures(
     ):
         plot_line(
             x=COUNTS,
-            y=ratio_curve(summary, {"role": role}, "mean_combined_loss"),
+            y=loss_curve(summary, {"role": role}, "mean_combined_loss"),
             ax=axis, color=color, linestyle=style, marker="o", label=label,
         )
-    configure_axis(axis)
+    configure_axis(axis, normalized=False)
     finish_figure(
         figure, out / "neural_generalization.png",
         "Full neural forecast by data split",
-        "Smoothed, train-normalized spike counts; dummy scored per split",
+        "Raw MSE on smoothed, train-normalized spike counts",
         legend=True,
     )
     names = sorted({row["session"] for row in sessions})
@@ -401,6 +418,10 @@ def publish(report: Path, diagnostics: Path) -> Path:
             relative_padding=RELATIVE_PADDING,
             includes_reference_if_model_is_worse_than_dummy=True,
             dummy="constant training-target mean on the matching windows",
+        ),
+        generalization_axis=dict(
+            measure="Neural MSE, four-horizon sum",
+            focus_padding=MSE_PADDING,
         ),
         figures=["horizon", "readout", "generalization", "session", "compute"],
     )
