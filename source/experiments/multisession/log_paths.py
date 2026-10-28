@@ -73,3 +73,18 @@ def job_log_path(launch: Path, key: str, spec: dict) -> Path:
     if spec["kind"] != "source":
         path /= spec["session"]
     return path / f"{job_label(key, spec)}.log"
+
+
+def source_session_log_path(
+    launch: Path, source_count: int, session: str,
+    component: str, size: int,
+) -> Path:
+    """Nest one source-session component log under its recording."""
+    if source_count <= 0 or size <= 0 or not session or not component:
+        raise ValueError("Source session log identity is incomplete.")
+    if "/" in session or ".." in session:
+        raise ValueError(f"Invalid source session log name: {session}.")
+    return (
+        launch / JOB_DIRECTORY / "source_n3" / session
+        / f"sources{source_count}_n3{size}__{component}.log"
+    )

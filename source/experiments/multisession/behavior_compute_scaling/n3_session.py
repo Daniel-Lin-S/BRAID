@@ -4,12 +4,11 @@ Usage: python -m experiments.multisession.behavior_compute_scaling.n3_session
   --stage audit|launch|worker|coordinator|report --plan ABSOLUTE_PLAN
   --source-report ABSOLUTE_REPORT [--count N --session-index I]
 
-Inputs are four checksum-valid selected source checkpoints and the four common
-recordings per count. Sixteen independent n3 fits live in the common source
-component store. The launch status records per-session update, validation,
-completion and failure. Once every fit completes, one immutable report under
-the existing analysis root contains behavioral tables and the n3-only and
-paired comparison figures.
+Inputs are selected source checkpoints and the four common recordings per
+count. Each private n3 fit lives in the common source component store. The
+launch status records lifecycle totals; per-session progress is nested under
+jobs/source_n3/. The standalone n3=1 report contains behavioral tables and
+figures.
 """
 
 import argparse
@@ -38,6 +37,7 @@ from experiments.multisession.behavior_compute_scaling.training import (
     optimizer_groups, validation_due,
 )
 from experiments.multisession.data import session_windows, source_features
+from experiments.multisession.log_paths import source_session_log_path
 from experiments.multisession.plan import analysis_directory
 from experiments.multisession.reports import write_table
 from experiments.multisession.runner import dataset
@@ -139,10 +139,13 @@ def session_seed(source: dict, index: int) -> int:
 def session_model(
     source: dict, index: int,
     device: tuple[str, str] | None = None,
+    size: int = N3_SIZE,
 ) -> MixedForecaster:
-    """Build one U-only additive n3 state of width one."""
+    """Build one U-only additive n3 state of the requested width."""
+    if size <= 0:
+        raise ValueError(f"n3 size must be positive, got {size}.")
     return MixedForecaster(
-        [(0, BEHAVIOR_WIDTH)], N3_SIZE, "none",
+        [(0, BEHAVIOR_WIDTH)], size, "none",
         session_seed(source, index), decoder_width=N3_DECODER_WIDTH,
         input_dimensions=[TASK_WIDTH],
         forward_dimensions=TASK_WIDTH,
@@ -161,7 +164,9 @@ def source_component(source: dict) -> Path:
     return path
 
 
-def identity(source: dict, index: int) -> dict:
+def identity(
+    source: dict, index: int, size: int = N3_SIZE,
+) -> dict:
     """Identify one scientific n3 fit without runtime GPU metadata."""
     name = session_name(source, index)
     upstream = source_component(source)
@@ -178,17 +183,19 @@ def identity(source: dict, index: int) -> dict:
         generated_scales_checksum=file_digest(
             source["fit"] / "preprocessing.json"
         ),
-        latent=N3_SIZE, decoder_width=N3_DECODER_WIDTH,
+        latent=size, decoder_width=N3_DECODER_WIDTH,
         sharing="none", input="U", output="recorded_Z_residual",
         seed=session_seed(source, index), horizons=HORIZONS,
         source_training=session_settings(source),
     )
 
 
-def directory(source: dict, index: int) -> Path:
+def directory(
+    source: dict, index: int, size: int = N3_SIZE,
+) -> Path:
     """Resolve one immutable fit path without fitting it."""
     scientific = dict(
-        identity(source, index), start=0,
+        identity(source, index, size), start=0,
         stop=session_settings(source)["fixed_update_cap"],
         branch=False, parent=None, parent_checksums=None,
         fixed_stage=True,
@@ -265,9 +272,10 @@ def base_forecast(
 
 def fit_one(
     plan: dict, source: dict, index: int, microbatch: int,
+    size: int = N3_SIZE,
 ) -> Path:
     """Fit or reuse one independently selected n3 session checkpoint."""
-    target = directory(source, index)
+    target = directory(source, index, size)
     if completed(target) is not None:
         return target
     train, inner = windows(plan, source, index)
@@ -277,11 +285,14 @@ def fit_one(
     validation = n3_addon.post_data(
         [inner], [base_forecast(source, index, inner)]
     )
-    model = session_model(source, index, ("/GPU:0", "/GPU:0"))
+    model = session_model(
+        source, index, ("/GPU:0", "/GPU:0"), size
+    )
     settings = session_settings(source)
     result, _ = fit_segment(
         model, training, n3_addon.component_root(source),
-        identity(source, index), settings, session_seed(source, index),
+        identity(source, index, size), settings,
+        session_seed(source, index),
         0, settings["fixed_update_cap"], None,
         ("/GPU:0", "/GPU:0"), microbatch,
         validation=validation,
@@ -293,6 +304,7 @@ def fit_one(
 
 def audit(
     plan: dict, source: dict, index: int, microbatch: int,
+    size: int = N3_SIZE,
 ) -> dict:
     """Time three updates and validation without persisting audit artifacts."""
     start = time.monotonic()
@@ -305,7 +317,9 @@ def audit(
     )
     prepared = time.monotonic()
     settings = session_settings(source)
-    model = session_model(source, index, ("/GPU:0", "/GPU:0"))
+    model = session_model(
+        source, index, ("/GPU:0", "/GPU:0"), size
+    )
     optimizers = optimizer_groups(model, settings)
     rng = np.random.default_rng(session_seed(source, index))
     functions = [gradient_function(model, 0)]
@@ -327,11 +341,11 @@ def audit(
 
 def corrected(
     source: dict, index: int, partition: dict,
-    prior: np.ndarray,
+    prior: np.ndarray, size: int = N3_SIZE,
 ) -> np.ndarray:
     """Add one saved session's U-only n3 prediction to RNN1."""
-    model = session_model(source, index)
-    path = directory(source, index)
+    model = session_model(source, index, size=size)
+    path = directory(source, index, size)
     if completed(path) is None:
         raise ValueError(f"Incomplete n3 session component: {path}.")
     model.restore(load_pickle(path / "checkpoint.pkl")["weights"])
@@ -433,9 +447,9 @@ def publish(plan_path: Path, source_report: Path) -> Path:
     return destination
 
 
-def key(count: int, index: int) -> str:
+def key(count: int, index: int, size: int = N3_SIZE) -> str:
     """Return a stable launch-local member label."""
-    return f"{count}:{index}"
+    return f"{count}:{index}:n3_{size}"
 
 
 def log_progress(path: Path) -> dict:
@@ -458,31 +472,40 @@ def log_progress(path: Path) -> dict:
     return progress
 
 
-def member_record(source: dict, index: int) -> dict:
+def member_record(
+    source: dict, index: int, size: int = N3_SIZE,
+) -> dict:
     """Describe one session's independent fixed-stage fit."""
     return dict(
         state="pending", source_count=source["count"],
         session=session_name(source, index), session_index=index,
         update=0, cap=session_settings(source)["fixed_update_cap"],
-        component=directory(source, index).name,
+        component=directory(source, index, size).name,
+        n3_size=size,
     )
 
 
 def publish_status(launch: Path, members: dict, state: str) -> None:
-    """Write current per-session state and separate completion counts."""
+    """Write lifecycle totals separately from per-session progress."""
     counts = {
         value: sum(row["state"] == value for row in members.values())
         for value in ("pending", "running", "complete", "failed")
     }
+    progress = launch / "jobs" / "source_n3" / "progress.json"
+    progress.parent.mkdir(parents=True, exist_ok=True)
+    observed = datetime.now(timezone.utc).isoformat()
+    atomic_json(progress, dict(
+        members=members, observed_at_utc=observed,
+    ))
     atomic_json(launch / "status.json", dict(
-        state=state, members=members, counts=counts,
-        observed_at_utc=datetime.now(timezone.utc).isoformat(),
+        state=state, counts=counts, total=len(members),
+        observed_at_utc=observed,
     ))
 
 
 def worker_command(
     plan_path: Path, source_report: Path, count: int,
-    index: int, microbatch: int,
+    index: int, microbatch: int, size: int = N3_SIZE,
 ) -> list[str]:
     """Build one independent session worker invocation."""
     return [
@@ -492,35 +515,42 @@ def worker_command(
         "--source-report", str(source_report),
         "--count", str(count), "--session-index", str(index),
         "--microbatch", str(microbatch),
+        "--size", str(size),
     ]
 
 
 def coordinator(
     plan_path: Path, source_report: Path, launch: Path,
     devices: list[dict], microbatch: int,
+    sizes: tuple[int, ...] = (N3_SIZE,),
+    report_kind: str = "single",
 ) -> None:
     """Schedule independent sessions and report only full membership."""
     plan = json.loads(plan_path.read_text())
     selected = sources(plan, source_report)
+    if not sizes or len(set(sizes)) != len(sizes) or min(sizes) <= 0:
+        raise ValueError("Expected distinct positive n3 sizes.")
     tasks = [
-        (count, index)
+        (count, index, size)
         for count in COUNTS for index in range(COMMON_SESSIONS)
+        for size in sizes
     ]
-    tasks.sort(
-        key=lambda item: -session_settings(
-            selected[item[0]]
-        )["fixed_update_cap"]
-    )
+    tasks.sort(key=lambda item: (
+        -session_settings(selected[item[0]])["fixed_update_cap"],
+        -item[2],
+    ))
     members = {
-        key(count, index): member_record(selected[count], index)
-        for count, index in tasks
+        key(count, index, size): member_record(
+            selected[count], index, size
+        )
+        for count, index, size in tasks
     }
     pending = []
-    for count, index in tasks:
-        label = key(count, index)
-        path = directory(selected[count], index)
+    for count, index, size in tasks:
+        label = key(count, index, size)
+        path = directory(selected[count], index, size)
         if completed(path) is None:
-            pending.append((count, index))
+            pending.append((count, index, size))
         else:
             training = json.loads((path / "training.json").read_text())
             members[label].update(
@@ -537,30 +567,39 @@ def coordinator(
                 continue
             if device["free_memory_mib"] < MINIMUM_FREE_MIB:
                 continue
-            count, index = pending.pop(0)
-            label = key(count, index)
+            count, index, size = pending.pop(0)
+            label = key(count, index, size)
             env = dict(os.environ)
             env.update(thread_environment(WORKER_CPU_THREADS, 1))
             env["CUDA_VISIBLE_DEVICES"] = device["uuid"]
             env["TF_USE_LEGACY_KERAS"] = "1"
             env["PYTHONPATH"] = str(Path(__file__).resolve().parents[3])
             env["MPLCONFIGDIR"] = "/tmp/braid_n3_matplotlib"
-            log = launch / f"n3_{count}_session_{index}.log"
+            log = source_session_log_path(
+                launch, count, session_name(selected[count], index),
+                directory(selected[count], index, size).name, size,
+            )
+            log.parent.mkdir(parents=True, exist_ok=True)
             with log.open("a") as stream:
                 process = subprocess.Popen(
                     worker_command(
                         plan_path, source_report, count, index,
-                        microbatch,
+                        microbatch, size,
                     ),
                     env=env, stdout=stream,
                     stderr=subprocess.STDOUT,
                     preexec_fn=lambda: os.nice(LOW_CPU_PRIORITY),
                 )
-            active[slot] = (count, index, process, log, time.monotonic())
-            members[label].update(state="running", gpu_index=slot)
+            active[slot] = (
+                count, index, size, process, log, time.monotonic()
+            )
+            members[label].update(
+                state="running", gpu_index=slot,
+                log_path=str(log.resolve()),
+            )
         for slot, item in list(active.items()):
-            count, index, process, log, started = item
-            label = key(count, index)
+            count, index, size, process, log, started = item
+            label = key(count, index, size)
             members[label].update(log_progress(log))
             members[label]["elapsed_seconds"] = round(
                 time.monotonic() - started, 1
@@ -569,7 +608,7 @@ def coordinator(
             if code is None:
                 continue
             del active[slot]
-            path = directory(selected[count], index)
+            path = directory(selected[count], index, size)
             marker = completed(path) if code == 0 else None
             if marker is None:
                 members[label]["state"] = "failed"
@@ -589,7 +628,13 @@ def coordinator(
         publish_status(launch, members, "failed")
         return
     try:
-        report = publish(plan_path, source_report)
+        if report_kind == "single":
+            report = publish(plan_path, source_report)
+        elif report_kind == "sweep":
+            from .n3_sweep import publish as publish_sweep
+            report = publish_sweep(plan_path, source_report)
+        else:
+            raise ValueError(f"Unknown n3 report kind {report_kind}.")
     except Exception as error:
         publish_status(launch, members, "report_failed")
         atomic_json(launch / "report_error.json", dict(
@@ -602,6 +647,8 @@ def coordinator(
 
 def launch(
     plan_path: Path, source_report: Path, microbatch: int,
+    sizes: tuple[int, ...] = (N3_SIZE,),
+    report_kind: str = "single",
 ) -> Path:
     """Detach a session-granular queue on available GPUs."""
     plan = json.loads(plan_path.read_text())
@@ -614,12 +661,13 @@ def launch(
     launch_root = Path(__file__).resolve().parents[4]
     launch_root /= "logs/multi_session_training"
     now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    launch_dir = launch_root / f"n3_session_{now}_{os.getpid()}"
+    launch_dir = launch_root / f"n3_{report_kind}_{now}_{os.getpid()}"
     launch_dir.mkdir(parents=True)
     atomic_json(launch_dir / "launch.json", dict(
         plan=str(plan_path), source_report=str(source_report),
         devices=devices, microbatch=microbatch,
-        protocol=PROTOCOL,
+        protocol=PROTOCOL, sizes=list(sizes),
+        report_kind=report_kind,
     ))
     env = dict(os.environ)
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[3])
@@ -656,6 +704,7 @@ def main() -> None:
     parser.add_argument("--count", type=int, choices=COUNTS)
     parser.add_argument("--session-index", type=int)
     parser.add_argument("--microbatch", type=int, default=4)
+    parser.add_argument("--size", type=int, default=N3_SIZE)
     parser.add_argument("--launch-dir", type=Path)
     args = parser.parse_args()
     plan_path = args.plan.resolve()
@@ -674,6 +723,8 @@ def main() -> None:
         coordinator(
             plan_path, source_report, args.launch_dir,
             record["devices"], args.microbatch,
+            tuple(record.get("sizes", [N3_SIZE])),
+            record.get("report_kind", "single"),
         )
     else:
         if args.count is None or args.session_index is None:
@@ -687,6 +738,7 @@ def main() -> None:
         if args.stage == "audit":
             print(json.dumps(audit(
                 plan, source, args.session_index, args.microbatch,
+                args.size,
             )))
         else:
             logging.basicConfig(
@@ -695,6 +747,7 @@ def main() -> None:
             )
             result = fit_one(
                 plan, source, args.session_index, args.microbatch,
+                args.size,
             )
             print(f"Completed n3 session fit: {result.resolve()}")
 

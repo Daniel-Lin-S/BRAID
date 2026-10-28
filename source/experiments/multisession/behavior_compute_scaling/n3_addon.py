@@ -45,6 +45,7 @@ from experiments.multisession.behavior_compute_scaling.training import (
     optimizer_groups,
 )
 from experiments.multisession.data import session_windows, source_features
+from experiments.multisession.log_paths import source_session_log_path
 from experiments.multisession.plan import analysis_directory
 from experiments.multisession.reports import write_table
 from experiments.multisession.runner import dataset
@@ -456,7 +457,12 @@ def coordinator(
             "--source-report", str(source_report),
             "--count", str(count), "--microbatch", str(microbatch),
         ]
-        log = launch / f"n3_{count}.log"
+        source = source_entry(plan, source_report, count)
+        log = source_session_log_path(
+            launch, count, "all_sessions",
+            n3_directory(source).name, N3_SIZE,
+        )
+        log.parent.mkdir(parents=True, exist_ok=True)
         with log.open("a") as stream:
             process = subprocess.Popen(
                 command, env=env, stdout=stream,

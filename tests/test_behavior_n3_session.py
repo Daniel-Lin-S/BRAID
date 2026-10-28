@@ -4,14 +4,17 @@ Inputs are synthetic recurrent arrays and fixed-stage settings. Outputs are
 checks on per-session forecast identity, validation cadence, and log progress.
 """
 
+import json
 from pathlib import Path
 
 import numpy as np
 
 from BRAID.multisession import MixedForecaster
 from experiments.multisession.behavior_compute_scaling.n3_session import (
-    log_progress, selected_session_weights, session_settings,
+    log_progress, publish_status, selected_session_weights,
+    session_settings,
 )
+from experiments.multisession.log_paths import source_session_log_path
 from experiments.multisession.behavior_compute_scaling.training import (
     validation_due,
 )
@@ -75,3 +78,34 @@ def test_live_progress_reads_last_real_update(tmp_path: Path) -> None:
         inner_validation_loss=0.9, best_update=26,
         stale_checks=0,
     )
+
+
+def test_worker_logs_are_nested_and_status_is_lifecycle_only(
+    tmp_path: Path,
+) -> None:
+    """Model progress stays outside the campaign lifecycle file."""
+    launch = tmp_path / "n3_sweep_20261028T000000Z_1"
+    path = source_session_log_path(
+        launch, 33, "indy_20160915_01", "component", 16
+    )
+    assert path.parent == (
+        launch / "jobs" / "source_n3" / "indy_20160915_01"
+    )
+    members = {
+        "33:0:n3_16": dict(
+            state="running", update=100, training_loss=0.5,
+            component="component",
+        )
+    }
+    publish_status(launch, members, "active")
+    status = json.loads((launch / "status.json").read_text())
+    assert status["state"] == "active"
+    assert status["counts"]["running"] == 1
+    assert status["total"] == 1
+    assert "members" not in status
+    assert "training_loss" not in status
+    progress = json.loads(
+        (launch / "jobs" / "source_n3" / "progress.json")
+        .read_text()
+    )
+    assert progress["members"]["33:0:n3_16"]["training_loss"] == 0.5
