@@ -49,6 +49,10 @@ def job_label(key: str, spec: dict) -> str:
                 f"_sources{spec['source_count']}_{spec['objective']}_"
                 f"{spec['sharing']}"
             )
+    task = spec.get("task_kind")
+    if task is not None:
+        budget = spec.get("budget")
+        detail += f"_{task}{budget if budget is not None else ''}"
     return f"{detail}__{key}"
 
 
