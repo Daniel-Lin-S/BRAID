@@ -189,6 +189,8 @@ def source_figures(
     stages: tuple[str, ...] = COMPONENTS,
     expected_points: int = 5,
     direct: bool = False,
+    stage_labels: dict[str, str] | None = None,
+    x_label: str = "Full-pipeline source model FLOPs",
 ) -> None:
     """Draw complete log-log source panels for requested stages."""
     if not rows:
@@ -240,9 +242,11 @@ def source_figures(
             )
         axis.set_xscale("log")
         axis.set_yscale("log")
-        axis.set_xlabel("Full-pipeline source model FLOPs")
+        axis.set_xlabel(x_label)
         axis.set_ylabel("Chronological source test loss")
-        stage_label = STAGE_LABELS.get(stage, stage.replace("_", " ").title())
+        stage_label = (
+            stage_labels or STAGE_LABELS
+        ).get(stage, stage.replace("_", " ").title())
         axis.set_title(
             fill(
                 f"{stage_label}: fixed four-session "

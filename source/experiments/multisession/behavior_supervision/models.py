@@ -46,7 +46,8 @@ def rnn1_model(
 ) -> MixedForecaster:
     """Build RNN1 with one private map set per source recording."""
     return MixedForecaster(
-        dimensions, spec["latent"], STAGE1_SHARING,
+        dimensions, spec["latent"],
+        spec.get("stage1_sharing", STAGE1_SHARING),
         spec["seed"] + 2, decoder_width=BEHAVIOR_WIDTH,
         session_devices=devices,
     )

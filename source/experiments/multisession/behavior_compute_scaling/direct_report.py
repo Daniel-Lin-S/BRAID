@@ -123,38 +123,68 @@ def verify_stage_loss(
 def full_neural_forecasts(
     source: dict, common: dict,
 ) -> list[np.ndarray]:
-    """Restore matched RNN1, readout and RNN2 to score full neural Y."""
+    """Restore the selected neural forecast for four common recordings."""
     spec = source["spec"]
     names = spec["sessions"]
+    objective = spec.get("objective")
+    neural_only = objective in ("neural", "neural_residual")
     dimensions = [
         (
             sum(source["inventory"][name]["scales"]["Y"]["keep"]),
+            sum(source["inventory"][name]["scales"]["Y"]["keep"])
+            if neural_only else
             sum(source["inventory"][name]["scales"]["Z"]["keep"]),
         )
         for name in names
     ]
     root = source["fit"].parent.parent / "source_components"
     stages = source["path"]["stages"]
-    main = rnn1_model(dimensions, spec)
-    restore_component(
-        main, root / stages["behavior_relevant"]["component_id"]
-    )
-    readout = neural_readout_model(dimensions, spec)
-    restore_component(
-        readout, root / stages["neural_readout"]["component_id"]
-    )
-    residual = rnn2_model(dimensions, spec)
-    restore_component(residual, root / stages["residual"]["component_id"])
     inputs = [
         recurrent_data(common[name]["test"])
         for name in names[:COMMON_SESSIONS]
     ]
-    rows = residual_data(main, readout, inputs)
-    corrections, _ = stage_predictions(residual, rows)
-    forecasts = [
-        prediction + row["P"]
-        for prediction, row in zip(corrections, rows)
-    ]
+    if neural_only:
+        from experiments.multisession.compute_scaling.self_supervised import (
+            neural_model,
+        )
+        main = neural_model(dimensions, spec)
+        restore_component(
+            main, root / stages["neural"]["component_id"]
+        )
+        if objective == "neural":
+            forecasts, _ = stage_predictions(main, inputs)
+        else:
+            from experiments.multisession.compute_scaling.self_supervised import (
+                residual_model,
+            )
+            residual = residual_model(dimensions, spec)
+            restore_component(
+                residual, root / stages["residual"]["component_id"]
+            )
+            rows = residual_data(main, None, inputs)
+            corrections, _ = stage_predictions(residual, rows)
+            forecasts = [
+                prediction + row["P"]
+                for prediction, row in zip(corrections, rows)
+            ]
+    else:
+        main = rnn1_model(dimensions, spec)
+        readout = neural_readout_model(dimensions, spec)
+        residual = rnn2_model(dimensions, spec)
+        for model, stage in (
+            (main, "behavior_relevant"),
+            (readout, "neural_readout"),
+            (residual, "residual"),
+        ):
+            restore_component(
+                model, root / stages[stage]["component_id"]
+            )
+        rows = residual_data(main, readout, inputs)
+        corrections, _ = stage_predictions(residual, rows)
+        forecasts = [
+            prediction + row["P"]
+            for prediction, row in zip(corrections, rows)
+        ]
     for name, forecast in zip(names, forecasts):
         expected = (
             len(HORIZONS), *common[name]["test"]["Y"].shape
@@ -258,8 +288,9 @@ def summarize(scores: list[dict]) -> list[dict]:
 def figures(
     summary: list[dict], directory: Path,
     baseline: list[dict] | None = None,
+    comparison: list[dict] | None = None,
 ) -> None:
-    """Draw target and metric panels with an optional one-session mean."""
+    """Draw source metrics with optional direct and one-session references."""
     directory.mkdir(parents=True, exist_ok=True)
     with plt.rc_context(READABLE_TEXT_STYLE):
         for group in GROUPS:
@@ -290,10 +321,44 @@ def figures(
                         )
                     plot_line(
                         x=COUNTS, y=values, ax=axis,
-                        color=COLORS[group], marker=MARKERS[group],
-                        label=("Multi-session model"
-                               if baseline is not None else None),
+                        color=(
+                            "#339966" if comparison is not None
+                            else COLORS[group]
+                        ),
+                        marker=MARKERS[group],
+                        label=(
+                            "Neural-pretrained BRAID"
+                            if comparison is not None
+                            else "Multi-session model"
+                            if baseline is not None else None
+                        ),
                     )
+                    if comparison is not None:
+                        matching = sorted(
+                            (
+                                row for row in comparison
+                                if row["group"] == group
+                                and row["horizon"] == horizon
+                            ),
+                            key=lambda row: row["source_count"],
+                        )
+                        if [row["source_count"] for row in matching] != (
+                            list(COUNTS)
+                        ):
+                            raise ValueError(
+                                "Incomplete direct comparison curve."
+                            )
+                        reference = [row[metric] for row in matching]
+                        if not np.isfinite(reference).all():
+                            raise ValueError(
+                                "Nonfinite direct comparison metric."
+                            )
+                        values.extend(reference)
+                        plot_line(
+                            x=COUNTS, y=reference, ax=axis,
+                            color="#2878b5", marker="D",
+                            linestyle="--", label="Direct behavior",
+                        )
                     if baseline is not None:
                         matching = [
                             row for row in baseline
@@ -312,7 +377,11 @@ def figures(
                         axis.axhline(
                             value, color="#555555", linestyle="--",
                             linewidth=2.2,
-                            label="Mean single-session model",
+                            label=(
+                                "Single-session direct model"
+                                if comparison is not None
+                                else "Mean single-session model"
+                            ),
                         )
                     axis.set_xscale("log", base=2)
                     axis.set_xticks(
@@ -326,7 +395,7 @@ def figures(
                     milliseconds = horizon * 1000 / SAMPLE_RATE
                     axis.set_title(f"{milliseconds:g} ms", pad=10)
                     decoding.focus_axis(axis, values, metric)
-                if baseline is not None:
+                if baseline is not None or comparison is not None:
                     handles, labels = (
                         axes.flat[0].get_legend_handles_labels()
                     )
@@ -341,7 +410,10 @@ def figures(
                 )
                 figure.subplots_adjust(
                     left=0.10,
-                    right=0.77 if baseline is not None else 0.97,
+                    right=(
+                        0.77 if baseline is not None
+                        or comparison is not None else 0.97
+                    ),
                     top=0.88, bottom=0.09,
                     hspace=0.45, wspace=0.32,
                 )
@@ -350,7 +422,7 @@ def figures(
                     dpi=DPI, bbox_inches="tight",
                 )
                 plt.close(figure)
-    print(f"Saved direct-behavior performance figures: {directory.resolve()}")
+    print(f"Saved source performance figures: {directory.resolve()}")
 
 
 def publish_direct_report(plan: dict, plan_path: Path) -> Path | None:

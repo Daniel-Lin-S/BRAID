@@ -1,9 +1,9 @@
-"""Schedule direct-behavior source budgets on four independent GPUs.
+"""Schedule source budgets and dependent seen-session fits on four GPUs.
 
 Usage: python -m experiments.multisession.behavior_compute_scaling.budget_queue
        --plan ABSOLUTE_PLAN --detach
 
-Input is a published direct-behavior source-only plan. Output is a detached
+Input is a published source-only plan. Output is a detached
 campaign log with lifecycle status, nested task logs, and frozen source code.
 Completed scientific artifacts remain in the plan's shared artifact root.
 """
@@ -36,11 +36,14 @@ LOGGER = logging.getLogger(__name__)
 GPU_COUNT = 4
 POLL_SECONDS = 5
 LOW_CPU_PRIORITY = 10
-TASK_KINDS = ("prefix", "budget", "final")
+TASK_KINDS = ("prefix", "budget", "final", "session", "full")
 
 
 def task_plan(plan: dict) -> dict:
     """Build runtime tasks without changing scientific source identities."""
+    from experiments.multisession.compute_scaling.self_supervised import (
+        CAMPAIGN as NEURAL_CAMPAIGN,
+    )
     jobs = {}
     for source_key in plan["source_references"]:
         spec = plan["jobs"][source_key]
@@ -64,6 +67,26 @@ def task_plan(plan: dict) -> dict:
                 spec, kind="source", task_kind=kind,
                 source_fit=source_key, budget=budget,
             )
+        if plan["name"] == NEURAL_CAMPAIGN:
+            for index in range(4):
+                identity = dict(
+                    source_fit=source_key, task_kind="session",
+                    session_index=index,
+                )
+                task_key = fingerprint(identity)
+                jobs[task_key] = dict(
+                    spec, kind="source", task_kind="session",
+                    source_fit=source_key, budget=None,
+                    session_index=index,
+                )
+            identity = dict(
+                source_fit=source_key, task_kind="full",
+            )
+            task_key = fingerprint(identity)
+            jobs[task_key] = dict(
+                spec, kind="source", task_kind="full",
+                source_fit=source_key, budget=None,
+            )
     return dict(jobs=jobs)
 
 
@@ -72,6 +95,23 @@ def task_complete(
 ) -> bool:
     """Validate a task's durable scientific or prefix record."""
     source = spec["source_fit"]
+    if spec["task_kind"] in ("session", "full"):
+        if completed(fit_directory(plan, source)) is None:
+            return False
+        from experiments.multisession.behavior_supervision.source_adaptation import (
+            full_directory, session_directory,
+        )
+        if spec["task_kind"] == "session":
+            path = session_directory(
+                plan, source, spec["session_index"]
+            )
+            return completed(path) is not None
+        if any(
+            completed(session_directory(plan, source, index)) is None
+            for index in range(4)
+        ):
+            return False
+        return completed(full_directory(plan, source)) is not None
     if completed(fit_directory(plan, source)) is not None:
         return True
     kind = spec["task_kind"]
@@ -108,15 +148,30 @@ def ready_tasks(
             plan, launch, source, spec["budget"]
         ) is None:
             continue
+        if kind == "session" and completed(
+            fit_directory(plan, source)
+        ) is None:
+            continue
         if kind == "final":
             related = [
                 other for other, row in tasks.items()
-                if row["source_fit"] == source and other != key
+                if row["source_fit"] == source
+                and row["task_kind"] in ("prefix", "budget")
+            ]
+            if any(states[other] != "complete" for other in related):
+                continue
+        if kind == "full":
+            related = [
+                other for other, row in tasks.items()
+                if row["source_fit"] == source
+                and row["task_kind"] == "session"
             ]
             if any(states[other] != "complete" for other in related):
                 continue
         result.append(key)
-    rank = dict(budget=0, prefix=1, final=2)
+    rank = dict(
+        budget=0, prefix=1, final=2, session=3, full=4,
+    )
     return sorted(result, key=lambda key: (
         counts[tasks[key]["source_count"]],
         rank[tasks[key]["task_kind"]],
@@ -127,7 +182,12 @@ def ready_tasks(
 
 def task_log(launch: Path, key: str, spec: dict) -> Path:
     """Nest a runtime task log by source count and task type."""
-    budget = "all" if spec["budget"] is None else str(spec["budget"])
+    budget = (
+        f"session{spec['session_index']}"
+        if spec["task_kind"] == "session"
+        else "all" if spec["budget"] is None
+        else str(spec["budget"])
+    )
     return (
         launch / "jobs" / "source_budget"
         / f"sources{spec['source_count']}" / spec["task_kind"]
@@ -158,6 +218,10 @@ def start_task(
     ]
     if spec["budget"] is not None:
         command.extend(["--budget", str(spec["budget"])])
+    if spec["task_kind"] == "session":
+        command.extend([
+            "--session-index", str(spec["session_index"])
+        ])
     with log.open("a") as stream:
         process = subprocess.Popen(
             command, env=environment, stdout=stream,
@@ -250,8 +314,24 @@ def run_queue(
                 "complete" if completed_fit is not None else "failed"
             )
         reconcile(plan, path, source_states)
-        if all(state == "complete" for state in source_states.values()):
-            publish_reports(plan, path)
+        if all(state == "complete" for state in states.values()):
+            from experiments.multisession.compute_scaling.self_supervised import (
+                CAMPAIGN as NEURAL_CAMPAIGN,
+            )
+            if plan["name"] == NEURAL_CAMPAIGN:
+                from experiments.multisession.compute_scaling import (
+                    self_supervised_report,
+                )
+                try:
+                    self_supervised_report.publish(plan, path)
+                except Exception as error:
+                    atomic_json(launch / "report_failure.json", dict(
+                        error=f"{type(error).__name__}: {error}",
+                    ))
+                    LOGGER.exception("Neural source report failed")
+                    raise
+            else:
+                publish_reports(plan, path)
     LOGGER.info("Budget task states: %s", dict(Counter(states.values())))
 
 
@@ -278,6 +358,7 @@ def main() -> None:
     parser.add_argument("--task-kind", choices=TASK_KINDS)
     parser.add_argument("--source-key")
     parser.add_argument("--budget", type=int)
+    parser.add_argument("--session-index", type=int)
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.INFO,
@@ -302,13 +383,29 @@ def main() -> None:
                 plan, args.launch.resolve(), args.source_key,
                 args.budget,
             )
+        elif args.task_kind == "session":
+            if args.session_index is None:
+                parser.error("Session worker requires --session-index.")
+            from experiments.multisession.behavior_supervision.source_adaptation import (
+                fit_session,
+            )
+            fit_session(plan, args.source_key, args.session_index)
+        elif args.task_kind == "full":
+            from experiments.multisession.behavior_supervision.source_adaptation import (
+                fit_full,
+            )
+            fit_full(plan, args.source_key)
         else:
             finish_source(plan, args.source_key)
         return
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     launch = args.launch or (
         Path(plan["settings"]["paths"]["log_root"]).resolve()
-        / PRIMARY / f"behavior_budget_{stamp}_{os.getpid()}"
+        / PRIMARY / (
+            f"neural_budget_{stamp}_{os.getpid()}"
+            if plan["name"] == "multi_session_self_supervised_scaling"
+            else f"behavior_budget_{stamp}_{os.getpid()}"
+        )
     )
     launch.mkdir(parents=True, exist_ok=True)
     if args.detach:

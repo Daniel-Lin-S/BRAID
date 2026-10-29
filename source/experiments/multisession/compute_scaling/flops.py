@@ -52,6 +52,7 @@ def session_ops(
     if not isinstance(model, MixedForecaster):
         raise TypeError(f"Unknown component {type(model)}.")
     maps = model.sessions[session]
+    frozen = set(getattr(model, "frozen_modules", ()))
     rows = batch * length
     for name, repeats in (
         ("K", 1), ("Afw", MAX_HORIZON - 1),
@@ -59,11 +60,17 @@ def session_ops(
         ("C", len(HORIZONS)),
     ):
         fwd, bwd = dense_ops(maps[name], rows)
+        if name == "Afw" and name in frozen:
+            bwd //= 2
+        if name == "Kfw" and name in frozen:
+            bwd = 0
         forward += repeats * fwd
         backward += repeats * bwd
     transition = 2 * rows * model.latent * model.latent
     forward += transition + rows * model.latent
-    backward += 2 * transition + rows * model.latent
+    backward += (
+        transition if "A" in frozen else 2 * transition
+    ) + rows * model.latent
     forward += 2 * (MAX_HORIZON - 1) * rows * model.latent
     backward += 2 * (MAX_HORIZON - 1) * rows * model.latent
     for horizon in HORIZONS:

@@ -227,7 +227,8 @@ def recorded_forecasts(
         for name in names
     ]
     model = MixedForecaster(
-        dimensions, spec["latent"], "A", spec["seed"] + 2,
+        dimensions, spec["latent"],
+        spec.get("stage1_sharing", "A"), spec["seed"] + 2,
         decoder_width=64, session_devices=devices,
     )
     component = source["path"]["stages"]["behavior_relevant"]["component_id"]
