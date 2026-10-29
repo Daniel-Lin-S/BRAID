@@ -42,6 +42,7 @@ from experiments.visualization.multisession import (
 )
 
 N3_WIDTH = 16
+COMPARISON_REPORT_PREFIX = "comparison-preprocessed-n3-16-vs-direct-best-7"
 COMMON_SESSIONS = 4
 BUDGET_POOL = (50, 100, 200, 400, 800, 1600, 2400)
 HORIZONS = (1, 2, 4, 8)
@@ -436,7 +437,18 @@ def publish(
         direct_plan, direct_plan["name"],
         direct_plan_path.parent.name,
     )
-    destination = root / "reports" / fingerprint(identity)
+    report_hash = fingerprint(identity)
+    reports_root = root / "reports"
+    destination = reports_root / (
+        f"{COMPARISON_REPORT_PREFIX}-{report_hash}"
+    )
+    legacy = reports_root / report_hash
+    if not destination.exists() and completed(legacy) is not None:
+        if destination.is_symlink():
+            raise ValueError(
+                f"Broken comparison report alias: {destination.absolute()}."
+            )
+        destination.symlink_to(legacy.name, target_is_directory=True)
     with job(destination, identity) as needed:
         if needed:
             scores = scored_models(
@@ -491,8 +503,8 @@ def publish(
     if completed(destination) is None:
         raise ValueError(f"Incomplete comparison: {destination}.")
     atomic_json(root / "latest_preprocessing_comparison.json", dict(
-        snapshot=str(destination.resolve()),
-        figures=str((destination / "figures").resolve()),
+        snapshot=str(destination.absolute()),
+        figures=str((destination / "figures").absolute()),
         identity=fingerprint(identity),
     ))
     return destination
