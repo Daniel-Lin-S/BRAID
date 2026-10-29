@@ -205,6 +205,11 @@ def budget_identity(plan: dict, key: str, budget: int) -> dict:
 def budget_directory(plan: dict, key: str, budget: int) -> Path:
     """Locate one immutable matched-path completion."""
     identity = budget_identity(plan, key, budget)
+    reused = plan.get("continuation", {}).get(key, {}).get(
+        "budgets", {}
+    ).get(str(budget))
+    if reused is not None:
+        return Path(reused)
     root = Path(plan["settings"]["paths"]["artifact_root"])
     return (
         root / "multi_session_training" / "source_budget_paths" / key

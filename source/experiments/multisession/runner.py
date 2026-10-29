@@ -174,7 +174,15 @@ def plan_campaign(settings: dict) -> tuple[dict, Path]:
         audit_source_holdout(adapter, reference)
         audit_inner_splits(adapter, reference, settings)
         target_audit = audit_held_out_windows(adapter, settings)
-        plan = build_neural(settings, sessions, reference)
+        previous = (
+            json.loads(Path(
+                settings["neural_continuation_plan"]
+            ).resolve().read_text())
+            if "neural_continuation_plan" in settings else None
+        )
+        plan = build_neural(
+            settings, sessions, reference, previous
+        )
         plan["held_out_window_audit"] = target_audit
     elif settings["name"] == "multi_session_source_capacity_scaling":
         from experiments.multisession.capacity import build_capacity_plan

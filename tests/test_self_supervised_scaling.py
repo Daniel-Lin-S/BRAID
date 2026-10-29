@@ -40,6 +40,48 @@ def source_plan(root: Path) -> dict:
     )
 
 
+def test_extended_budget_uses_saved_path_without_refitting(
+    tmp_path: Path,
+) -> None:
+    """An overlapping neural budget resolves to its completed old fit."""
+    from experiments.multisession.behavior_compute_scaling import (
+        budget_parallel,
+    )
+
+    plan = source_plan(tmp_path)
+    plan["jobs"]["4"]["source_training"]["checkpoints"] = [
+        160, 320, 640, 1280, 1920, 2560, 3840,
+    ]
+    saved = tmp_path / "previous" / "budget160"
+    plan["continuation"] = {
+        "4": {"budgets": {"160": str(saved)}},
+    }
+    assert budget_parallel.budget_directory(plan, "4", 160) == saved
+    assert budget_parallel.budget_directory(
+        plan, "4", 2560
+    ) != saved
+
+
+def test_extended_schedule_changes_only_budget_fields() -> None:
+    """The main and decay ladder may extend without changing sampling."""
+    from experiments.multisession.compute_scaling.self_supervised import (
+        schedule_without_ladder,
+    )
+
+    original = dict(
+        checkpoints=[40, 80], total_updates=[50, 100],
+        maximum_updates=80, learning_rate=0.001,
+        session_batch_sizes={"4": 8},
+    )
+    extended = dict(
+        original, checkpoints=[160, 320],
+        total_updates=[200, 400], maximum_updates=320,
+    )
+    assert schedule_without_ladder(original) == (
+        schedule_without_ladder(extended)
+    )
+
+
 def test_seen_session_paths_wait_for_own_count(
     tmp_path: Path, monkeypatch,
 ) -> None:

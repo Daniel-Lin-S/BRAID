@@ -49,7 +49,6 @@ from experiments.multisession.training import recurrent_data
 from experiments.storage.cache import atomic_json, file_digest, fingerprint
 
 REPORT_PREFIX = "self-supervised-single-backbone-full-braid"
-EXPECTED_TOTALS = (50, 100, 200, 400, 800, 1600, 2400)
 GROUPS = ("position", "velocity", "neural")
 METRICS = ("cc", "r2", "mse_ratio")
 VARIANTS = ("self_supervised", "direct_behavior")
@@ -113,8 +112,13 @@ def checked_sources(plan: dict) -> list[dict]:
         inventory = json.loads((fit / "data.json").read_text())
         selection = json.loads((fit / "selection.json").read_text())
         paths = json.loads((fit / "budgets.json").read_text())
-        multiplier = 2 if spec["source_count"] == 33 else 1
-        expected = [value * multiplier for value in EXPECTED_TOTALS]
+        multiplier = spec["source_training"]["update_multipliers"][
+            str(spec["source_count"])
+        ]
+        expected = [
+            value * multiplier
+            for value in spec["source_training"]["total_updates"]
+        ]
         if [row["total_updates"] for row in paths] != expected:
             raise ValueError("Neural source budget pool differs.")
         chosen = min(
@@ -554,7 +558,9 @@ def publish(plan: dict, plan_path: Path) -> Path:
             source_figures(
                 source_losses, figures,
                 stages=("neural",),
-                expected_points=len(EXPECTED_TOTALS), direct=True,
+                expected_points=len(
+                    plan["settings"]["source_training"]["total_updates"]
+                ), direct=True,
                 stage_labels={"neural": "Neural backbone forecast"},
                 x_label="Full-backbone training FLOPs",
             )

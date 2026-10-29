@@ -1,0 +1,6 @@
+extends: multi_session_self_supervised_scaling.yaml
+title: Extended neural-only source and compute scaling
+source_training:
+  maximum_updates: 3840
+  checkpoints: [160, 320, 640, 1280, 1920, 2560, 3840]
+  total_updates: [200, 400, 800, 1600, 2400, 3200, 4800]

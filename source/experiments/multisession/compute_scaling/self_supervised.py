@@ -31,12 +31,12 @@ from experiments.multisession.data import session_windows, source_features
 from experiments.multisession.plan import PRIMARY
 from experiments.multisession.runner import dataset
 from experiments.multisession.store import (
-    completed, dump_pickle, fit_directory, job,
+    completed, dump_pickle, fit_directory, job, load_pickle,
 )
 from experiments.multisession.training import recurrent_data
 from experiments.storage.cache import atomic_json, fingerprint
 from experiments.multisession.compute_scaling.ancestry import (
-    restore_component,
+    main_prefix, restore_component,
 )
 
 CAMPAIGN = "multi_session_self_supervised_scaling"
@@ -50,9 +50,108 @@ SHARING = STAGE2_SHARING
 COMMON = 4
 OUTER_WINDOWS = 87
 LOCAL_DEVICE = ("/GPU:0", "/GPU:0")
+LADDER_FIELDS = frozenset((
+    "maximum_updates", "checkpoints", "total_updates",
+))
 
 
-def build_plan(settings: dict, sessions: dict, reference: dict) -> dict:
+def schedule_without_ladder(settings: dict) -> dict:
+    """Return scientific schedule fields unaffected by budget extension."""
+    return {
+        key: value for key, value in settings.items()
+        if key not in LADDER_FIELDS
+    }
+
+
+def reuse_paths(settings: dict, previous: dict, new_spec: dict) -> dict:
+    """Validate saved neural ancestry and return reusable artifact paths."""
+    from ..behavior_compute_scaling.budget_parallel import (
+        budget_directory,
+    )
+
+    count = new_spec["source_count"]
+    matches = [
+        key for key in previous["source_references"]
+        if previous["jobs"][key]["source_count"] == count
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"Expected one previous neural source for {count} sessions."
+        )
+    old_key = matches[0]
+    old_spec = previous["jobs"][old_key]
+    for field in (
+        "sessions", "sources", "data", "model", "latent",
+        "seed", "sharing", "objective", "implementation",
+    ):
+        if old_spec[field] != new_spec[field]:
+            raise ValueError(
+                f"Previous neural source {count} changed {field}."
+            )
+    old_schedule = old_spec["source_training"]
+    new_schedule = new_spec["source_training"]
+    if schedule_without_ladder(old_schedule) != (
+        schedule_without_ladder(new_schedule)
+    ):
+        raise ValueError(
+            f"Previous neural source {count} changed training protocol."
+        )
+    old_fit = fit_directory(previous, old_key)
+    if completed(old_fit) is None:
+        raise ValueError(f"Incomplete previous neural fit for {count}.")
+    old_paths = json.loads((old_fit / "budgets.json").read_text())
+    old_budgets = {row["budget"] for row in old_paths}
+    multiplier = new_schedule["update_multipliers"][str(count)]
+    expected_old = {
+        value * multiplier for value in old_schedule["checkpoints"]
+    }
+    if len(old_budgets) != len(old_paths) or (
+        old_budgets != expected_old
+    ):
+        raise ValueError(
+            f"Previous neural budgets differ for {count} sessions."
+        )
+    new_budgets = {
+        value * multiplier for value in new_schedule["checkpoints"]
+    }
+    reused = {
+        budget: budget_directory(previous, old_key, budget)
+        for budget in new_budgets.intersection(old_budgets)
+    }
+    if not reused or any(
+        completed(path) is None for path in reused.values()
+    ):
+        raise ValueError(
+            f"Invalid previous neural budget for {count} sessions."
+        )
+    latest = max(old_paths, key=lambda row: row["budget"])
+    if latest["budget"] >= max(new_budgets):
+        raise ValueError("Extended ladder has no larger main checkpoint.")
+    component = (
+        Path(settings["paths"]["artifact_root"]) / PRIMARY
+        / "source_components"
+        / latest["stages"]["neural"]["component_id"]
+    )
+    prefix = main_prefix(component)
+    if load_pickle(prefix / "checkpoint.pkl")["update"] != (
+        latest["budget"]
+    ):
+        raise ValueError(
+            f"Previous main checkpoint differs for {count} sessions."
+        )
+    return dict(
+        source_fit=old_key, prefix=str(prefix.resolve()),
+        budgets={
+            str(budget): str(path.resolve())
+            for budget, path in reused.items()
+        },
+    )
+
+
+def build_plan(
+    settings: dict, sessions: dict, reference: dict,
+    previous: dict | None = None,
+) -> dict:
     """Build four nested neural-only source fits from the direct source sets."""
     if settings["name"] != CAMPAIGN or (
         settings["latent"] != LATENT or settings["seeds"] != [SEED]
@@ -61,10 +160,32 @@ def build_plan(settings: dict, sessions: dict, reference: dict) -> dict:
     if settings["source_training"]["protocol"] != PROTOCOL:
         raise ValueError("Expected neural-only compute protocol.")
     schedule = json.loads(json.dumps(settings["source_training"]))
-    if schedule != dict(
+    direct_schedule = dict(
         reference["settings"]["source_training"], protocol=PROTOCOL
+    )
+    if schedule_without_ladder(schedule) != (
+        schedule_without_ladder(direct_schedule)
     ):
-        raise ValueError("Neural source schedule differs from direct ladder.")
+        raise ValueError("Neural source training protocol differs.")
+    if previous is None and schedule != direct_schedule:
+        raise ValueError(
+            "Extended neural ladder requires a continuation plan."
+        )
+    if previous is not None and (
+        previous["name"] != CAMPAIGN
+        or previous["settings"]["paths"]["artifact_root"]
+        != settings["paths"]["artifact_root"]
+    ):
+        raise ValueError("Previous neural campaign identity differs.")
+    checkpoints = schedule["checkpoints"]
+    totals = schedule["total_updates"]
+    if not checkpoints or len(checkpoints) != len(totals) or any(
+        later <= earlier
+        for earlier, later in zip(checkpoints, checkpoints[1:])
+    ) or any(
+        total <= main for main, total in zip(checkpoints, totals)
+    ):
+        raise ValueError("Expected increasing main and decay budgets.")
     old = reference["settings"]
     for field in ("data", "model", "held_out_sessions"):
         if settings[field] != old[field]:
@@ -73,7 +194,7 @@ def build_plan(settings: dict, sessions: dict, reference: dict) -> dict:
         old["paths"]["artifact_root"]
     ):
         raise ValueError("Artifact root differs from reference campaign.")
-    jobs, sources = {}, []
+    jobs, sources, continuation = {}, [], {}
     for key in reference["source_references"]:
         original = reference["jobs"][key]
         if completed(fit_directory(reference, key)) is None:
@@ -86,7 +207,7 @@ def build_plan(settings: dict, sessions: dict, reference: dict) -> dict:
         spec = deepcopy(original)
         spec.update(
             objective="neural", sharing=SHARING,
-            source_training=deepcopy(settings["source_training"]),
+            source_training=deepcopy(schedule),
             implementation=IMPLEMENTATION, dependencies=[],
         )
         spec.pop("behavior_supervision", None)
@@ -96,6 +217,10 @@ def build_plan(settings: dict, sessions: dict, reference: dict) -> dict:
             raise ValueError("Duplicate neural-only source fit identity.")
         jobs[identifier] = spec
         sources.append(identifier)
+        if previous is not None:
+            continuation[identifier] = reuse_paths(
+                settings, previous, spec
+            )
     counts = sorted(row["source_count"] for row in jobs.values())
     if counts != list(COUNTS):
         raise ValueError(f"Expected source counts {COUNTS}, got {counts}.")
@@ -107,6 +232,7 @@ def build_plan(settings: dict, sessions: dict, reference: dict) -> dict:
         analyses={CAMPAIGN: sources},
         analysis_paths={CAMPAIGN: CAMPAIGN},
         held_out_sessions=list(settings["held_out_sessions"]),
+        continuation=continuation,
     )
 
 
@@ -183,8 +309,17 @@ def fit_prefixes(plan: dict, launch: Path, key: str) -> None:
     )
     settings = spec["source_training"]
     local = settings["session_batch_sizes"][str(spec["source_count"])]
-    previous, start = None, 0
+    previous = (
+        Path(plan["continuation"][key]["prefix"])
+        if key in plan["continuation"] else None
+    )
+    start = (
+        int(json.loads((previous / "training.json").read_text())["stop"])
+        if previous is not None else 0
+    )
     for stop in settings["checkpoints"]:
+        if stop <= start:
+            continue
         component, _ = fit_segment(
             model, data, root, prefix_identity(spec), settings,
             spec["seed"], start, stop, previous,
@@ -211,10 +346,12 @@ def fit_budget(
     from ..behavior_compute_scaling.budget_parallel import (
         budget_directory, budget_identity, prefix_component,
     )
+    destination = budget_directory(plan, key, budget)
+    if completed(destination) is not None:
+        return
     current = prefix_component(plan, launch, key, budget)
     if current is None:
         raise ValueError(f"Neural prefix {budget} is not ready.")
-    destination = budget_directory(plan, key, budget)
     with job(destination, budget_identity(plan, key, budget)) as needed:
         if not needed:
             return
@@ -227,6 +364,8 @@ def fit_budget(
                 plan, launch, key, settings["checkpoints"][index - 1]
             ) if index else None
         )
+        if previous is None and key in plan["continuation"]:
+            previous = Path(plan["continuation"][key]["prefix"])
         if index and previous is None:
             raise ValueError("Previous neural prefix is missing.")
         dimensions = [(row["Y"].shape[-1],) * 2 for row in train]
