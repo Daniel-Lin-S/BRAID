@@ -408,6 +408,22 @@ def score_selected(
     return scores
 
 
+def session_training_rows(plan: dict, sources: list[dict]) -> list[dict]:
+    """Collect four private stage paths per source count for the report."""
+    rows = []
+    for source in sources:
+        for index in range(COMMON):
+            directory = session_directory(plan, source["key"], index)
+            record = json.loads((directory / "path.json").read_text())
+            expected = source["spec"]["sessions"][index]
+            if record["session"] != expected or (
+                "source_count" in record
+            ):
+                raise ValueError("Seen-session training row differs.")
+            rows.append(dict(record, source_count=source["count"]))
+    return rows
+
+
 def publish(plan: dict, plan_path: Path) -> Path:
     """Publish one complete immutable analysis after all fits finish."""
     if plan["name"] != CAMPAIGN:
@@ -517,16 +533,10 @@ def publish(plan: dict, plan_path: Path) -> Path:
                     ),
                 ) for source, other in zip(sources, direct_choices)
             ])
-            write_table(tables / "seen_session_training.csv", [
-                dict(
-                    source_count=source["count"],
-                    session=source["spec"]["sessions"][index],
-                    **json.loads((
-                        session_directory(plan, source["key"], index)
-                        / "path.json"
-                    ).read_text()),
-                ) for source in sources for index in range(COMMON)
-            ])
+            write_table(
+                tables / "seen_session_training.csv",
+                session_training_rows(plan, sources),
+            )
             write_table(tables / "seen_full_paths.csv", [
                 dict(source_count=source["count"], **json.loads((
                     full_directory(plan, source["key"]) / "path.json"

@@ -193,3 +193,36 @@ def test_full_path_waits_for_four_completed_session_paths(
         ),
     )
     assert not budget_queue.task_complete(plan, tmp_path, full)
+
+def test_seen_session_report_rows_keep_one_session_field(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """The report records four session paths without duplicate CSV keys."""
+    import json
+
+    from experiments.multisession.compute_scaling import (
+        self_supervised_report as report,
+    )
+
+    names = [f"common_{index}" for index in range(4)]
+    for index, name in enumerate(names):
+        directory = tmp_path / f"session{index}"
+        directory.mkdir()
+        (directory / "path.json").write_text(json.dumps(dict(
+            session=name, session_index=index,
+            behavior_rnn1_flops=100,
+            neural_readout_flops=200,
+        )))
+    monkeypatch.setattr(
+        report, "session_directory",
+        lambda unused_plan, unused_key, index: (
+            tmp_path / f"session{index}"
+        ),
+    )
+    source = dict(
+        count=4, key="fit", spec=dict(sessions=names),
+    )
+    rows = report.session_training_rows({}, [source])
+    assert len(rows) == 4
+    assert [row["session"] for row in rows] == names
+    assert all(row["source_count"] == 4 for row in rows)
