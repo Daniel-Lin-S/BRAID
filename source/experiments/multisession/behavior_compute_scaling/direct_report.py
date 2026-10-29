@@ -255,8 +255,11 @@ def summarize(scores: list[dict]) -> list[dict]:
     return summary
 
 
-def figures(summary: list[dict], directory: Path) -> None:
-    """Draw separate readable target and metric horizon panels."""
+def figures(
+    summary: list[dict], directory: Path,
+    baseline: list[dict] | None = None,
+) -> None:
+    """Draw target and metric panels with an optional one-session mean."""
     directory.mkdir(parents=True, exist_ok=True)
     with plt.rc_context(READABLE_TEXT_STYLE):
         for group in GROUPS:
@@ -288,7 +291,29 @@ def figures(summary: list[dict], directory: Path) -> None:
                     plot_line(
                         x=COUNTS, y=values, ax=axis,
                         color=COLORS[group], marker=MARKERS[group],
+                        label=("Multi-session model"
+                               if baseline is not None else None),
                     )
+                    if baseline is not None:
+                        matching = [
+                            row for row in baseline
+                            if row["group"] == group
+                            and row["horizon"] == horizon
+                        ]
+                        if len(matching) != 1 or not np.isfinite(
+                            matching[0][metric]
+                        ):
+                            raise ValueError(
+                                f"Missing one-session baseline: "
+                                f"{group}, {metric}, {horizon}."
+                            )
+                        value = matching[0][metric]
+                        values.append(value)
+                        axis.axhline(
+                            value, color="#555555", linestyle="--",
+                            linewidth=2.2,
+                            label="Mean single-session model",
+                        )
                     axis.set_xscale("log", base=2)
                     axis.set_xticks(
                         COUNTS, labels=[str(count) for count in COUNTS]
@@ -301,13 +326,24 @@ def figures(summary: list[dict], directory: Path) -> None:
                     milliseconds = horizon * 1000 / SAMPLE_RATE
                     axis.set_title(f"{milliseconds:g} ms", pad=10)
                     decoding.focus_axis(axis, values, metric)
+                if baseline is not None:
+                    handles, labels = (
+                        axes.flat[0].get_legend_handles_labels()
+                    )
+                    figure.legend(
+                        handles, labels, loc="upper left",
+                        bbox_to_anchor=(0.79, 0.87),
+                        frameon=False,
+                    )
                 title = f"{group.capitalize()} source performance"
                 figure.suptitle(
                     textwrap.fill(title, 46), y=0.98, fontsize=23,
                 )
                 figure.subplots_adjust(
-                    left=0.10, right=0.97, top=0.88,
-                    bottom=0.09, hspace=0.45, wspace=0.32,
+                    left=0.10,
+                    right=0.77 if baseline is not None else 0.97,
+                    top=0.88, bottom=0.09,
+                    hspace=0.45, wspace=0.32,
                 )
                 figure.savefig(
                     directory / f"{group}_{metric}.png",

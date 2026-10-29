@@ -50,9 +50,13 @@ def score_component(
     model: object, training: list[dict], holdout: list[dict],
     names: list[str],
 ) -> dict:
-    """Evaluate native stage loss and training-mean dummy on common four."""
-    if len(names) != 4:
-        raise ValueError("Expected exactly four common source sessions.")
+    """Evaluate native stage loss and training-mean dummy per session."""
+    if not names or len(names) != len(training) or (
+        len(holdout) != len(training)
+    ):
+        raise ValueError(
+            "Expected one name, training set, and holdout per session."
+        )
     losses, evaluation_flops = evaluate_sessions(
         model, holdout[:len(names)]
     )
