@@ -51,11 +51,11 @@ def score_component(
     names: list[str],
 ) -> dict:
     """Evaluate native stage loss and training-mean dummy per session."""
-    if not names or len(names) != len(training) or (
+    if not names or len(names) > len(training) or (
         len(holdout) != len(training)
     ):
         raise ValueError(
-            "Expected one name, training set, and holdout per session."
+            "Expected training and holdout for every named session."
         )
     losses, evaluation_flops = evaluate_sessions(
         model, holdout[:len(names)]
@@ -106,8 +106,11 @@ def stage_identity(spec: dict, stage: str, parent: str | None) -> dict:
         latent=spec["latent"],
         seed=spec["seed"],
         sharing=(
-            STAGE1_SHARING if stage == "behavior_relevant"
-            else STAGE2_SHARING if stage == "residual" else "none"
+            spec["sharing"] if stage == "neural"
+            else spec.get("stage1_sharing", STAGE1_SHARING)
+            if stage == "behavior_relevant"
+            else spec.get("stage2_sharing", STAGE2_SHARING)
+            if stage == "residual" else "none"
         ),
         source_training=spec["source_training"],
         implementation=spec["implementation"],
@@ -129,10 +132,10 @@ def run_stage(
     if reuse is not None:
         restore_component(model, root / reuse["component_id"])
         return reuse, reuse["component_id"]
-    stage_index = COMPONENTS.index(stage)
+    stage_index = 0 if stage == "neural" else COMPONENTS.index(stage)
     identity = stage_identity(spec, stage, parent)
     settings = spec["source_training"]
-    if stage in RECURRENT_STAGES:
+    if stage in RECURRENT_STAGES or stage == "neural":
         directory, flops = fit_component_budget(
             model, training, root, identity, settings,
             spec["seed"] + stage_index, budget, devices, microbatch,

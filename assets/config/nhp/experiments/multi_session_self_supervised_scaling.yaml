@@ -1,0 +1,7 @@
+extends: multi_session_behavior_scaling_no_preprocess.yaml
+name: multi_session_self_supervised_scaling
+title: Neural-only multi-session source and compute scaling
+behavior_supervision:
+  target: neural_only
+source_training:
+  protocol: single_neural_recurrent_compute_v2

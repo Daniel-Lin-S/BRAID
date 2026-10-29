@@ -19,6 +19,7 @@ from experiments.multisession.data import (
     LENGTH, session_windows, source_features, target_selection,
 )
 from experiments.multisession.store import completed, fit_directory
+from experiments.storage.cache import fingerprint
 
 COMMON_SESSION_COUNT = 4
 COMMON_WINDOW_COUNT = 87
@@ -146,3 +147,66 @@ def audit_inner_splits(
                     raise ValueError(f"Source roles overlap: {name} {role}.")
         result[name] = {role: len(record[role]) for role in roles}
     return result
+
+
+def audit_held_out_windows(
+    adapter: object, settings: dict,
+) -> list[dict]:
+    """Check future held-out folds without fitting or selecting checkpoints."""
+    rows = []
+    for name in settings["held_out_sessions"]:
+        raw = adapter.load(name)
+        for fold in settings["target_folds"]:
+            features = adapter.fold(raw, fold, True)
+            test = features.arrays["indices"][window_indices(
+                features, TEST, LENGTH
+            )]
+            if not len(test):
+                raise ValueError(
+                    f"Empty held-out test: {name}, fold {fold}."
+                )
+            tested = np.unique(test)
+            test_identity = fingerprint(test.tolist())
+            for fraction in settings["target_fractions"]:
+                train, validation, _ = target_selection(
+                    features, len(raw.arrays["t"]), fraction, SEED
+                )
+                if not len(train) or not len(validation):
+                    raise ValueError(
+                        f"Empty held-out adaptation: {name}, "
+                        f"fold {fold}, fraction {fraction}."
+                    )
+                chosen = [
+                    np.unique(features.arrays["indices"][indices])
+                    for indices in (train, validation)
+                ]
+                if any(
+                    np.intersect1d(left, right).size
+                    for left, right in (
+                        (chosen[0], chosen[1]),
+                        (chosen[0], tested),
+                        (chosen[1], tested),
+                    )
+                ):
+                    raise ValueError(
+                        f"Held-out split overlap: {name}, "
+                        f"fold {fold}, fraction {fraction}."
+                    )
+                rows.append(dict(
+                    session=name, fold=fold, fraction=fraction,
+                    training_windows=len(train),
+                    validation_windows=len(validation),
+                    test_windows=len(test),
+                    test_identity=test_identity,
+                ))
+    expected = (
+        len(settings["held_out_sessions"])
+        * len(settings["target_folds"])
+        * len(settings["target_fractions"])
+    )
+    if len(rows) != expected:
+        raise ValueError(
+            f"Expected {expected} held-out split audits, "
+            f"got {len(rows)}."
+        )
+    return rows

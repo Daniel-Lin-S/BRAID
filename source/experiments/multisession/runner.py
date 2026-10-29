@@ -161,6 +161,21 @@ def plan_campaign(settings: dict) -> tuple[dict, Path]:
         audit_source_holdout(adapter, reference)
         audit_inner_splits(adapter, reference, settings)
         plan = build_direct_plan(settings, sessions, reference)
+    elif settings["name"] == "multi_session_self_supervised_scaling":
+        from .behavior_compute_scaling.audit import (
+            audit_source_holdout, audit_inner_splits,
+            audit_held_out_windows,
+        )
+        from .compute_scaling.self_supervised import build_plan as build_neural
+
+        reference = json.loads(
+            Path(settings["source_reference_plan"]).resolve().read_text()
+        )
+        audit_source_holdout(adapter, reference)
+        audit_inner_splits(adapter, reference, settings)
+        target_audit = audit_held_out_windows(adapter, settings)
+        plan = build_neural(settings, sessions, reference)
+        plan["held_out_window_audit"] = target_audit
     elif settings["name"] == "multi_session_source_capacity_scaling":
         from experiments.multisession.capacity import build_capacity_plan
 

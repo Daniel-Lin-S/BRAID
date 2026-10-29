@@ -1,4 +1,4 @@
-"""Run independently checkpointed direct-behavior source budget tasks.
+"""Run independently checkpointed source compute-budget tasks.
 
 Input is the existing immutable direct-behavior source plan. Prefix tasks
 write checksum-valid RNN1 main checkpoints. Budget tasks write one matched
@@ -23,11 +23,28 @@ from experiments.storage.cache import atomic_json, fingerprint
 COMMON_SESSIONS = 4
 COMMON_WINDOWS = 87
 TASK_PROTOCOL = "direct_behavior_budget_tasks_v1"
+NEURAL_TASK_PROTOCOL = "single_neural_budget_tasks_v2"
 LOCAL_DEVICE = ("/GPU:0", "/GPU:0")
 
 
 def validate_plan(plan: dict) -> None:
     """Require the existing four-count direct source-only design."""
+    from experiments.multisession.compute_scaling.self_supervised import (
+        CAMPAIGN as NEURAL_CAMPAIGN,
+    )
+    if plan.get("name") == NEURAL_CAMPAIGN:
+        if not plan.get("source_only"):
+            raise ValueError("Neural budget plan must be source-only.")
+        sources = plan["source_references"]
+        counts = [plan["jobs"][key]["source_count"] for key in sources]
+        if len(sources) != 4 or sorted(counts) != [4, 8, 16, 33]:
+            raise ValueError("Expected four neural source counts.")
+        if any(
+            plan["jobs"][key]["objective"] != "neural"
+            for key in sources
+        ):
+            raise ValueError("Neural budget plan has behavior objective.")
+        return
     if plan.get("name") != DIRECT_CAMPAIGN or not plan.get("source_only"):
         raise ValueError("Budget tasks require the direct source-only plan.")
     sources = plan["source_references"]
@@ -117,6 +134,12 @@ def prefix_component(
 
 def fit_prefixes(plan: dict, launch: Path, key: str) -> None:
     """Extend the RNN1 main run, releasing each saved checkpoint."""
+    if plan["name"] != DIRECT_CAMPAIGN:
+        from experiments.multisession.compute_scaling.self_supervised import (
+            fit_prefixes as neural_prefixes,
+        )
+        neural_prefixes(plan, launch, key)
+        return
     from experiments.multisession.behavior_compute_scaling.pipeline import (
         stage_identity,
     )
@@ -171,7 +194,10 @@ def budget_identity(plan: dict, key: str, budget: int) -> dict:
     ):
         raise ValueError(f"Unknown source budget {budget}.")
     return dict(
-        protocol=TASK_PROTOCOL, source_fit=key,
+        protocol=(
+            TASK_PROTOCOL if plan["name"] == DIRECT_CAMPAIGN
+            else NEURAL_TASK_PROTOCOL
+        ), source_fit=key,
         implementation=spec["implementation"], budget=budget,
     )
 
@@ -190,6 +216,12 @@ def fit_budget(
     plan: dict, launch: Path, key: str, budget: int,
 ) -> None:
     """Fit or reuse one matched RNN1/readout/RNN2 budget path."""
+    if plan["name"] != DIRECT_CAMPAIGN:
+        from experiments.multisession.compute_scaling.self_supervised import (
+            fit_budget as neural_budget,
+        )
+        neural_budget(plan, launch, key, budget)
+        return
     from experiments.multisession.behavior_compute_scaling.pipeline import (
         run_stage,
     )
@@ -284,6 +316,12 @@ def fit_budget(
 
 def finish_source(plan: dict, key: str) -> None:
     """Assemble seven completed paths into the ordinary source fit."""
+    if plan["name"] != DIRECT_CAMPAIGN:
+        from experiments.multisession.compute_scaling.self_supervised import (
+            finish_source as finish_neural,
+        )
+        finish_neural(plan, key)
+        return
     from experiments.multisession.behavior_supervision.models import (
         rnn1_model, rnn2_model,
     )
