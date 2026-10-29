@@ -631,20 +631,20 @@ def report(
     counts: tuple[int, ...] = COUNTS,
 ) -> None:
     """Publish a complete design or the authorized three-count interim."""
-    source_snapshot = None
+    if plan.get("source_only") and plan.get("name") == DIRECT_CAMPAIGN:
+        if counts != COUNTS:
+            raise ValueError("Direct source report needs all counts.")
+        from .direct_report import publish_direct_report
+
+        publish_direct_report(plan, plan_path)
+        return
     if revised_protocol(plan):
         if counts != COUNTS:
             raise ValueError(
                 "Interim figures are not authorized for this protocol."
             )
-        source_snapshot = source_report(plan, plan_path)
+        source_report(plan, plan_path)
     if plan.get("source_only"):
-        if plan.get("name") == DIRECT_CAMPAIGN and source_snapshot is not None:
-            from .direct_report import publish_direct_performance
-
-            publish_direct_performance(
-                plan, plan_path, source_snapshot
-            )
         return
     if not campaign_complete(plan, final or counts != COUNTS, counts):
         return

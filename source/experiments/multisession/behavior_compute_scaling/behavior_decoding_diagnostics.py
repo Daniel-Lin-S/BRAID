@@ -96,12 +96,17 @@ weight sharing or establish transfer to new recordings.
 """
 
 
-def checked_sources(plan: dict, report: Path) -> list[dict]:
-    """Validate four completed fits and one fixed evaluation identity."""
-    if completed(report) is None:
-        raise ValueError(f"Incomplete source report: {report.resolve()}.")
-    with (report / "tables" / "selection.csv").open() as stream:
-        reported = list(csv.DictReader(stream))
+def checked_sources(
+    plan: dict, report: Path | None = None,
+    choices: list[dict] | None = None,
+) -> list[dict]:
+    """Validate completed fits and their selected checkpoints."""
+    if choices is None:
+        if report is None or completed(report) is None:
+            raise ValueError("A completed source report is required.")
+        with (report / "tables" / "selection.csv").open() as stream:
+            choices = list(csv.DictReader(stream))
+    reported = choices
     references = plan["source_references"]
     if len(references) != len(COUNTS):
         raise ValueError("Expected one source reference per source count.")

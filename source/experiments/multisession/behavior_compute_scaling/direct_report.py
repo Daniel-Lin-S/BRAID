@@ -1,9 +1,9 @@
 """Score direct-behavior source fits on the fixed four-session holdout.
 
-Input is a completed source-only plan and its immutable source-loss report.
-Output is one immutable sibling report with session_scores.csv (recording,
-source count, horizon, target, CC, R2, MSE, dummy MSE and ratio), summary.csv
-(equal four-recording means), guide.md, and nine target/metric PNG figures.
+Input is a completed source-only plan and its saved source checkpoints.
+Output is one immutable report with tables for source losses, selected
+checkpoints and per-recording CC, R2, MSE and dummy MSE. Its figures/
+directory contains two source-loss and nine performance PNG figures.
 No fit or target adaptation is started.
 """
 
@@ -24,7 +24,9 @@ from experiments.multisession.behavior_compute_scaling import (
 from experiments.multisession.behavior_compute_scaling.ancestry import (
     restore_component,
 )
-from experiments.multisession.behavior_compute_scaling.plan import COUNTS
+from experiments.multisession.behavior_compute_scaling.plan import (
+    COUNTS, RECURRENT_STAGES,
+)
 from experiments.multisession.behavior_supervision.models import (
     neural_readout_model, rnn1_model, rnn2_model,
 )
@@ -35,7 +37,9 @@ from experiments.multisession.data import SAMPLE_RATE
 from experiments.multisession.plan import analysis_directory
 from experiments.multisession.reports import write_table
 from experiments.multisession.source import residual_data
-from experiments.multisession.store import completed, job
+from experiments.multisession.store import (
+    completed, fit_directory, job,
+)
 from experiments.multisession.training import (
     recurrent_data, stage_predictions,
 )
@@ -57,7 +61,14 @@ FIGURE_SIZE = (14, 10)
 DPI = 180
 STAGE_LOSS_RELATIVE_TOLERANCE = 5e-4
 STAGE_LOSS_ABSOLUTE_TOLERANCE = 1e-5
-GUIDE = """# Direct recorded-behavior source performance
+GUIDE = """# Direct recorded-behavior source scaling
+
+The source_behavior_relevant.png and source_residual.png figures plot
+chronological source test loss against full-pipeline training FLOPs.
+Each shows seven recurrent budgets for each of four source counts.
+Source loss sums squared error across the four trained horizons and
+equally averages the four common recordings. The residual stage scores
+the full neural prediction, including the matched neural readout.
 
 RNN1 predicts the four-coordinate, training-normalized recorded position
 and velocity directly. The two n0 preprocessing stages and n3 are absent.
@@ -75,6 +86,11 @@ MSE/dummy MSE; values above one mean worse than dummy. CC and R2 average
 valid per-channel values. Each plotted point averages four recording scores
 equally. The four panels show the trained 50, 100, 200 and 400 ms horizons.
 No target adaptation or uncertainty interval is included.
+
+The tables/ directory contains source_loss.csv, source_session_loss.csv,
+selection.csv, session_scores.csv and summary.csv. The first two give
+stage losses by budget and recording; selection.csv records the chosen
+matched budget. The last two give performance by recording and mean.
 """
 
 
@@ -301,22 +317,34 @@ def figures(summary: list[dict], directory: Path) -> None:
     print(f"Saved direct-behavior performance figures: {directory.resolve()}")
 
 
-def publish_direct_performance(
-    plan: dict, plan_path: Path, source_report: Path,
-) -> Path:
-    """Publish matched behavior and full-neural scores after all sources."""
-    selected = decoding.checked_sources(plan, source_report)
+def publish_direct_report(plan: dict, plan_path: Path) -> Path | None:
+    """Publish source losses and selected performance in one snapshot."""
+    from .report import source_figures, source_tables
+
+    references = plan["source_references"]
+    if len(references) != len(COUNTS):
+        raise ValueError("Expected one source fit per source count.")
+    if any(
+        completed(fit_directory(plan, key)) is None
+        for key in references
+    ):
+        return None
+    losses, session_losses, choices = source_tables(plan)
+    if len(choices) != len(COUNTS):
+        raise ValueError("Incomplete source checkpoint selection.")
+    selected = decoding.checked_sources(plan, choices=choices)
     if any(
         target_mode(source["spec"]) != RECORDED
         for source in selected
     ):
         raise ValueError("Direct report requires recorded RNN1 targets.")
-    marker = completed(source_report)
-    if marker is None:
-        raise ValueError(f"Incomplete source report: {source_report}.")
     identity = dict(
-        group="direct_behavior_source_performance",
-        source_report_checksums=marker["checksums"],
+        group="direct_behavior_complete_source_report_v1",
+        source_counts=list(COUNTS),
+        source_completions={
+            key: completed(fit_directory(plan, key))["checksums"]
+            for key in references
+        },
         selected_components={
             str(source["count"]): source["path"]["stages"]
             for source in selected
@@ -345,21 +373,40 @@ def publish_direct_performance(
                 verify_stage_loss(source, neural_rows, "residual", 1)
                 scores.extend(neural_rows)
             summary = summarize(scores)
-            write_table(destination / "session_scores.csv", scores)
-            write_table(destination / "summary.csv", summary)
+            tables = destination / "tables"
+            figure_dir = destination / "figures"
+            tables.mkdir()
+            figure_dir.mkdir()
+            write_table(tables / "source_loss.csv", losses)
+            write_table(
+                tables / "source_session_loss.csv", session_losses
+            )
+            write_table(tables / "selection.csv", choices)
+            write_table(tables / "session_scores.csv", scores)
+            write_table(tables / "summary.csv", summary)
             (destination / "guide.md").write_text(GUIDE)
-            atomic_json(destination / "source_reference.json", dict(
-                snapshot=str(source_report.resolve()),
-            ))
-            figures(summary, destination / "figures")
-    atomic_json(root / "latest_performance_figures.json", dict(
-        snapshot=str((destination / "figures").resolve()),
-        identity=fingerprint(identity),
-    ))
+            source_figures(
+                losses, figure_dir, stages=RECURRENT_STAGES,
+                expected_points=len(
+                    plan["settings"]["source_training"]["total_updates"]
+                ), direct=True,
+            )
+            figures(summary, figure_dir)
+    marker = completed(destination)
+    if marker is None:
+        raise ValueError(f"Incomplete direct report: {destination}.")
+    figure_dir = (destination / "figures").resolve()
+    pointer = dict(
+        snapshot=str(figure_dir), identity=fingerprint(identity),
+    )
+    for name in (
+        "latest_source_figures.json", "latest_performance_figures.json",
+        "latest_figures.json",
+    ):
+        atomic_json(root / name, pointer)
     atomic_json(root / "latest_report.json", dict(
-        source_loss_report=str(source_report.resolve()),
-        source_loss_figures=str((source_report / "figures").resolve()),
-        performance_report=str(destination.resolve()),
-        performance_figures=str((destination / "figures").resolve()),
+        snapshot=str(destination.resolve()),
+        figures=str(figure_dir),
+        identity=fingerprint(identity),
     ))
     return destination
