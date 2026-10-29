@@ -31,6 +31,9 @@ from experiments.multisession.behavior_compute_scaling import (
     behavior_decoding_diagnostics as decoding,
     n3_addon,
 )
+from experiments.multisession.behavior_compute_scaling.ancestry import (
+    checked_reference, inherited_paths,
+)
 from experiments.multisession.behavior_compute_scaling.plan import COUNTS
 from experiments.multisession.behavior_compute_scaling.training import (
     balanced_update, evaluate_sessions, fit_segment, gradient_function,
@@ -55,6 +58,10 @@ LOW_CPU_PRIORITY = 10
 AUDIT_UPDATES = 3
 AUDIT_COUNT = 4
 N3_SIZE = 1
+UNUSED_FIXED_STAGE_FIELDS = (
+    "checkpoints", "total_updates", "maximum_updates",
+    "batch_size", "patience", "validation_interval",
+)
 N3_DECODER_WIDTH = 64
 N3_SEED_OFFSET = 5
 TASK_WIDTH = 2
@@ -190,17 +197,83 @@ def identity(
     )
 
 
-def directory(
-    source: dict, index: int, size: int = N3_SIZE,
-) -> Path:
-    """Resolve one immutable fit path without fitting it."""
-    scientific = dict(
+def segment_identity(
+    source: dict, index: int, size: int,
+) -> dict:
+    """Bind a private fit to its fixed-stage schedule and upstream state."""
+    return dict(
         identity(source, index, size), start=0,
         stop=session_settings(source)["fixed_update_cap"],
         branch=False, parent=None, parent_checksums=None,
         fixed_stage=True,
     )
-    return n3_addon.component_root(source) / fingerprint(scientific)
+
+
+def reusable_inputs(scientific: dict) -> dict:
+    """Remove source bookkeeping and unused recurrent budget settings.
+
+    Parameters
+    ----------
+    scientific : dict
+        Private n3 segment identity. Fixed-stage n3 always uses a constant
+        learning rate and its own exposure cap; recurrent checkpoints do
+        not participate in fitting.
+
+    Returns
+    -------
+    dict
+        All scientific n3 inputs, excluding the source wrapper identifier
+        and the recurrent ladder. Checkpoint checksums, splits, seed,
+        width, optimizer, batch, and early-stopping parameters remain.
+    """
+    result = dict(scientific)
+    result.pop("source_fit")
+    result["source_training"] = {
+        key: value for key, value in scientific["source_training"].items()
+        if key not in UNUSED_FIXED_STAGE_FIELDS
+    }
+    return result
+
+
+def directory(
+    source: dict, index: int, size: int = N3_SIZE,
+) -> Path:
+    """Reuse compatible ancestor n3 completions without copying fits."""
+    scientific = segment_identity(source, index, size)
+    root = n3_addon.component_root(source)
+    current = root / fingerprint(scientific)
+    if completed(current) is not None:
+        return current
+    cursor = source["fit"]
+    visited = set()
+    while (cursor / "continuation.json").is_file():
+        if cursor in visited:
+            raise ValueError("Cyclic n3 source ancestry.")
+        visited.add(cursor)
+        reference = json.loads(
+            (cursor / "continuation.json").read_text()
+        )
+        cursor = checked_reference(cursor.parent, reference)
+        spec = json.loads((cursor / "identity.json").read_text())
+        selection = json.loads((cursor / "selection.json").read_text())
+        paths = [
+            path for path in inherited_paths(cursor)
+            if path["budget"] == selection["selected_budget"]
+        ]
+        if len(paths) != 1:
+            raise ValueError("Ancestor needs one selected source path.")
+        ancestor = dict(
+            count=spec["source_count"], spec=spec, fit=cursor,
+            selection=selection, path=paths[0],
+            inventory=json.loads((cursor / "data.json").read_text()),
+        )
+        candidate = segment_identity(ancestor, index, size)
+        if reusable_inputs(candidate) != reusable_inputs(scientific):
+            continue
+        existing = root / fingerprint(candidate)
+        if completed(existing) is not None:
+            return existing
+    return current
 
 
 def windows(
@@ -633,6 +706,17 @@ def coordinator(
         elif report_kind == "sweep":
             from .n3_sweep import publish as publish_sweep
             report = publish_sweep(plan_path, source_report)
+        elif report_kind == "comparison":
+            from .preprocessing_comparison import publish as compare
+
+            arguments = json.loads(
+                (launch / "launch.json").read_text()
+            )["comparison"]
+            report = compare(
+                plan_path, source_report, None,
+                Path(arguments["direct_plan"]),
+                Path(arguments["direct_report"]),
+            )
         else:
             raise ValueError(f"Unknown n3 report kind {report_kind}.")
     except Exception as error:
@@ -649,10 +733,19 @@ def launch(
     plan_path: Path, source_report: Path, microbatch: int,
     sizes: tuple[int, ...] = (N3_SIZE,),
     report_kind: str = "single",
+    comparison: dict | None = None,
 ) -> Path:
     """Detach a session-granular queue on available GPUs."""
     plan = json.loads(plan_path.read_text())
     sources(plan, source_report)
+    if report_kind == "comparison" and (
+        comparison is None
+        or set(comparison) != {"direct_plan", "direct_report"}
+        or sizes != (16,)
+    ):
+        raise ValueError(
+            "Comparison queue requires n3=16 and direct plan/report paths."
+        )
     if microbatch <= 0:
         raise ValueError("n3 microbatch must be positive.")
     devices = select_gpus("auto", GPU_INVENTORY_COUNT)
@@ -667,7 +760,7 @@ def launch(
         plan=str(plan_path), source_report=str(source_report),
         devices=devices, microbatch=microbatch,
         protocol=PROTOCOL, sizes=list(sizes),
-        report_kind=report_kind,
+        report_kind=report_kind, comparison=comparison,
     ))
     env = dict(os.environ)
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[3])

@@ -12,7 +12,7 @@ import numpy as np
 from BRAID.multisession import MixedForecaster
 from experiments.multisession.behavior_compute_scaling.n3_session import (
     log_progress, publish_status, selected_session_weights,
-    session_settings,
+    session_settings, reusable_inputs,
 )
 from experiments.multisession.log_paths import source_session_log_path
 from experiments.multisession.behavior_compute_scaling.training import (
@@ -109,3 +109,40 @@ def test_worker_logs_are_nested_and_status_is_lifecycle_only(
         .read_text()
     )
     assert progress["members"]["33:0:n3_16"]["training_loss"] == 0.5
+
+
+def test_ancestor_reuse_preserves_actual_scientific_inputs() -> None:
+    """Unused parent ladder changes are safe; upstream or fit changes fail."""
+    scientific = dict(
+        source_fit="original", upstream_checksums={"weights": "abc"},
+        generated_scales_checksum="scale", latent=16,
+        source_training=dict(
+            checkpoints=[40], total_updates=[50],
+            learning_rate=0.001, fixed_update_cap=484,
+            fixed_patience=10, session_batch_sizes={"1": 4},
+            validation_exposure=800 / 33,
+        ),
+    )
+    extended = dict(scientific, source_fit="extension")
+    extended["source_training"] = dict(
+        scientific["source_training"], checkpoints=[40, 80],
+        total_updates=[50, 100], batch_size=32, patience=10,
+        validation_interval=25,
+    )
+    assert reusable_inputs(scientific) == reusable_inputs(extended)
+    for key, value in (
+        ("upstream_checksums", {"weights": "changed"}),
+        ("generated_scales_checksum", "changed"), ("latent", 8),
+    ):
+        changed = dict(extended, **{key: value})
+        assert reusable_inputs(scientific) != reusable_inputs(changed)
+    for key, value in (
+        ("learning_rate", 0.01), ("fixed_update_cap", 500),
+        ("fixed_patience", 9), ("session_batch_sizes", {"1": 8}),
+        ("validation_exposure", 800),
+    ):
+        changed = dict(extended)
+        changed["source_training"] = dict(
+            extended["source_training"], **{key: value}
+        )
+        assert reusable_inputs(scientific) != reusable_inputs(changed)

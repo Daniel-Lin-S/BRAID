@@ -2,10 +2,11 @@
 
 Usage: python -m experiments.multisession.behavior_compute_scaling.
 preprocessing_comparison --with-plan ABSOLUTE_PLAN
-  --with-source-report ABSOLUTE_REPORT --with-n3-report ABSOLUTE_REPORT
+  --with-source-report ABSOLUTE_REPORT [--with-n3-report ABSOLUTE_REPORT]
   --direct-plan ABSOLUTE_PLAN --direct-report ABSOLUTE_REPORT
 
-Inputs are two checksum-valid source reports and the n3=16 sweep report.
+Inputs are two checksum-valid source reports and completed n3=16 fits.
+An optional n3 sweep report supplies previously scored behavior metrics.
 Output is an immutable sibling report under the direct campaign's reports/
 with per-recording scores, paired differences, four-session means, selected
 checkpoint references, a guide, and nine target/metric PNG figures.
@@ -26,6 +27,7 @@ import numpy as np
 from experiments.multisession.behavior_compute_scaling import (
     behavior_decoding_diagnostics as decoding,
     direct_report,
+    n3_session,
 )
 from experiments.multisession.behavior_compute_scaling.ancestry import (
     inherited_paths,
@@ -41,6 +43,7 @@ from experiments.visualization.multisession import (
 
 N3_WIDTH = 16
 COMMON_SESSIONS = 4
+BUDGET_POOL = (50, 100, 200, 400, 800, 1600, 2400)
 HORIZONS = (1, 2, 4, 8)
 GROUPS = ("position", "velocity", "neural")
 METRICS = ("cc", "r2", "mse_ratio")
@@ -65,14 +68,16 @@ model predicts recorded behavior directly and has no n0 or n3. Both use
 n1=n2=16, seed 42, A1,fw plus RNN2 sharing, the same nested source sets,
 and the same 87 chronological windows in four common recordings.
 
-Each source count uses the checkpoint minimizing the sum of RNN1 and RNN2
-mean session dummy-normalized outer-test losses among the five recurrent
-budgets common to both campaigns. The direct campaign's saved original
-selection used seven budgets; this report reselects from five without
-changing fits. The same holdout selects these checkpoints, so the plotted
-selected scores are descriptive. Fixed-stage training and n3 add compute
-only to the purple model. The two pipelines differ in both preprocessing
-and n3; their difference cannot be attributed to preprocessing alone.
+Each campaign uses its saved best checkpoint at each source count. The
+selection minimizes the sum of RNN1 and RNN2 mean session dummy-normalized
+outer-test losses over all completed budgets in that campaign, with lower
+FLOPs breaking an exact tie. Both campaigns use total recurrent budgets
+50/100/200/400/800/1600/2400, doubled for 33 sessions. Each selects its best
+budget independently. The same holdout selects these checkpoints,
+so selected scores are descriptive. The n3=16 correction is applied to the
+preprocessing campaign's selected model. The pipelines differ in
+preprocessing and n3, and selected updates and FLOPs may differ; their
+difference cannot be attributed to preprocessing alone.
 
 Behavior metrics score recorded position and velocity separately. Neural
 metrics score the full RNN1 readout plus RNN2 residual against smoothed,
@@ -103,11 +108,21 @@ def checked_report(path: Path) -> dict:
     return marker
 
 
-def matched_sources(
+def validate_selected_sources(
     with_sources: list[dict], direct_sources: list[dict],
-) -> list[dict]:
-    """Reselect direct checkpoints within the five shared budgets."""
-    paired = []
+) -> None:
+    """Require compatible data and each campaign's saved best checkpoint.
+
+    Parameters
+    ----------
+    with_sources, direct_sources : list of dict
+        Four sources ordered by session count, containing completed fit
+        paths, scientific specifications, and saved checkpoint selections.
+    """
+    if len(with_sources) != len(COUNTS) or (
+        len(direct_sources) != len(COUNTS)
+    ):
+        raise ValueError("Expected four selected sources per campaign.")
     for original, direct in zip(with_sources, direct_sources):
         if original["count"] != direct["count"]:
             raise ValueError("Source count pairing changed.")
@@ -121,42 +136,52 @@ def matched_sources(
             != direct["selection"]["evaluation_set_id"]
         ):
             raise ValueError("Chronological evaluation windows differ.")
-        spec = original["spec"]["source_training"]
-        multiplier = spec["update_multipliers"][str(original["count"])]
-        budgets = {
-            int(value) * int(multiplier)
-            for value in spec["total_updates"]
-        }
-        candidates = [
-            row for row in inherited_paths(direct["fit"])
-            if row["total_updates"] in budgets
-        ]
-        if len(candidates) != len(budgets):
-            raise ValueError(
-                f"Expected {len(budgets)} common budgets for "
-                f"{direct['count']} sessions, got {len(candidates)}."
+        for source in (original, direct):
+            paths = inherited_paths(source["fit"])
+            multiplier = 2 if source["count"] == 33 else 1
+            expected = [budget * multiplier for budget in BUDGET_POOL]
+            actual = [path["total_updates"] for path in paths]
+            if actual != expected:
+                raise ValueError(
+                    f"Expected complete budget pool {expected}, "
+                    f"got {actual} for {source['fit'].resolve()}."
+                )
+            chosen = min(
+                paths,
+                key=lambda row: (
+                    row["selection_score"], row["full_path_flops"]
+                ),
             )
-        chosen = min(
-            candidates,
-            key=lambda row: (
-                row["selection_score"], row["full_path_flops"]
-            ),
-        )
-        updated = dict(direct)
-        updated["path"] = chosen
-        updated["selection"] = dict(
-            direct["selection"], selected_budget=chosen["budget"],
-            selection_score=chosen["selection_score"],
-            selected_full_path_flops=chosen["full_path_flops"],
-        )
-        paired.append(updated)
-    return paired
+            if chosen["budget"] != source["path"]["budget"]:
+                raise ValueError(
+                    "Saved checkpoint is not the best completed budget "
+                    f"for {source['fit'].resolve()}."
+                )
 
 
 def n3_behavior(
-    report: Path, sources: list[dict],
+    report: Path | None, sources: list[dict], common: dict,
 ) -> list[dict]:
-    """Load the existing n3=16 per-recording performance only."""
+    """Score recorded behavior using matching saved private n3 models."""
+    if report is None:
+        scores = []
+        for source in sources:
+            priors = decoding.selected_forecasts(source, common)
+            names = source["spec"]["sessions"][:COMMON_SESSIONS]
+            predictions = [
+                n3_session.corrected(
+                    source, index, common[name]["test"],
+                    priors[index], N3_WIDTH,
+                )
+                for index, name in enumerate(names)
+            ]
+            scores.extend(
+                dict(row, variant=VARIANTS[0])
+                for row in decoding.session_scores(
+                    source, common, predictions
+                )
+            )
+        return scores
     rows = read_rows(report / "session_scores.csv")
     selected = [
         row for row in rows if int(row["n3_size"]) == N3_WIDTH
@@ -197,11 +222,11 @@ def n3_behavior(
 
 def scored_models(
     direct_plan: dict, with_sources: list[dict],
-    direct_sources: list[dict], n3_report: Path,
+    direct_sources: list[dict], n3_report: Path | None,
 ) -> list[dict]:
     """Score selected full neural models and direct behavior."""
     common = decoding.fixed_windows(direct_plan, direct_sources)
-    scores = n3_behavior(n3_report, with_sources)
+    scores = n3_behavior(n3_report, with_sources, common)
     for variant, sources in (
         (VARIANTS[0], with_sources),
         (VARIANTS[1], direct_sources),
@@ -353,15 +378,30 @@ def comparison_figures(summary: list[dict], directory: Path) -> None:
     print(f"Saved preprocessing comparison figures: {directory.resolve()}")
 
 
+def n3_references(sources: list[dict]) -> dict:
+    """Pin all sixteen selected private correction checkpoints."""
+    references = {}
+    for source in sources:
+        references[str(source["count"])] = {}
+        for index in range(COMMON_SESSIONS):
+            name = n3_session.session_name(source, index)
+            path = n3_session.directory(source, index, N3_WIDTH)
+            marker = checked_report(path)
+            references[str(source["count"])][name] = dict(
+                component=path.name, checksums=marker["checksums"],
+            )
+    return references
+
+
 def publish(
     with_plan_path: Path, with_source_report: Path,
-    with_n3_report: Path, direct_plan_path: Path,
+    with_n3_report: Path | None, direct_plan_path: Path,
     direct_report_path: Path,
 ) -> Path:
     """Publish checksum-pinned comparison without refitting models."""
-    reports = (
-        with_source_report, with_n3_report, direct_report_path,
-    )
+    reports = [with_source_report, direct_report_path]
+    if with_n3_report is not None:
+        reports.append(with_n3_report)
     markers = [checked_report(path) for path in reports]
     with_plan = json.loads(with_plan_path.read_text())
     direct_plan = json.loads(direct_plan_path.read_text())
@@ -373,19 +413,22 @@ def publish(
     direct_sources = decoding.checked_sources(
         direct_plan, direct_report_path
     )
-    matched = matched_sources(with_sources, direct_sources)
+    validate_selected_sources(with_sources, direct_sources)
     identity = dict(
-        group="behavior_preprocessing_comparison_v1",
+        group="behavior_preprocessing_comparison_seven_budgets_v3",
+        budget_pool=list(BUDGET_POOL),
+        n3_components=n3_references(with_sources),
+        selection="saved_best_over_all_completed_budgets",
         input_checksums={
             path.name: marker["checksums"]
             for path, marker in zip(reports, markers)
         },
-        matched_direct={
+        selected_direct={
             str(source["count"]): dict(
                 budget=source["path"]["budget"],
                 stages=source["path"]["stages"],
             )
-            for source in matched
+            for source in direct_sources
         },
         guide=GUIDE,
     )
@@ -397,7 +440,7 @@ def publish(
     with job(destination, identity) as needed:
         if needed:
             scores = scored_models(
-                direct_plan, with_sources, matched, with_n3_report
+                direct_plan, with_sources, direct_sources, with_n3_report
             )
             paired = paired_scores(scores)
             summary = [
@@ -431,13 +474,16 @@ def publish(
                         "full_path_flops"
                     ],
                 )
-                for original, direct in zip(with_sources, matched)
+                for original, direct in zip(with_sources, direct_sources)
             ])
             (destination / "guide.md").write_text(GUIDE)
             atomic_json(destination / "inputs.json", dict(
                 with_plan=str(with_plan_path.resolve()),
                 with_source_report=str(with_source_report.resolve()),
-                with_n3_report=str(with_n3_report.resolve()),
+                with_n3_report=(
+                    str(with_n3_report.resolve())
+                    if with_n3_report is not None else None
+                ),
                 direct_plan=str(direct_plan_path.resolve()),
                 direct_report=str(direct_report_path.resolve()),
             ))
@@ -453,17 +499,20 @@ def publish(
 
 
 def main() -> None:
-    """Publish a matched selected-checkpoint comparison report."""
+    """Compare each campaign at its saved best-budget checkpoints."""
     parser = argparse.ArgumentParser(description=__doc__)
     for name in (
         "with-plan", "with-source-report", "with-n3-report",
         "direct-plan", "direct-report",
     ):
-        parser.add_argument(f"--{name}", required=True, type=Path)
+        parser.add_argument(
+            f"--{name}", required=name != "with-n3-report", type=Path
+        )
     args = parser.parse_args()
     publish(
         args.with_plan.resolve(), args.with_source_report.resolve(),
-        args.with_n3_report.resolve(), args.direct_plan.resolve(),
+        args.with_n3_report.resolve() if args.with_n3_report else None,
+        args.direct_plan.resolve(),
         args.direct_report.resolve(),
     )
 
