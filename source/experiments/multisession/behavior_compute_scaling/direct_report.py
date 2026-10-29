@@ -55,6 +55,8 @@ COLORS = dict(
 MARKERS = dict(position="o", velocity="s", neural="D")
 FIGURE_SIZE = (14, 10)
 DPI = 180
+STAGE_LOSS_RELATIVE_TOLERANCE = 5e-4
+STAGE_LOSS_ABSOLUTE_TOLERANCE = 1e-5
 GUIDE = """# Direct recorded-behavior source performance
 
 RNN1 predicts the four-coordinate, training-normalized recorded position
@@ -79,7 +81,7 @@ No target adaptation or uncertainty interval is included.
 def verify_stage_loss(
     source: dict, scores: list[dict], stage: str, groups: int,
 ) -> None:
-    """Match scored horizon MSE to the selected native stage loss."""
+    """Compare scored MSE with saved loss across numerical backends."""
     saved = source["path"]["stages"][stage]["score"]
     for record in saved["per_session"]:
         name = record["session"]
@@ -91,7 +93,9 @@ def verify_stage_loss(
             )
         reconstructed = sum(row["mse"] for row in rows) / groups
         if not np.isclose(
-            reconstructed, record["loss"], rtol=1e-4, atol=1e-5
+            reconstructed, record["loss"],
+            rtol=STAGE_LOSS_RELATIVE_TOLERANCE,
+            atol=STAGE_LOSS_ABSOLUTE_TOLERANCE,
         ):
             raise ValueError(
                 f"{stage} holdout loss differs from scored MSE for "
@@ -351,5 +355,11 @@ def publish_direct_performance(
     atomic_json(root / "latest_performance_figures.json", dict(
         snapshot=str((destination / "figures").resolve()),
         identity=fingerprint(identity),
+    ))
+    atomic_json(root / "latest_report.json", dict(
+        source_loss_report=str(source_report.resolve()),
+        source_loss_figures=str((source_report / "figures").resolve()),
+        performance_report=str(destination.resolve()),
+        performance_figures=str((destination / "figures").resolve()),
     ))
     return destination
