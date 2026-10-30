@@ -191,6 +191,7 @@ def source_figures(
     direct: bool = False,
     stage_labels: dict[str, str] | None = None,
     x_label: str = "Full-pipeline source model FLOPs",
+    filename_prefix: str = "",
 ) -> None:
     """Draw complete log-log source panels for requested stages."""
     if not rows:
@@ -274,7 +275,7 @@ def source_figures(
                 left=0.12, right=0.73, top=0.87, bottom=0.16
             )
         figure.savefig(
-            directory / f"source_{stage}.png",
+            directory / f"{filename_prefix}source_{stage}.png",
             dpi=180, bbox_inches="tight",
         )
         plt.close(figure)
