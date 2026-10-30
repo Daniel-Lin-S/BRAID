@@ -17,7 +17,7 @@ from experiments.multisession.behavior_supervision.models import (
     NEURAL_WIDTH, STAGE2_SHARING, rnn2_model,
 )
 from experiments.multisession.compute_scaling.ancestry import (
-    restore_component,
+    main_prefix, restore_component,
 )
 from experiments.multisession.compute_scaling.branching import load_flops
 from experiments.multisession.compute_scaling.self_supervised import (
@@ -45,7 +45,8 @@ WARMUP_START = 1e-7
 LEARNING_RATE = 1e-3
 HEAD_BATCH = 8
 HEAD_CAP = 2000
-HEAD_INTERVAL = 800
+HEAD_INTERVAL = 200
+PREVIOUS_HEAD_INTERVAL = 800
 HEAD_PATIENCE = 10
 HEAD_WIDTH = 64
 CORE_KEYS = ("A", "Afw", "Kfw")
@@ -115,9 +116,13 @@ def session_identity(plan: dict, key: str, index: int) -> dict:
     )
 
 
-def session_directory(plan: dict, key: str, index: int) -> Path:
-    """Locate a private seen-session path by scientific identity."""
+def session_directory(
+    plan: dict, key: str, index: int,
+    readout_interval: int = HEAD_INTERVAL,
+) -> Path:
+    """Locate a seen-session path for one readout check interval."""
     identity = session_identity(plan, key, index)
+    identity["readout_interval"] = readout_interval
     root = (
         Path(plan["settings"]["paths"]["artifact_root"])
         / PRIMARY / "source_session_paths" / key
@@ -219,8 +224,65 @@ def verify_frozen_core(model: MixedForecaster, core: dict) -> None:
             np.testing.assert_array_equal(expected, actual)
 
 
+def reused_behavior_branch(
+    plan: dict, key: str, index: int,
+    model: MixedForecaster, core: dict, record: dict,
+) -> tuple[Path, int, str]:
+    """Restore the completed RNN1 branch with identical scientific inputs.
+
+    Parameters
+    ----------
+    plan : dict
+        Neural source campaign plan.
+    key : str
+        Source fit identity.
+    index : int
+        Common recording index, from zero to three.
+    model : MixedForecaster
+        Initialized session-local behavioral model.
+    core : dict
+        Frozen pretrained core arrays indexed by module name.
+    record : dict
+        Verified training, inner-validation, and outer-test inventory.
+
+    Returns
+    -------
+    tuple of Path, int, str
+        Completed decay branch, full RNN1 training FLOPs, and previous
+        session path name.
+    """
+    previous = session_directory(
+        plan, key, index, PREVIOUS_HEAD_INTERVAL
+    )
+    if completed(previous) is None:
+        raise ValueError(
+            f"Missing completed RNN1 reuse path: {previous.resolve()}."
+        )
+    expected = session_identity(plan, key, index)
+    expected["readout_interval"] = PREVIOUS_HEAD_INTERVAL
+    saved = json.loads((previous / "identity.json").read_text())
+    inventory = json.loads((previous / "data.json").read_text())
+    if fingerprint(saved) != fingerprint(expected) or inventory != record:
+        raise ValueError(
+            f"RNN1 reuse inputs changed: {previous.resolve()}."
+        )
+    path = json.loads((previous / "path.json").read_text())
+    if path["session"] != expected["session"] or (
+        path["session_index"] != index
+    ):
+        raise ValueError("RNN1 reuse recording identity changed.")
+    branch = component_root(plan) / path["stages"]["behavior_relevant"]
+    prefix = main_prefix(branch)
+    flops = load_flops(prefix) + load_flops(branch)
+    if path["behavior_rnn1_flops"] != flops:
+        raise ValueError("Saved RNN1 path FLOPs differ from its components.")
+    restore_component(model, branch)
+    verify_frozen_core(model, core)
+    return branch, flops, previous.name
+
+
 def fit_session(plan: dict, key: str, index: int) -> None:
-    """Fit one private behavioral RNN1 and its neural readout."""
+    """Reuse behavioral RNN1 and fit one private neural readout."""
     identity = session_identity(plan, key, index)
     destination = session_directory(plan, key, index)
     with job(destination, identity) as needed:
@@ -237,23 +299,9 @@ def fit_session(plan: dict, key: str, index: int) -> None:
         training = [recurrent_data(train, "Z")]
         validation = [recurrent_data(inner, "Z")]
         root = component_root(plan)
-        settings = recurrent_settings()
-        stage = dict(
-            identity, stage="behavior_relevant",
-            target="recorded_Z", settings=settings,
+        branch, behavior_flops, previous = reused_behavior_branch(
+            plan, key, index, model, core, record
         )
-        main, _ = fit_segment(
-            model, training, root, stage, settings,
-            spec["seed"] + 2 + index, 0, MAIN_UPDATES, None,
-            LOCAL_DEVICE, HEAD_BATCH,
-        )
-        branch, _ = fit_segment(
-            model, training, root, stage, settings,
-            spec["seed"] + 2 + index,
-            MAIN_UPDATES, TOTAL_UPDATES, main,
-            LOCAL_DEVICE, HEAD_BATCH, branch=True,
-        )
-        verify_frozen_core(model, core)
         train_states = stage_predictions(model, training)[1]
         inner_states = stage_predictions(model, validation)[1]
         readout_train = readout_data(
@@ -285,9 +333,8 @@ def fit_session(plan: dict, key: str, index: int) -> None:
                 behavior_relevant=branch.name,
                 neural_readout=readout_path.name,
             ),
-            behavior_rnn1_flops=(
-                load_flops(main) + load_flops(branch)
-            ),
+            behavior_rnn1_flops=behavior_flops,
+            behavior_checkpoint_reused_from=previous,
             neural_readout_flops=load_flops(readout_path),
             readout_selected_update=json.loads((
                 readout_path / "training.json"

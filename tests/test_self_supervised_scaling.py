@@ -388,3 +388,74 @@ def test_recovered_single_session_scores_pair_with_both_protocols(
     saved[0]["reference_score"] = 0.5
     with pytest.raises(ValueError, match="reference changed"):
         report.direct_reference_scores(scores, saved)
+
+
+def test_changed_readout_reuses_exact_completed_rnn1(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A new readout cadence restores RNN1 without fitting it again."""
+    import json
+
+    import pytest
+
+    from experiments.multisession.behavior_supervision import (
+        source_adaptation as adaptation,
+    )
+
+    plan = source_plan(tmp_path)
+    identity = dict(
+        session="common_0", session_index=0,
+        readout_interval=adaptation.HEAD_INTERVAL,
+    )
+    monkeypatch.setattr(
+        adaptation, "session_identity",
+        lambda unused_plan, unused_key, unused_index: dict(identity),
+    )
+    current = adaptation.session_directory(plan, "4", 0)
+    previous = adaptation.session_directory(
+        plan, "4", 0, adaptation.PREVIOUS_HEAD_INTERVAL
+    )
+    assert current != previous
+    previous.mkdir(parents=True)
+    old = dict(identity, readout_interval=adaptation.PREVIOUS_HEAD_INTERVAL)
+    record = {"validation": [1, 2]}
+    (previous / "identity.json").write_text(json.dumps(old))
+    (previous / "data.json").write_text(json.dumps(record))
+    (previous / "path.json").write_text(json.dumps(dict(
+        session="common_0", session_index=0,
+        stages={"behavior_relevant": "branch"},
+        behavior_rnn1_flops=30,
+    )))
+    root = adaptation.component_root(plan)
+    branch = root / "branch"
+    prefix = root / "prefix"
+    monkeypatch.setattr(
+        adaptation, "completed",
+        lambda path: {} if path == previous else None,
+    )
+    monkeypatch.setattr(
+        adaptation, "main_prefix", lambda unused: prefix,
+    )
+    monkeypatch.setattr(
+        adaptation, "load_flops",
+        lambda path: 10 if path == prefix else 20,
+    )
+    restored = []
+    monkeypatch.setattr(
+        adaptation, "restore_component",
+        lambda unused_model, path: restored.append(path),
+    )
+    monkeypatch.setattr(
+        adaptation, "verify_frozen_core",
+        lambda unused_model, unused_core: None,
+    )
+    result = adaptation.reused_behavior_branch(
+        plan, "4", 0, object(), {}, record
+    )
+    assert result == (branch, 30, previous.name)
+    assert restored == [branch]
+    assert adaptation.readout_settings()["validation_exposure"] == 200
+    with pytest.raises(ValueError, match="RNN1 reuse inputs changed"):
+        adaptation.reused_behavior_branch(
+            plan, "4", 0, object(), {}, {"validation": [3]}
+        )

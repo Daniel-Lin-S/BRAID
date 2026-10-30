@@ -75,7 +75,8 @@ on the four seen recordings. Its behavioral RNN1 starts from the shared
 A/Afw/Kfw core and each recording's private neural input K. The recurrent
 core stays frozen; private K is fine-tuned and a new behavior decoder C is
 trained. Four session paths fit independently for 800 RNN1 updates, then
-train private neural readouts with inner-validation early stopping. A shared
+train private neural readouts with inner-validation checks every 200
+sampled windows per recording and early stopping. A shared
 RNN2 is fitted for 800 updates after all four paths complete. RNN2 predicts
 an additive neural correction. No n0 or n3 is fitted. Adaptation FLOPs are
 recorded separately from the source panel's x-axis.
@@ -540,6 +541,8 @@ independently saved direct scores within 0.001, and evaluated sample counts
 match. The neural-pretrained downstream RNN1 and RNN2 use 800 updates;
 therefore the baseline is a common direct BRAID reference, not an
 exposure-matched control for every downstream stage.
+The neural-pretrained readout uses the same 200-window-per-recording
+inner-validation cadence as the direct four-source model and the control.
 
 For metric m, recording s and source count c, gain is m(s,c)-m(s,1)
 for CC and R2, and m(s,1)-m(s,c) for MSE/dummy MSE. Dummy MSE uses that
@@ -555,7 +558,7 @@ loss against full-backbone training FLOPs for all seven budgets at each
 source count, with log axes. The source checkpoint is selected on inner
 validation. The direct reference's historical outer results were inspected,
 so retrospective inner reselection does not restore a blind historical
-test. No model refit or unseen-session adaptation is started.
+test. No unseen-session adaptation is included.
 """
 
 
