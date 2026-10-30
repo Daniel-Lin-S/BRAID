@@ -2,6 +2,7 @@
 
 Usage: python -m experiments.multisession.behavior_compute_scaling.budget_queue
        --plan ABSOLUTE_PLAN --detach
+       [--baseline-gains-report ABSOLUTE_REPORT]
 
 Input is a published source-only plan. Output is a detached
 campaign log with lifecycle status, nested task logs, and frozen source code.
@@ -98,20 +99,24 @@ def task_complete(
     if spec["task_kind"] in ("session", "full"):
         if completed(fit_directory(plan, source)) is None:
             return False
-        from experiments.multisession.behavior_supervision.source_adaptation import (
-            full_directory, session_directory,
+        from experiments.multisession.behavior_supervision import (
+            source_adaptation as adaptation,
         )
         if spec["task_kind"] == "session":
-            path = session_directory(
+            path = adaptation.session_directory(
                 plan, source, spec["session_index"]
             )
             return completed(path) is not None
         if any(
-            completed(session_directory(plan, source, index)) is None
+            completed(adaptation.session_directory(
+                plan, source, index
+            )) is None
             for index in range(4)
         ):
             return False
-        return completed(full_directory(plan, source)) is not None
+        return completed(adaptation.full_directory(
+            plan, source
+        )) is not None
     if completed(fit_directory(plan, source)) is not None:
         return True
     kind = spec["task_kind"]
@@ -239,11 +244,18 @@ def start_task(
 
 def run_queue(
     plan: dict, path: Path, launch: Path, source_hash: str,
+    baseline_gains_report: Path | None = None,
 ) -> None:
     """Schedule ready paths while keeping only four one-GPU tasks live."""
     from experiments.multisession.runner import publish_reports, reconcile
 
     validate_plan(plan)
+    if baseline_gains_report is not None and plan["name"] != (
+        "multi_session_self_supervised_scaling"
+    ):
+        raise ValueError(
+            "A paired baseline report requires neural source fits."
+        )
     task_spec = task_plan(plan)
     tasks = task_spec["jobs"]
     devices = select_gpus(plan["settings"]["runtime"]["device"], GPU_COUNT)
@@ -315,15 +327,19 @@ def run_queue(
             )
         reconcile(plan, path, source_states)
         if all(state == "complete" for state in states.values()):
-            from experiments.multisession.compute_scaling.self_supervised import (
-                CAMPAIGN as NEURAL_CAMPAIGN,
+            from experiments.multisession.compute_scaling import (
+                self_supervised,
             )
-            if plan["name"] == NEURAL_CAMPAIGN:
+            if plan["name"] == self_supervised.CAMPAIGN:
                 from experiments.multisession.compute_scaling import (
                     self_supervised_report,
                 )
                 try:
-                    self_supervised_report.publish(plan, path)
+                    report = self_supervised_report.publish(plan, path)
+                    if baseline_gains_report is not None:
+                        self_supervised_report.publish_paired_view(
+                            report, baseline_gains_report
+                        )
                 except Exception as error:
                     atomic_json(launch / "report_failure.json", dict(
                         error=f"{type(error).__name__}: {error}",
@@ -354,6 +370,7 @@ def main() -> None:
     parser.add_argument("--plan", required=True, type=Path)
     parser.add_argument("--launch", type=Path)
     parser.add_argument("--detach", action="store_true")
+    parser.add_argument("--baseline-gains-report", type=Path)
     parser.add_argument("--source-sha256")
     parser.add_argument("--task-kind", choices=TASK_KINDS)
     parser.add_argument("--source-key")
@@ -386,15 +403,17 @@ def main() -> None:
         elif args.task_kind == "session":
             if args.session_index is None:
                 parser.error("Session worker requires --session-index.")
-            from experiments.multisession.behavior_supervision.source_adaptation import (
-                fit_session,
+            from experiments.multisession.behavior_supervision import (
+                source_adaptation as adaptation,
             )
-            fit_session(plan, args.source_key, args.session_index)
+            adaptation.fit_session(
+                plan, args.source_key, args.session_index
+            )
         elif args.task_kind == "full":
-            from experiments.multisession.behavior_supervision.source_adaptation import (
-                fit_full,
+            from experiments.multisession.behavior_supervision import (
+                source_adaptation as adaptation,
             )
-            fit_full(plan, args.source_key)
+            adaptation.fit_full(plan, args.source_key)
         else:
             finish_source(plan, args.source_key)
         return
@@ -418,6 +437,11 @@ def main() -> None:
             "--plan", str(path), "--launch", str(launch.resolve()),
             "--source-sha256", source_hash,
         ]
+        if args.baseline_gains_report is not None:
+            command.extend((
+                "--baseline-gains-report",
+                str(args.baseline_gains_report.resolve()),
+            ))
         with (launch / "coordinator.log").open("a") as stream:
             process = subprocess.Popen(
                 command, env=environment, stdout=stream,
@@ -432,7 +456,11 @@ def main() -> None:
     if args.source_sha256 is None:
         parser.error("Coordinator requires a frozen-source checksum.")
     verify_source_code(args.source_sha256)
-    run_queue(plan, path, launch.resolve(), args.source_sha256)
+    run_queue(
+        plan, path, launch.resolve(), args.source_sha256,
+        args.baseline_gains_report.resolve()
+        if args.baseline_gains_report is not None else None,
+    )
 
 
 if __name__ == "__main__":
