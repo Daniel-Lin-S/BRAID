@@ -328,3 +328,63 @@ def test_seen_session_report_rows_keep_one_session_field(
     assert len(rows) == 4
     assert [row["session"] for row in rows] == names
     assert all(row["source_count"] == 4 for row in rows)
+
+
+def test_recovered_single_session_scores_pair_with_both_protocols(
+    tmp_path: Path,
+) -> None:
+    """Saved control scores must match each current direct recording."""
+    import pytest
+
+    from experiments.multisession.compute_scaling import (
+        self_supervised_report as report,
+    )
+    from experiments.multisession.behavior_compute_scaling import (
+        preprocessing_comparison as comparison,
+    )
+
+    scores, saved = [], []
+    for group in report.GROUPS:
+        for horizon in (1, 2, 4, 8):
+            for session in range(report.COMMON):
+                for count in report.COUNTS:
+                    score = dict(
+                        variant=report.VARIANTS[1],
+                        source_count=count, session=str(session),
+                        group=group, horizon=horizon, samples=20,
+                        dummy_mse=2.0, mse=1.0, mse_ratio=0.5,
+                        cc=0.3, r2=0.2, evaluation_set_id="fixed",
+                    )
+                    scores.append(score)
+                    for metric in report.METRICS:
+                        saved.append(dict(
+                            reference="single_session",
+                            variant="direct_no_n3",
+                            source_count=count, session=str(session),
+                            group=group, horizon=str(horizon),
+                            metric=metric, samples=20,
+                            model_score=score[metric],
+                            reference_score=0.4,
+                        ))
+    controls = report.direct_reference_scores(scores, saved)
+    assert len(controls) == 96
+    assert {row["variant"] for row in controls} == set(report.VARIANTS)
+    assert all(row["mse_ratio"] == 0.4 for row in controls)
+    scores.extend([
+        dict(row, variant=report.VARIANTS[0]) for row in scores
+    ])
+    gain = comparison.paired_gain_rows(
+        scores, controls, "single_session", report.VARIANTS
+    )
+    assert len(gain) == 1152
+    figure = comparison.gain_figure(
+        gain, comparison.gain_summary(gain), "single_session",
+        "position", "mse_ratio", tmp_path,
+        variants=report.VARIANTS, styles=report.PAIRED_STYLES,
+        filename="position_mse_ratio.png",
+    )
+    assert figure.name == "position_mse_ratio.png"
+    assert figure.is_file()
+    saved[0]["reference_score"] = 0.5
+    with pytest.raises(ValueError, match="reference changed"):
+        report.direct_reference_scores(scores, saved)

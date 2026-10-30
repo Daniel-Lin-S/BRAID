@@ -3,7 +3,10 @@
 Inputs are four completed neural source fits, four completed full BRAID paths,
 and a completed direct-behavior reference report. Outputs are a checksum-pinned
 report with source losses, inner selections, per-session performances, and ten
-figures. The latest pointer changes only after report completion.
+figures. ``python -m experiments.multisession.compute_scaling.
+self_supervised_report --source-report ABSOLUTE_REPORT --baseline-gains-report
+ABSOLUTE_REPORT`` publishes paired gain figures from two complete reports.
+The latest pointer changes only after report completion.
 """
 
 import csv
@@ -499,3 +502,283 @@ def publish(plan: dict, plan_path: Path) -> Path:
         identity=fingerprint(identity),
     ))
     return destination
+PAIRED_PREFIX = "self-supervised-paired-single-session"
+PAIRED_PROTOCOL = "self_supervised_and_direct_paired_single_v1"
+EXPECTED_BUDGETS = 7
+PAIRED_TABLE = "tables/paired_recording_gains.csv"
+REFERENCE_VARIANT = "direct_no_n3"
+REFERENCE_ROLE = "single_session"
+DIRECT_MATCH_TOLERANCE = 1e-3
+PAIRED_STYLES = {
+    VARIANTS[0]: dict(
+        color="#7551a8", marker="o", linestyle="-",
+        label="Neural pretraining + BRAID",
+    ),
+    VARIANTS[1]: dict(
+        color="#2878b5", marker="D", linestyle="--",
+        label="Direct behavior BRAID",
+    ),
+}
+PAIRED_GUIDE = """# Seen-session gain over single-session BRAID
+
+The nine performance figures show the same 87 chronological test windows
+in four seen Indy recordings, at 50/100/200/400 ms. Purple is BRAID
+initialized from a neural-only multi-session backbone, followed by frozen
+shared core and four seen-session full BRAID fits. Blue is the saved direct
+behavior multi-session BRAID reference. Both appear in every panel. Four
+thin lines show recording-specific gains and a thick line shows their equal
+mean. Each panel has a gray zero line. Positive means improvement.
+
+The reference for both protocols is the same recording's corrected direct
+three-stage single-session BRAID fit: batch 8, recurrent cap 2400 updates,
+inner-validation early stopping, no preprocessing or n3. Its per-recording
+scores are recovered from the checksum-verified single-session paired-gain
+table pinned in inputs.json. The original baseline comparison directory is
+not present; the saved reference scores are identical across source counts.
+The direct multi-session scores in that table agree with this report's
+independently saved direct scores within 0.001, and evaluated sample counts
+match. The neural-pretrained downstream RNN1 and RNN2 use 800 updates;
+therefore the baseline is a common direct BRAID reference, not an
+exposure-matched control for every downstream stage.
+
+For metric m, recording s and source count c, gain is m(s,c)-m(s,1)
+for CC and R2, and m(s,1)-m(s,c) for MSE/dummy MSE. Dummy MSE uses that
+recording's observed training-target mean on its test samples. These
+within-recording differences remove fixed recording difficulty from the
+y-axis but retain differences in how recordings respond to each protocol.
+The tables contain every recording gain, the mean, range and sign counts.
+There is one training seed per configuration, so the lines do not estimate
+random-seed uncertainty or establish statistical significance.
+
+The newly rendered source_neural.png shows raw chronological neural test
+loss against full-backbone training FLOPs for all seven budgets at each
+source count, with log axes. The source checkpoint is selected on inner
+validation. The direct reference's historical outer results were inspected,
+so retrospective inner reselection does not restore a blind historical
+test. No model refit or unseen-session adaptation is started.
+"""
+
+
+def checked_reference_gains(path: Path) -> tuple[list[dict], str]:
+    """Verify a saved table even if unrelated linked figures have moved.
+
+    Parameters
+    ----------
+    path : Path
+        Prior paired-gain report containing a completed checksum manifest.
+
+    Returns
+    -------
+    tuple of list of dict and str
+        CSV rows and verified SHA256 of the recording-gain table.
+    """
+    marker = path / "complete.json"
+    if not marker.is_file():
+        raise ValueError(f"Missing saved completion: {marker.resolve()}.")
+    checksums = json.loads(marker.read_text()).get("checksums", {})
+    expected = checksums.get(PAIRED_TABLE)
+    table = path / PAIRED_TABLE
+    if expected is None or not table.is_file():
+        raise ValueError(f"Missing pinned reference table: {table.resolve()}.")
+    actual = file_digest(table)
+    if actual != expected:
+        raise ValueError(
+            f"Reference table checksum changed: {table.resolve()}."
+        )
+    return read_rows(table), actual
+
+
+def direct_reference_scores(
+    scores: list[dict], rows: list[dict],
+) -> list[dict]:
+    """Recover the 2400-cap control from verified paired reference scores.
+
+    The saved direct comparisons supply one reference score per metric,
+    recording, group and horizon. Current direct rows verify its samples
+    and evaluate dummy MSE on the same normalized observed coordinates.
+    """
+    direct = [row for row in scores if row["variant"] == VARIANTS[1]]
+    source = {}
+    for row in direct:
+        key = (row["session"], row["group"], int(row["horizon"]))
+        source.setdefault(key, []).append(row)
+    saved = {}
+    for row in rows:
+        if (
+            row["reference"] != REFERENCE_ROLE
+            or row["variant"] != REFERENCE_VARIANT
+        ):
+            continue
+        key = (row["session"], row["group"], int(row["horizon"]),
+               row["metric"])
+        saved.setdefault(key, []).append(row)
+    expected = COMMON * len(GROUPS) * len(HORIZONS) * len(METRICS)
+    if len(saved) != expected or len(source) != expected // len(METRICS):
+        raise ValueError("Incomplete saved direct single-session reference.")
+    controls = []
+    for (session, group, horizon), current in sorted(source.items()):
+        if len(current) != len(COUNTS):
+            raise ValueError("Incomplete direct source-count comparison.")
+        samples = {int(row["samples"]) for row in current}
+        dummy = np.asarray([
+            float(row["dummy_mse"]) for row in current
+        ])
+        if len(samples) != 1 or not np.isfinite(dummy).all() or (
+            dummy.min() <= 0
+            or not np.allclose(dummy, dummy[0], rtol=1e-5, atol=1e-6)
+        ):
+            raise ValueError("Direct test samples or dummy MSE changed.")
+        values = {}
+        for metric in METRICS:
+            candidates = saved[(session, group, horizon, metric)]
+            if len(candidates) != len(COUNTS):
+                raise ValueError("Incomplete saved single-session scores.")
+            references = np.asarray([
+                float(row["reference_score"]) for row in candidates
+            ])
+            if not np.isfinite(references).all() or not np.allclose(
+                references, references[0], rtol=0, atol=0
+            ):
+                raise ValueError("Saved single-session reference changed.")
+            for row, prior in zip(
+                sorted(current, key=lambda item: int(item["source_count"])),
+                sorted(candidates,
+                       key=lambda item: int(item["source_count"])),
+            ):
+                if (
+                    int(row["source_count"]) != int(prior["source_count"])
+                    or int(prior["samples"]) != int(row["samples"])
+                    or abs(float(row[metric])
+                           - float(prior["model_score"]))
+                    > DIRECT_MATCH_TOLERANCE
+                ):
+                    raise ValueError(
+                        "Saved direct model differs from this report: "
+                        f"{session}, {group}, {horizon}, {metric}."
+                    )
+            values[metric] = float(references[0])
+        for variant in VARIANTS:
+            controls.append(dict(
+                variant=variant, source_count=1, session=session,
+                group=group, horizon=int(horizon),
+                samples=int(current[0]["samples"]),
+                dummy_mse=float(dummy[0]),
+                mse=values["mse_ratio"] * float(dummy[0]),
+                evaluation_set_id=current[0]["evaluation_set_id"],
+                **values,
+            ))
+    return controls
+
+
+def publish_paired_view(source_report: Path, gain_report: Path) -> Path:
+    """Publish nine paired comparison panels and a regenerated source panel.
+
+    Inputs are two saved reports. The gain report provides the corrected
+    single-session direct reference; no checkpoint is loaded or fitted.
+    Output is a new immutable sibling report with ten PNG figures and
+    per-recording/aggregate paired-gain CSV tables.
+    """
+    from experiments.multisession.behavior_compute_scaling import (
+        preprocessing_comparison as comparison,
+    )
+
+    source_marker = completed(source_report)
+    if source_marker is None:
+        raise ValueError("Self-supervised source report is incomplete.")
+    prior, prior_digest = checked_reference_gains(gain_report)
+    identity = dict(
+        protocol=PAIRED_PROTOCOL,
+        source_report=source_report.name,
+        source_checksums=source_marker["checksums"],
+        single_reference_table=prior_digest,
+        reference_report=gain_report.name,
+        variants=list(VARIANTS), groups=list(GROUPS),
+        horizons=list(HORIZONS), metrics=list(METRICS),
+        guide=PAIRED_GUIDE,
+    )
+    destination = (
+        source_report.parent
+        / f"{PAIRED_PREFIX}-{fingerprint(identity)}"
+    )
+    with job(destination, identity) as needed:
+        if needed:
+            scores = read_rows(
+                source_report / "tables" / "session_scores.csv"
+            )
+            controls = direct_reference_scores(scores, prior)
+            paired = comparison.paired_gain_rows(
+                scores, controls, "single_session", VARIANTS
+            )
+            summary = comparison.gain_summary(paired)
+            tables = destination / "tables"
+            figures = destination / "figures"
+            tables.mkdir()
+            figures.mkdir()
+            write_table(tables / "paired_recording_gains.csv", paired)
+            write_table(tables / "paired_gain_summary.csv", summary)
+            for group in GROUPS:
+                for metric in METRICS:
+                    comparison.gain_figure(
+                        paired, summary, "single_session", group,
+                        metric, figures, variants=VARIANTS,
+                        styles=PAIRED_STYLES,
+                        filename=f"{group}_{metric}.png",
+                    )
+            source_rows = [dict(
+                row, source_count=int(row["source_count"]),
+                budget=int(row["budget"]),
+                full_path_flops=int(row["full_path_flops"]),
+                chronological_source_test_loss=float(
+                    row["chronological_source_test_loss"]
+                ),
+                transfer_selected=row["transfer_selected"] == "True",
+            ) for row in read_rows(
+                source_report / "tables" / "source_loss.csv"
+            )]
+            source_figures(
+                source_rows, figures, stages=("neural",),
+                expected_points=EXPECTED_BUDGETS, direct=True,
+                stage_labels={"neural": "Neural backbone forecast"},
+                x_label="Full-backbone training FLOPs",
+            )
+            (destination / "guide.md").write_text(PAIRED_GUIDE)
+            atomic_json(destination / "inputs.json", dict(
+                source_report=str(source_report.resolve()),
+                source_checksums=source_marker["checksums"],
+                baseline_gain_report=str(gain_report.resolve()),
+                reference_table_checksum=prior_digest,
+            ))
+    if completed(destination) is None:
+        raise ValueError("Incomplete self-supervised paired report.")
+    root = source_report.parent.parent
+    pointer = dict(
+        snapshot=str(destination.resolve()),
+        figures=str((destination / "figures").resolve()),
+        identity=fingerprint(identity),
+    )
+    for name in (
+        "latest_report.json", "latest_figures.json",
+        "latest_source_figures.json", "latest_performance_figures.json",
+        "latest_paired_gain_comparison.json",
+    ):
+        atomic_json(root / name, pointer)
+    print(f"Saved self-supervised paired figures: {pointer['figures']}")
+    return destination
+
+
+def main() -> None:
+    """Render paired source figures from complete saved report tables."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source-report", required=True, type=Path)
+    parser.add_argument("--baseline-gains-report", required=True, type=Path)
+    arguments = parser.parse_args()
+    publish_paired_view(
+        arguments.source_report.resolve(),
+        arguments.baseline_gains_report.resolve(),
+    )
+
+
+if __name__ == "__main__":
+    main()

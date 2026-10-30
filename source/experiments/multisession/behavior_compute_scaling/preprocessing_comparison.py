@@ -1128,6 +1128,7 @@ def gain_key(row: dict) -> tuple:
 
 def checked_gain_scores(
     rows: list[dict], counts: tuple[int, ...],
+    variants: tuple[str, ...] = VARIANTS,
 ) -> dict[tuple, dict]:
     """Validate complete finite per-recording metrics and index them.
 
@@ -1138,7 +1139,7 @@ def checked_gain_scores(
     indexed = {}
     for row in rows:
         count = int(row["source_count"])
-        if count not in counts or row["variant"] not in VARIANTS:
+        if count not in counts or row["variant"] not in variants:
             raise ValueError("Unexpected protocol or source count in scores.")
         key = (*gain_key(row), count)
         if key in indexed:
@@ -1150,7 +1151,7 @@ def checked_gain_scores(
         if not np.isfinite(values).all() or values[-1] <= 0:
             raise ValueError(f"Invalid recording metric or dummy MSE {key}.")
         indexed[key] = row
-    expected = len(VARIANTS) * COMMON_SESSIONS
+    expected = len(variants) * COMMON_SESSIONS
     expected *= len(GROUPS) * len(HORIZONS) * len(counts)
     if len(indexed) != expected:
         raise ValueError(
@@ -1162,6 +1163,7 @@ def checked_gain_scores(
 
 def paired_gain_rows(
     scores: list[dict], controls: list[dict], reference: str,
+    variants: tuple[str, ...] = VARIANTS,
 ) -> list[dict]:
     """Subtract a recording-matched control or four-source score.
 
@@ -1181,8 +1183,8 @@ def paired_gain_rows(
     """
     if reference not in GAIN_REFERENCES:
         raise ValueError(f"Unknown paired reference {reference}.")
-    source = checked_gain_scores(scores, COUNTS)
-    baseline = checked_gain_scores(controls, (1,))
+    source = checked_gain_scores(scores, COUNTS, variants)
+    baseline = checked_gain_scores(controls, (1,), variants)
     rows = []
     for key, model in sorted(source.items()):
         variant, session, group, horizon, count = key
@@ -1258,10 +1260,14 @@ def gain_summary(rows: list[dict]) -> list[dict]:
 def gain_figure(
     rows: list[dict], summary: list[dict], reference: str,
     group: str, metric: str, directory: Path,
+    variants: tuple[str, ...] = VARIANTS,
+    styles: dict | None = None,
+    filename: str | None = None,
 ) -> Path:
     """Draw four horizon panels with both model families and four sessions."""
     if reference not in GAIN_REFERENCES:
         raise ValueError(f"Unknown gain reference {reference}.")
+    styles = STYLES if styles is None else styles
     names = sorted({row["session"] for row in rows})
     if len(names) != COMMON_SESSIONS:
         raise ValueError("Expected four recording names in gain figure.")
@@ -1269,8 +1275,8 @@ def gain_figure(
         figure, axes = plt.subplots(2, 2, figsize=(16, 11))
         for axis, horizon in zip(axes.flat, HORIZONS):
             extent = [0.0]
-            for variant in VARIANTS:
-                style = STYLES[variant]
+            for variant in variants:
+                style = styles[variant]
                 for index, name in enumerate(names):
                     selected = sorted((row for row in rows if (
                         row["reference"] == reference
@@ -1337,12 +1343,12 @@ def gain_figure(
             fontsize=22, y=0.97,
         )
         handles = [
-            Line2D([0], [0], color=STYLES[variant]["color"],
-                   marker=STYLES[variant]["marker"],
-                   linestyle=STYLES[variant]["linestyle"],
+            Line2D([0], [0], color=styles[variant]["color"],
+                   marker=styles[variant]["marker"],
+                   linestyle=styles[variant]["linestyle"],
                    linewidth=3.5, markersize=9,
-                   label=STYLES[variant]["label"] + " mean")
-            for variant in VARIANTS
+                   label=styles[variant]["label"] + " mean")
+            for variant in variants
         ]
         handles.extend(
             Line2D([0], [0], color="#777777", linestyle="-",
@@ -1362,7 +1368,9 @@ def gain_figure(
             left=0.09, right=0.98, top=0.87, bottom=0.20,
             hspace=0.43, wspace=0.29,
         )
-        output = directory / f"{group}_{metric}_vs_{reference}.png"
+        output = directory / (
+            filename or f"{group}_{metric}_vs_{reference}.png"
+        )
         figure.savefig(output, dpi=DPI, bbox_inches="tight")
         plt.close(figure)
     return output
