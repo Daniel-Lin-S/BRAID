@@ -140,7 +140,10 @@ def session_settings(source: dict) -> dict:
 
 def session_seed(source: dict, index: int) -> int:
     """Keep each session's native private-map initialization distinct."""
-    return source["spec"]["seed"] + N3_SEED_OFFSET + index
+    return (
+        source["spec"]["seed"] + N3_SEED_OFFSET + index
+        + source["spec"].get("initialization_session_index", 0)
+    )
 
 
 def session_model(

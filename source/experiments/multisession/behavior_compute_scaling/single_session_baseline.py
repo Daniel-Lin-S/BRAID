@@ -33,7 +33,7 @@ from experiments.multisession.behavior_compute_scaling import (
     direct_report,
 )
 from experiments.multisession.behavior_compute_scaling.pipeline import (
-    run_stage,
+    fixed_targets, run_stage,
 )
 from experiments.multisession.behavior_compute_scaling.plan import (
     COUNTS, RECURRENT_STAGES,
@@ -60,6 +60,9 @@ from experiments.multisession.training import (
 from experiments.storage.cache import atomic_json, fingerprint
 
 COMMON_SESSIONS = 4
+MATCHED_MAIN = 1920
+MATCHED_TOTAL = 2400
+MATCHED_PROTOCOL = "architecture_matched_inner_stopped_2400_v1"
 MAIN_UPDATES = 640
 TOTAL_UPDATES = 800
 SESSION_BATCH = 8
@@ -114,29 +117,17 @@ def reference(plan: dict) -> tuple[str, dict]:
     return key, json.loads((directory / "data.json").read_text())
 
 
-def prepare(
-    plan: dict, index: int,
-) -> tuple[dict, dict, dict, dict, dict, Path]:
-    """Rebuild one recording's exact saved train/inner/test split."""
+def saved_spec(
+    plan: dict, index: int, matched: bool = False,
+) -> tuple[dict, dict, Path]:
+    """Resolve a completed reference session without loading its arrays."""
     key, inventory = reference(plan)
     original = plan["jobs"][key]
     names = original["sessions"][:COMMON_SESSIONS]
     if index not in range(len(names)):
         raise ValueError(f"Expected session index 0-3, got {index}.")
     name = names[index]
-    adapter = dataset(plan["settings"])
-    adapter.mode = "off"
-    features = source_features(
-        adapter.load(name), original["data"],
-        original["source_training"]["inner_validation_fraction"],
-    )
-    train, inner, outer, record = session_windows(
-        features, True, include_test=True,
-    )
-    if record != inventory[name]:
-        raise ValueError(f"Single-session split changed for {name}.")
-    if not all(len(row["Z"]) for row in (train, inner, outer)):
-        raise ValueError(f"Empty source split for {name}.")
+    record = inventory[name]
     settings = dict(
         original["source_training"],
         batch_size=SESSION_BATCH,
@@ -157,21 +148,103 @@ def prepare(
     )
     if spec["source_training"]["fixed_update_cap"] != FIXED_CAP:
         raise ValueError("Single-session readout cap is not 2,000.")
-    identity = dict(protocol=BASELINE_PROTOCOL, spec=spec)
+    if matched:
+        spec.pop("continuation", None)
+        spec["implementation"] = MATCHED_PROTOCOL
+        spec["initialization_session_index"] = index
+        spec["initialization_dimensions"] = [
+            [sum(inventory[item]["scales"][key]["keep"])
+             for key in ("Y", "Z")]
+            for item in names
+        ]
+        spec["source_training"].update(
+            checkpoints=[MATCHED_MAIN], total_updates=[MATCHED_TOTAL],
+            maximum_updates=MATCHED_MAIN,
+            recurrent_early_stopping="inner_validation",
+        )
+    identity = dict(protocol=spec["implementation"], spec=spec)
     artifact = Path(plan["settings"]["paths"]["artifact_root"])
     directory = (
         artifact / "multi_session_training" / "fits"
         / f"source_single_{fingerprint(identity)}"
     )
+    return spec, record, directory
+
+
+def prepare(
+    plan: dict, index: int, matched: bool = False,
+) -> tuple[dict, dict, dict, dict, dict, Path]:
+    """Rebuild one recording's exact saved train/inner/test split."""
+    spec, saved, directory = saved_spec(plan, index, matched)
+    name = spec["sessions"][0]
+    adapter = dataset(plan["settings"])
+    adapter.mode = "off"
+    features = source_features(
+        adapter.load(name), spec["data"],
+        spec["source_training"]["inner_validation_fraction"],
+    )
+    train, inner, outer, record = session_windows(
+        features, True, include_test=True,
+    )
+    if record != saved:
+        raise ValueError(f"Single-session split changed for {name}.")
+    if not all(len(row["Z"]) for row in (train, inner, outer)):
+        raise ValueError(f"Empty source split for {name}.")
     return spec, train, inner, outer, record, directory
 
 
-def fit_one(plan: dict, index: int, microbatch: int) -> Path:
+def initialized_model(
+    factory: object, dimensions: list, spec: dict,
+) -> object:
+    """Match each private map's initialization to the four-source model.
+
+    ``dimensions`` contains singleton (neural, behavior) widths. The
+    reference model is constructed only to extract its initial weights;
+    it is never fitted and allocates no optimizer state.
+    """
+    model = factory(dimensions, spec, LOCAL_DEVICE)
+    if "initialization_session_index" not in spec:
+        return model
+    from .n3_session import selected_session_weights
+
+    reference_model = factory(
+        spec["initialization_dimensions"], spec, LOCAL_DEVICE
+    )
+    index = spec["initialization_session_index"]
+    weights = reference_model.weights()
+    selected = (
+        {"0": weights[str(index)]} if str(index) in weights
+        else selected_session_weights(weights, index)
+    )
+    model.restore(selected)
+    return model
+
+
+def source_view(
+    spec: dict, record: dict, directory: Path,
+) -> dict:
+    """Read a single-recording path with inner-only checkpoint selection."""
+    name = spec["sessions"][0]
+    path = json.loads((directory / "path.json").read_text())
+    return dict(
+        count=1, spec=spec, fit=directory, path=path,
+        inventory={name: record},
+        selection=dict(
+            selected_budget=path["budget"],
+            selection_role="inner_validation",
+            evaluation_set_id=fingerprint({name: record["validation"]}),
+        ),
+    )
+
+
+def fit_one(
+    plan: dict, index: int, microbatch: int, matched: bool = False,
+) -> Path:
     """Fit or reuse one independent matched three-stage path."""
     spec, train, inner, outer, record, directory = prepare(
-        plan, index
+        plan, index, matched
     )
-    identity = dict(protocol=BASELINE_PROTOCOL, spec=spec)
+    identity = dict(protocol=spec["implementation"], spec=spec)
     with job(directory, identity) as needed:
         if not needed:
             return directory
@@ -180,24 +253,37 @@ def fit_one(plan: dict, index: int, microbatch: int) -> Path:
         from experiments.multisession.behavior_supervision.models import (
             neural_readout_model, rnn1_model, rnn2_model,
         )
-        main = rnn1_model(dimensions, spec, LOCAL_DEVICE)
+        scoring = inner if matched else outer
+        prepared, stages, parent, _ = fixed_targets(
+            ([train], [inner], [scoring]), dimensions,
+            spec["sessions"], spec, directory, root,
+            LOCAL_DEVICE, microbatch,
+            initialize=lambda factory: initialized_model(
+                factory, dimensions, spec
+            ),
+        )
+        main_updates = MATCHED_MAIN if matched else MAIN_UPDATES
+        total_updates = MATCHED_TOTAL if matched else TOTAL_UPDATES
+        schedule = (main_updates, total_updates) if matched else None
+        main = initialized_model(rnn1_model, dimensions, spec)
         behavior = [
-            recurrent_data(row, "Z")
-            for row in (train, inner, outer)
+            recurrent_data(part[0], "Z") for part in prepared
         ]
         first, parent = run_stage(
             "behavior_relevant", main, [behavior[0]],
             [behavior[2]], spec["sessions"], spec, root,
-            None, MAIN_UPDATES, LOCAL_DEVICE, microbatch,
+            parent, main_updates, LOCAL_DEVICE, microbatch,
+            validation=[behavior[1]] if matched else None,
+            stopping_schedule=schedule,
         )
         neural = [
-            recurrent_data(row) for row in (train, inner, outer)
+            recurrent_data(row) for row in (train, inner, scoring)
         ]
         latent = [
             stage_predictions(main, [row])[1]
             for row in behavior
         ]
-        readout = neural_readout_model(dimensions, spec, LOCAL_DEVICE)
+        readout = initialized_model(neural_readout_model, dimensions, spec)
         readout_inputs = [
             readout_data([row], states)
             for row, states in zip(neural, latent)
@@ -208,15 +294,19 @@ def fit_one(plan: dict, index: int, microbatch: int) -> Path:
             parent, 0, LOCAL_DEVICE, microbatch,
             validation=readout_inputs[1],
         )
-        residual = rnn2_model(dimensions, spec, LOCAL_DEVICE)
+        residual = initialized_model(rnn2_model, dimensions, spec)
         third, _ = run_stage(
             "residual", residual,
             residual_data(main, readout, [neural[0]]),
             residual_data(main, readout, [neural[2]]),
             spec["sessions"], spec, root, parent,
-            MAIN_UPDATES, LOCAL_DEVICE, microbatch,
+            main_updates, LOCAL_DEVICE, microbatch,
+            validation=(
+                residual_data(main, readout, [neural[1]]) if matched else None
+            ),
+            stopping_schedule=schedule,
         )
-        stages = dict(
+        stages.update(
             behavior_relevant=first, neural_readout=second,
             residual=third,
         )
@@ -224,12 +314,26 @@ def fit_one(plan: dict, index: int, microbatch: int) -> Path:
             spec["sessions"][0]: record,
         })
         atomic_json(directory / "path.json", dict(
-            budget=MAIN_UPDATES, total_updates=TOTAL_UPDATES,
+            budget=main_updates, total_updates=total_updates,
             stages=stages,
             full_path_flops=sum(
                 row["component_flops"] for row in stages.values()
             ),
         ))
+        from experiments.multisession.behavior_supervision.targets import (
+            GENERATED, target_mode,
+        )
+        if matched and target_mode(spec) == GENERATED:
+            from . import n3_session
+
+            correction = n3_session.fit_one(
+                plan, source_view(spec, record, directory), 0,
+                microbatch, size=16,
+            )
+            atomic_json(directory / "n3.json", dict(
+                component=correction.name,
+                checksums=completed(correction)["checksums"],
+            ))
     return directory
 
 
@@ -386,27 +490,38 @@ def publish(plan_path: Path, source_report: Path) -> Path:
     return destination
 
 
-def audit(plan: dict, microbatch: int) -> None:
+def audit(plan: dict, microbatch: int, matched: bool = False) -> None:
     """Run three RNN1 updates without creating a fit artifact."""
     from experiments.multisession.behavior_supervision.models import (
         rnn1_model,
     )
 
-    spec, train, _, _, _, _ = prepare(plan, 0)
-    model = rnn1_model(
+    from experiments.multisession.behavior_supervision.models import (
+        preprocessing_model,
+    )
+    from experiments.multisession.behavior_supervision.targets import (
+        GENERATED, target_mode,
+    )
+
+    spec, train, _, _, _, _ = prepare(plan, 0, matched)
+    generated = matched and target_mode(spec) == GENERATED
+    factory = preprocessing_model if generated else rnn1_model
+    model = initialized_model(
+        factory,
         [(train["Y"].shape[-1], train["Z"].shape[-1])],
-        spec, LOCAL_DEVICE,
+        spec,
     )
     optimizers = optimizer_groups(model, spec["source_training"])
     rng = np.random.default_rng(spec["seed"] + 2)
     functions = [gradient_function(model, 0)]
     for _ in range(AUDIT_UPDATES):
         balanced_update(
-            model, [recurrent_data(train, "Z")], optimizers,
+            model, [recurrent_data(train, "Y" if generated else "Z")],
+            optimizers,
             rng, SESSION_BATCH, microbatch, LOCAL_DEVICE,
             functions,
         )
-    print("Single-session RNN1 audit: three updates succeeded.")
+    print("Single-session first-stage audit: three updates succeeded.")
 
 
 def status(launch: Path, states: dict[str, str], phase: str) -> None:
@@ -421,66 +536,109 @@ def status(launch: Path, states: dict[str, str], phase: str) -> None:
     ))
 
 
+def worker_environment(device: dict | None = None) -> dict:
+    """Limit worker threads and optionally bind one GPU UUID."""
+    env = dict(os.environ)
+    env.update(thread_environment(WORKER_CPU_THREADS, 1))
+    env["CUDA_VISIBLE_DEVICES"] = "" if device is None else device["uuid"]
+    env["TF_USE_LEGACY_KERAS"] = "1"
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[3])
+    env["MPLCONFIGDIR"] = "/tmp/braid_single_mpl"
+    return env
+
+
+def run_task_queue(
+    tasks: list[dict], devices: list[dict], launch_dir: Path,
+) -> dict[str, str]:
+    """Schedule independent commands and validate immutable completions.
+
+    Parameters
+    ----------
+    tasks : list of dict
+        Each entry has a unique key, command argv, and target directory.
+    devices : list of dict
+        One selected GPU UUID per concurrent worker.
+    launch_dir : Path
+        Lifecycle logs; worker logs are nested under jobs/<task key>/.
+
+    Returns
+    -------
+    dict
+        Terminal complete/failed state for every requested task.
+    """
+    if not tasks or not devices:
+        raise ValueError("A task queue requires tasks and available devices.")
+    states = {task["key"]: "pending" for task in tasks}
+    if len(states) != len(tasks):
+        raise ValueError("Duplicate task keys in fit queue.")
+    active = {}
+    while True:
+        for key, (process, device, target) in list(active.items()):
+            code = process.poll()
+            if code is None:
+                continue
+            del active[key]
+            states[key] = (
+                "complete" if code == 0 and completed(target) is not None
+                else "failed"
+            )
+            if states[key] == "failed":
+                with (launch_dir / "failures.jsonl").open("a") as stream:
+                    stream.write(json.dumps(dict(
+                        task=key, exit_code=code,
+                        artifact=str(target.resolve()),
+                    )) + "\n")
+        busy = {device["uuid"] for _, device, _ in active.values()}
+        free = [device for device in devices if device["uuid"] not in busy]
+        for task in tasks:
+            key, target = task["key"], Path(task["target"])
+            if states[key] != "pending":
+                continue
+            if completed(target) is not None:
+                states[key] = "complete"
+                continue
+            if not free:
+                continue
+            device = free.pop(0)
+            log = launch_dir / "jobs" / key / "worker.log"
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with log.open("a") as stream:
+                process = subprocess.Popen(
+                    task["command"], env=worker_environment(device),
+                    stdout=stream, stderr=subprocess.STDOUT,
+                    preexec_fn=lambda: os.nice(LOW_CPU_PRIORITY),
+                )
+            active[key] = (process, device, target)
+            states[key] = "running"
+        status(launch_dir, states, "active")
+        if not active:
+            return states
+        time.sleep(POLL_SECONDS)
+
+
 def coordinator(
     plan_path: Path, source_report: Path, launch: Path,
     microbatch: int,
 ) -> None:
     """Run each recording on one GPU and publish after all finish."""
     plan = json.loads(plan_path.read_text())
-    devices = json.loads((launch / "launch.json").read_text())[
-        "devices"
-    ]
-    key, _ = reference(plan)
-    names = [
-        plan["jobs"][key]["sessions"][i]
-        for i in range(COMMON_SESSIONS)
-    ]
-    states = {name: "pending" for name in names}
-    active = {}
-    for index, (name, device) in enumerate(zip(names, devices)):
-        directory = prepare(plan, index)[-1]
-        if completed(directory) is not None:
-            states[name] = "complete"
-            continue
-        env = dict(os.environ)
-        env.update(thread_environment(WORKER_CPU_THREADS, 1))
-        env["CUDA_VISIBLE_DEVICES"] = device["uuid"]
-        env["TF_USE_LEGACY_KERAS"] = "1"
-        env["PYTHONPATH"] = str(Path(__file__).resolve().parents[3])
-        env["MPLCONFIGDIR"] = "/tmp/braid_single_mpl"
-        log = launch / "jobs" / name / "worker.log"
-        log.parent.mkdir(parents=True, exist_ok=True)
-        command = [
-            sys.executable, "-m",
-            "experiments.multisession.behavior_compute_scaling."
-            "single_session_baseline",
-            "--stage", "worker", "--plan", str(plan_path),
-            "--source-report", str(source_report),
-            "--session-index", str(index),
-            "--microbatch", str(microbatch),
-        ]
-        with log.open("a") as stream:
-            process = subprocess.Popen(
-                command, env=env, stdout=stream,
-                stderr=subprocess.STDOUT,
-                preexec_fn=lambda: os.nice(LOW_CPU_PRIORITY),
-            )
-        active[name] = (process, directory)
-        states[name] = "running"
-    status(launch, states, "active")
-    while active:
-        for name, (process, directory) in list(active.items()):
-            code = process.poll()
-            if code is None:
-                continue
-            del active[name]
-            states[name] = (
-                "complete" if code == 0
-                and completed(directory) is not None else "failed"
-            )
-        status(launch, states, "active")
-        if active:
-            time.sleep(POLL_SECONDS)
+    devices = json.loads((launch / "launch.json").read_text())["devices"]
+    tasks = []
+    for index in range(COMMON_SESSIONS):
+        spec, _, directory = saved_spec(plan, index)
+        tasks.append(dict(
+            key=spec["sessions"][0], target=str(directory),
+            command=[
+                sys.executable, "-m",
+                "experiments.multisession.behavior_compute_scaling."
+                "single_session_baseline", "--stage", "worker",
+                "--plan", str(plan_path),
+                "--source-report", str(source_report),
+                "--session-index", str(index),
+                "--microbatch", str(microbatch),
+            ],
+        ))
+    states = run_task_queue(tasks, devices, launch)
     if "failed" in states.values():
         status(launch, states, "failed")
         return
@@ -492,9 +650,7 @@ def coordinator(
         ))
         status(launch, states, "report_failed")
         return
-    atomic_json(launch / "report.json", dict(
-        snapshot=str(report.resolve()),
-    ))
+    atomic_json(launch / "report.json", dict(snapshot=str(report.resolve())))
     status(launch, states, "complete")
 
 

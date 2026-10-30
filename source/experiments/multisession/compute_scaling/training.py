@@ -108,6 +108,38 @@ def learning_rate(update: int, settings: dict, branch: bool) -> float:
     )
 
 
+def recurrent_stopping_rate(
+    update: int, settings: dict, main: int, total: int,
+) -> float:
+    """Apply the native warmup and decay to one stopped recurrent fit.
+
+    Parameters
+    ----------
+    update : int
+        One-based optimizer update.
+    settings : dict
+        Source learning-rate and warmup settings.
+    main : int
+        Last main-phase update.
+    total : int
+        Maximum update, including the decay phase.
+
+    Returns
+    -------
+    float
+        Learning rate at the requested update.
+    """
+    if not 1 <= update <= total or not 1 <= main < total:
+        raise ValueError(
+            f"Expected 1 <= update <= {total} and 1 <= main < total; "
+            f"got update={update}, main={main}."
+        )
+    if update <= main:
+        return learning_rate(update, settings, False)
+    decay = dict(settings, branch_updates=total - main)
+    return learning_rate(update - main, decay, True)
+
+
 def optimizer_groups(model: object, settings: dict) -> list:
     """Initialize independent shared and session-private Adam states."""
     groups = [model.shared_variables, *model.private_variables]
@@ -264,18 +296,12 @@ def validation_due(update: int, batch: int, interval: int, cap: int) -> bool:
     )
 
 
-def fit_segment(
-    model: object, data: list[dict], root: Path, identity: dict,
-    settings: dict, seed: int, start: int, stop: int,
-    parent: Path | None, devices: tuple[str, str], microbatch: int,
-    branch: bool = False,
-    validation: list[dict] | None = None,
-) -> tuple[Path, dict]:
-    """Complete or reuse one immutable segment and its full state."""
-    if validation is not None and (branch or parent is not None or start):
-        raise ValueError("Fixed stages must start without a branch or parent.")
-    if stop <= start:
-        raise ValueError(f"Invalid update segment {start} to {stop}.")
+def segment_identity(
+    identity: dict, start: int, stop: int, branch: bool,
+    parent: Path | None, validation: bool,
+    recurrent_schedule: tuple[int, int] | None = None,
+) -> dict:
+    """Build the scientific identity of a checkpointed fit segment."""
     parent_record = completed(parent) if parent is not None else None
     if parent is not None and parent_record is None:
         raise ValueError(f"Incomplete source parent {parent.resolve()}.")
@@ -286,8 +312,41 @@ def fit_segment(
             parent_record["checksums"] if parent_record is not None else None
         ),
     )
-    if validation is not None:
+    if validation:
         scientific["fixed_stage"] = True
+    if recurrent_schedule is not None:
+        scientific["recurrent_schedule"] = list(
+            recurrent_schedule
+        )
+    return scientific
+
+
+def fit_segment(
+    model: object, data: list[dict], root: Path, identity: dict,
+    settings: dict, seed: int, start: int, stop: int,
+    parent: Path | None, devices: tuple[str, str], microbatch: int,
+    branch: bool = False,
+    validation: list[dict] | None = None,
+    recurrent_schedule: tuple[int, int] | None = None,
+    directory_prefix: str = "",
+) -> tuple[Path, dict]:
+    """Complete or reuse one immutable segment and its full state."""
+    if validation is not None and (branch or parent is not None or start):
+        raise ValueError("Fixed stages must start without a branch or parent.")
+    if stop <= start:
+        raise ValueError(f"Invalid update segment {start} to {stop}.")
+    if recurrent_schedule is not None and (
+        validation is None or not isinstance(model, MixedForecaster)
+        or start != 0 or stop != recurrent_schedule[1]
+    ):
+        raise ValueError(
+            "Stopped recurrent fit requires validation, a recurrent "
+            "model, start zero, and the scheduled total update cap."
+        )
+    scientific = segment_identity(
+        identity, start, stop, branch, parent,
+        validation is not None, recurrent_schedule,
+    )
     if parent is not None:
         parent_payload = load_pickle(parent / "checkpoint.pkl")
         if parent_payload["update"] != start:
@@ -295,7 +354,7 @@ def fit_segment(
                 f"Expected parent at update {start}, "
                 f"got {parent_payload['update']}."
             )
-    directory = root / fingerprint(scientific)
+    directory = root / f"{directory_prefix}{fingerprint(scientific)}"
     with job(directory, scientific) as needed:
         if needed:
             optimizers = optimizer_groups(model, settings)
@@ -325,6 +384,9 @@ def fit_segment(
                         for update in range(start + 1, stop + 1):
                             relative = update - start if branch else update
                             rate = (
+                                recurrent_stopping_rate(
+                                    update, settings, *recurrent_schedule
+                                ) if recurrent_schedule is not None else
                                 settings["learning_rate"]
                                 if validation is not None else
                                 learning_rate(relative, settings, branch)
@@ -350,6 +412,12 @@ def fit_segment(
                                 )
                                 evaluation_flops += work
                                 value = float(np.mean(losses))
+                                if not np.isfinite(value):
+                                    raise FloatingPointError(
+                                        "Nonfinite inner-validation loss "
+                                        f"for {identity['stage']} at "
+                                        f"update {update}."
+                                    )
                                 row["validation_loss"] = value
                                 row["session_validation_losses"] = losses
                                 if value < best:

@@ -127,6 +127,7 @@ def run_stage(
     devices: tuple[str, str], microbatch: int,
     validation: list[dict] | None = None,
     reuse: dict | None = None, resume: Path | None = None,
+    stopping_schedule: tuple[int, int] | None = None,
 ) -> tuple[dict, str]:
     """Fit one matched stage branch and record fixed-set stage loss."""
     if reuse is not None:
@@ -134,8 +135,25 @@ def run_stage(
         return reuse, reuse["component_id"]
     stage_index = 0 if stage == "neural" else COMPONENTS.index(stage)
     identity = stage_identity(spec, stage, parent)
+    if "initialization_session_index" in spec:
+        identity["initialization_session_index"] = spec[
+            "initialization_session_index"
+        ]
+        identity["initialization_dimensions"] = spec[
+            "initialization_dimensions"
+        ]
     settings = spec["source_training"]
-    if stage in RECURRENT_STAGES or stage == "neural":
+    if stopping_schedule is not None:
+        if stage not in RECURRENT_STAGES or validation is None:
+            raise ValueError("Stopped recurrence requires inner validation.")
+        directory, _ = fit_segment(
+            model, training, root, identity, settings,
+            spec["seed"] + stage_index, 0, stopping_schedule[1],
+            None, devices, microbatch, validation=validation,
+            recurrent_schedule=stopping_schedule,
+        )
+        flops = load_flops(directory)
+    elif stage in RECURRENT_STAGES or stage == "neural":
         directory, flops = fit_component_budget(
             model, training, root, identity, settings,
             spec["seed"] + stage_index, budget, devices, microbatch,
@@ -157,6 +175,79 @@ def run_stage(
         exposure=component_exposure(directory, training),
     )
     return record, directory.name
+
+
+def fixed_targets(
+    partitions: tuple, dimensions: list[tuple[int, int]],
+    names: list[str], spec: dict, directory: Path, root: Path,
+    devices: tuple[str, str], microbatch: int,
+    reused: dict | None = None, initialize: object | None = None,
+) -> tuple[list, dict, str | None, str | None]:
+    """Fit/reuse fixed preprocessing and training-only target scales.
+
+    Parameters
+    ----------
+    partitions : tuple of three lists of dict
+        Train, inner and scoring Y/U/Z windows (windows, time, channels).
+    dimensions : list of tuple of int
+        Neural and behavioral channel counts for each recording.
+    names : list of str
+        Recordings included in stage scoring.
+    spec : dict
+        Scientific configuration, including the resolved fixed-stage cap.
+    directory, root : Path
+        Fit manifest directory and shared component store.
+    devices : tuple of str
+        Session placement cycle.
+    microbatch : int
+        Accumulation chunk size; does not define scientific identity.
+    reused : dict, optional
+        Completed stage references, default None.
+    initialize : callable, optional
+        Factory override for matched private initialization, default None.
+
+    Returns
+    -------
+    tuple
+        Prepared partitions, stage records, parent id, target manifest name.
+    """
+    reused = {} if reused is None else reused
+    build = initialize or (
+        lambda factory: factory(dimensions, spec, devices)
+    )
+    mode = target_mode(spec)
+    if mode == RECORDED:
+        prepared, _ = prepare_targets(partitions, mode)
+        return prepared, {}, None, None
+    neural = [[recurrent_data(row) for row in part] for part in partitions]
+    pre = build(preprocessing_model)
+    pre_record, parent = run_stage(
+        "preprocessing_neural", pre, neural[0], neural[2], names,
+        spec, root, None, 0, devices, microbatch,
+        validation=neural[1], reuse=reused.get("preprocessing_neural"),
+    )
+    states = [stage_predictions(pre, part)[1] for part in neural]
+    readout = build(preprocessing_readout_model)
+    behavior = [
+        readout_data([recurrent_data(row, "Z") for row in part], state)
+        for part, state in zip(partitions, states)
+    ]
+    record, parent = run_stage(
+        "preprocessing_behavior", readout, behavior[0], behavior[2],
+        names, spec, root, parent, 0, devices, microbatch,
+        validation=behavior[1], reuse=reused.get("preprocessing_behavior"),
+    )
+    prepared, scales = prepare_targets(partitions, mode, states, readout)
+    atomic_json(directory / "preprocessing.json", dict(
+        neural=pre_record["component_id"],
+        behavior=record["component_id"], scales=scales,
+        target_identity=fingerprint(dict(
+            parent=parent, scales=scales, data=spec["data_identity"],
+        )),
+    ))
+    return prepared, dict(
+        preprocessing_neural=pre_record, preprocessing_behavior=record,
+    ), parent, "preprocessing.json"
 
 
 def fit_source_campaign(
@@ -211,59 +302,16 @@ def fit_source_campaign(
     ]
     partitions = (train, validation, holdout)
     neural = [[recurrent_data(row) for row in part] for part in partitions]
-    mode = target_mode(spec)
-    direct_target = mode == RECORDED
-    if direct_target:
-        prepared, _ = prepare_targets(partitions, mode)
-        base_stages = {}
-        pre_parent = None
-        target_reference = None
-    else:
-        pre = preprocessing_model(component_dimensions, spec, devices)
-        pre_record, parent = run_stage(
-            "preprocessing_neural", pre, neural[0], neural[2], names,
-            spec, component_root, None, 0, devices, microbatch,
-            validation=neural[1], reuse=reused.get("preprocessing_neural"),
-        )
-        pre_states = [stage_predictions(pre, part)[1] for part in neural]
-        pre_readout = preprocessing_readout_model(
-            component_dimensions, spec, devices
-        )
-        behavior = [
-            readout_data([recurrent_data(row, "Z") for row in part], states)
-            for part, states in zip(partitions, pre_states)
-        ]
-        behavior_record, pre_parent = run_stage(
-            "preprocessing_behavior", pre_readout, behavior[0], behavior[2],
-            names, spec, component_root, parent, 0, devices, microbatch,
-            validation=behavior[1], reuse=reused.get("preprocessing_behavior"),
-        )
-        prepared, scales = prepare_targets(
-            partitions, mode, pre_states, pre_readout
-        )
-        atomic_json(directory / "preprocessing.json", dict(
-            neural=pre_record["component_id"],
-            behavior=behavior_record["component_id"], scales=scales,
-            target_identity=fingerprint(dict(
-                parent=pre_parent, scales=scales, data=spec["data_identity"],
-            )),
-        ))
-        if inherited:
-            saved_preprocessing = json.loads(
-                (ancestor / "preprocessing.json").read_text()
-            )
-            current_preprocessing = json.loads(
-                (directory / "preprocessing.json").read_text()
-            )
-            if saved_preprocessing != current_preprocessing:
-                raise ValueError(
-                    "Continuation changed fixed generated targets."
-                )
-        base_stages = dict(
-            preprocessing_neural=pre_record,
-            preprocessing_behavior=behavior_record,
-        )
-        target_reference = "preprocessing.json"
+    direct_target = target_mode(spec) == RECORDED
+    prepared, base_stages, pre_parent, target_reference = fixed_targets(
+        partitions, component_dimensions, names, spec, directory,
+        component_root, devices, microbatch, reused,
+    )
+    if inherited and target_reference is not None:
+        saved = json.loads((ancestor / target_reference).read_text())
+        current = json.loads((directory / target_reference).read_text())
+        if saved != current:
+            raise ValueError("Continuation changed fixed generated targets.")
     stage_data = [
         [recurrent_data(row, "Z") for row in part] for part in prepared
     ]
@@ -346,3 +394,145 @@ def fit_source_campaign(
             "chronological_source_test_and_transfer_selection"
         ),
     ))
+
+
+def selection_targets(
+    source: dict, common: dict, dimensions: list[tuple[int, int]],
+) -> tuple[list[dict], list[dict]]:
+    """Restore training/inner targets without reading outer-test arrays.
+
+    Generated targets use saved preprocessing and training-only scales.
+    Returned recurrent dictionaries contain arrays (windows, time, channels).
+    """
+    names = source["spec"]["sessions"][:4]
+    parts = [
+        [common[name][split] for name in names]
+        for split in ("training", "inner")
+    ]
+    if target_mode(source["spec"]) != RECORDED:
+        from experiments.multisession.data import Scale
+        from experiments.multisession.source import behavior_targets
+
+        saved = json.loads(
+            (source["fit"] / "preprocessing.json").read_text()
+        )
+        root = source["fit"].parent.parent / "source_components"
+        pre = preprocessing_model(dimensions, source["spec"])
+        readout = preprocessing_readout_model(dimensions, source["spec"])
+        restore_component(pre, root / saved["neural"])
+        restore_component(readout, root / saved["behavior"])
+        for path in source["paths"]:
+            for stage, key in (
+                ("preprocessing_neural", "neural"),
+                ("preprocessing_behavior", "behavior"),
+            ):
+                if path["stages"][stage]["component_id"] != saved[key]:
+                    raise ValueError("Budget changed fixed preprocessing.")
+        generated = []
+        for part in parts:
+            neural = [recurrent_data(row) for row in part]
+            states = stage_predictions(pre, neural)[1]
+            target = behavior_targets(readout, states, part)
+            for index, row in enumerate(target):
+                record = saved["scales"][index]
+                scale = Scale(
+                    np.asarray(record["mean"]), float(record["scale"]),
+                    np.asarray(record["keep"], dtype=bool),
+                )
+                row["Z"] = scale.apply(row["Z"])
+            generated.append(target)
+        parts = generated
+    return tuple([
+        recurrent_data(row, "Z") for row in part
+    ] for part in parts)
+
+
+def inner_source_choices(
+    sources: list[dict], common: dict,
+) -> tuple[list[dict], list[dict]]:
+    """Reselect saved behavioral budgets using their joint inner criterion."""
+    selected, rows = [], []
+    for source in sources:
+        spec = source["spec"]
+        names = spec["sessions"][:4]
+        inventory = source["inventory"]
+        dimensions = [
+            (
+                sum(inventory[name]["scales"]["Y"]["keep"]),
+                sum(inventory[name]["scales"]["Z"]["keep"]),
+            ) for name in spec["sessions"]
+        ]
+        from experiments.multisession.behavior_supervision.models import (
+            neural_readout_model, rnn1_model, rnn2_model,
+        )
+        main = rnn1_model(dimensions, spec)
+        readout = neural_readout_model(dimensions, spec)
+        residual = rnn2_model(dimensions, spec)
+        root = source["fit"].parent.parent / "source_components"
+        behavior_train, behavior_inner = selection_targets(
+            source, common, dimensions
+        )
+        neural_train = [
+            recurrent_data(common[name]["training"])
+            for name in names
+        ]
+        neural_inner = [
+            recurrent_data(common[name]["inner"])
+            for name in names
+        ]
+        ranking = []
+        session_rows = []
+        for path in source["paths"]:
+            stages = path["stages"]
+            for model, stage in (
+                (main, "behavior_relevant"),
+                (readout, "neural_readout"),
+                (residual, "residual"),
+            ):
+                restore_component(
+                    model, root / stages[stage]["component_id"]
+                )
+            behavior = score_component(
+                main, behavior_train, behavior_inner, names
+            )
+            neural = score_component(
+                residual,
+                neural_train,
+                residual_data(main, readout, neural_inner), names,
+            )
+            for stage, score in (("behavior", behavior), ("neural", neural)):
+                session_rows.extend(dict(
+                    stage=stage, budget=path["budget"], **record,
+                ) for record in score["per_session"])
+            criterion = behavior["mean_ratio"] + neural["mean_ratio"]
+            if not np.isfinite(criterion):
+                raise ValueError("Nonfinite direct inner selection score.")
+            ranking.append((
+                criterion, path["full_path_flops"], path
+            ))
+            rows.append(dict(
+                source_count=source["count"],
+                budget=path["budget"],
+                total_updates=path["total_updates"],
+                behavior_inner_ratio=behavior["mean_ratio"],
+                neural_inner_ratio=neural["mean_ratio"],
+                joint_inner_score=criterion,
+                full_path_flops=path["full_path_flops"],
+            ))
+        chosen = min(ranking, key=lambda row: (row[0], row[1]))[2]
+        derived = dict(source)
+        derived["path"] = chosen
+        derived["selection"] = dict(
+            source["selection"],
+            selected_budget=chosen["budget"],
+            selection_role="four_common_inner_validation",
+            selection_set_id=fingerprint({
+                name: inventory[name]["inner_validation"] for name in names
+            }),
+            selection_score=min(ranking, key=lambda row: (row[0], row[1]))[0],
+            selected_full_path_flops=chosen["full_path_flops"],
+        )
+        derived["inner_session_scores"] = session_rows
+        selected.append(derived)
+
+    return selected, rows

@@ -22,6 +22,7 @@ from experiments.multisession.behavior_compute_scaling.ancestry import (
     inherited_paths, restore_component,
 )
 from experiments.multisession.behavior_compute_scaling.pipeline import (
+    inner_source_choices as inner_direct_choices,
     score_component,
 )
 from experiments.multisession.behavior_compute_scaling.report import (
@@ -41,7 +42,6 @@ from experiments.multisession.data import session_windows, source_features
 from experiments.multisession.plan import analysis_directory
 from experiments.multisession.reports import write_table
 from experiments.multisession.runner import dataset
-from experiments.multisession.source import residual_data
 from experiments.multisession.store import (
     completed, fit_directory, job,
 )
@@ -189,91 +189,6 @@ def common_windows(
     if sum(len(row["test"]["Y"]) for row in common.values()) != 87:
         raise ValueError("Expected 87 fixed outer-test windows.")
     return common
-
-
-def inner_direct_choices(
-    sources: list[dict], common: dict,
-) -> tuple[list[dict], list[dict]]:
-    """Reselect saved direct budgets using their joint inner criterion."""
-    selected, rows = [], []
-    for source in sources:
-        spec = source["spec"]
-        names = spec["sessions"][:COMMON]
-        inventory = source["inventory"]
-        dimensions = [
-            (
-                sum(inventory[name]["scales"]["Y"]["keep"]),
-                sum(inventory[name]["scales"]["Z"]["keep"]),
-            ) for name in spec["sessions"]
-        ]
-        from experiments.multisession.behavior_supervision.models import (
-            neural_readout_model, rnn1_model, rnn2_model,
-        )
-        main = rnn1_model(dimensions, spec)
-        readout = neural_readout_model(dimensions, spec)
-        residual = rnn2_model(dimensions, spec)
-        root = source["fit"].parent.parent / "source_components"
-        behavior_train = [
-            recurrent_data(common[name]["training"], "Z")
-            for name in names
-        ]
-        behavior_inner = [
-            recurrent_data(common[name]["inner"], "Z")
-            for name in names
-        ]
-        neural_train = [
-            recurrent_data(common[name]["training"])
-            for name in names
-        ]
-        neural_inner = [
-            recurrent_data(common[name]["inner"])
-            for name in names
-        ]
-        ranking = []
-        for path in source["paths"]:
-            stages = path["stages"]
-            for model, stage in (
-                (main, "behavior_relevant"),
-                (readout, "neural_readout"),
-                (residual, "residual"),
-            ):
-                restore_component(
-                    model, root / stages[stage]["component_id"]
-                )
-            behavior = score_component(
-                main, behavior_train, behavior_inner, names
-            )
-            neural = score_component(
-                residual,
-                residual_data(main, readout, neural_train),
-                residual_data(main, readout, neural_inner), names,
-            )
-            criterion = behavior["mean_ratio"] + neural["mean_ratio"]
-            if not np.isfinite(criterion):
-                raise ValueError("Nonfinite direct inner selection score.")
-            ranking.append((
-                criterion, path["full_path_flops"], path
-            ))
-            rows.append(dict(
-                source_count=source["count"],
-                budget=path["budget"],
-                total_updates=path["total_updates"],
-                behavior_inner_ratio=behavior["mean_ratio"],
-                neural_inner_ratio=neural["mean_ratio"],
-                joint_inner_score=criterion,
-                full_path_flops=path["full_path_flops"],
-            ))
-        chosen = min(ranking, key=lambda row: (row[0], row[1]))[2]
-        derived = dict(source)
-        derived["path"] = chosen
-        derived["selection"] = dict(
-            source["selection"],
-            selected_budget=chosen["budget"],
-            selection_role="four_common_inner_validation",
-        )
-        selected.append(derived)
-        tf.keras.backend.clear_session()
-    return selected, rows
 
 
 def outer_source_losses(

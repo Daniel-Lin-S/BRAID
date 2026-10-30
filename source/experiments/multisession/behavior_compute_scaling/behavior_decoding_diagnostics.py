@@ -181,7 +181,7 @@ def fixed_windows(plan: dict, sources: list[dict]) -> dict:
             adapter.load(name), first["data"],
             first["source_training"]["inner_validation_fraction"],
         )
-        training, _, test, record = session_windows(
+        training, inner, test, record = session_windows(
             features, True, include_test=True,
         )
         for source in sources:
@@ -190,7 +190,7 @@ def fixed_windows(plan: dict, sources: list[dict]) -> dict:
                     f"Rebuilt source windows differ for {name} "
                     f"at {source['count']} sessions."
                 )
-        result[name] = dict(training=training, test=test)
+        result[name] = dict(training=training, inner=inner, test=test)
     return result
 
 
