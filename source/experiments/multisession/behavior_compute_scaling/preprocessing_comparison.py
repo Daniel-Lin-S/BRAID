@@ -1263,6 +1263,7 @@ def gain_figure(
     variants: tuple[str, ...] = VARIANTS,
     styles: dict | None = None,
     filename: str | None = None,
+    reference_label: str | None = None,
 ) -> Path:
     """Draw four horizon panels with both model families and four sessions."""
     if reference not in GAIN_REFERENCES:
@@ -1334,10 +1335,13 @@ def gain_figure(
                 f"Improvement in {decoding.METRIC_LABELS[metric]}"
             )
             axis.grid(alpha=0.15)
-        label = (
-            "matched single-session BRAID" if reference == "single_session"
-            else "the four-source model"
-        )
+        label = reference_label
+        if label is None:
+            label = (
+                "matched single-session BRAID"
+                if reference == "single_session"
+                else "the four-source model"
+            )
         figure.suptitle(
             fill(f"{group.capitalize()}: gain over {label}", 54),
             fontsize=22, y=0.97,

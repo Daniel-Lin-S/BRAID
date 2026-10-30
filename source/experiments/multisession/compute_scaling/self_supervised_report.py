@@ -504,6 +504,7 @@ def publish(plan: dict, plan_path: Path) -> Path:
     ))
     return destination
 PAIRED_PREFIX = "self-supervised-paired-single-session"
+PAIRED_REFERENCE_LABEL = "direct single-session BRAID"
 PAIRED_PROTOCOL = "self_supervised_and_direct_paired_single_v1"
 EXPECTED_BUDGETS = 7
 PAIRED_TABLE = "tables/paired_recording_gains.csv"
@@ -520,7 +521,7 @@ PAIRED_STYLES = {
         label="Direct behavior BRAID",
     ),
 }
-PAIRED_GUIDE = """# Seen-session gain over single-session BRAID
+PAIRED_GUIDE = """# Seen-session gain over direct single-session BRAID
 
 The nine performance figures show the same 87 chronological test windows
 in four seen Indy recordings, at 50/100/200/400 ms. Purple is BRAID
@@ -698,6 +699,7 @@ def publish_paired_view(source_report: Path, gain_report: Path) -> Path:
         variants=list(VARIANTS), groups=list(GROUPS),
         horizons=list(HORIZONS), metrics=list(METRICS),
         guide=PAIRED_GUIDE,
+        reference_label=PAIRED_REFERENCE_LABEL,
     )
     destination = (
         source_report.parent
@@ -726,6 +728,7 @@ def publish_paired_view(source_report: Path, gain_report: Path) -> Path:
                         metric, figures, variants=VARIANTS,
                         styles=PAIRED_STYLES,
                         filename=f"{group}_{metric}.png",
+                        reference_label=PAIRED_REFERENCE_LABEL,
                     )
             source_rows = [dict(
                 row, source_count=int(row["source_count"]),
