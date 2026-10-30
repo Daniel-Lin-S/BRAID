@@ -49,7 +49,7 @@ from experiments.multisession.behavior_compute_scaling.pipeline import (
 )
 from experiments.multisession.plan import analysis_directory
 from experiments.multisession.reports import write_table
-from experiments.multisession.store import completed, job
+from experiments.multisession.store import completed, fit_directory, job
 from experiments.storage.cache import atomic_json, fingerprint
 from experiments.visualization.multisession import (
     READABLE_TEXT_STYLE, plot_line,
@@ -650,18 +650,25 @@ def matched_sources(inputs: dict) -> tuple[dict, dict, Path]:
     """Cache inner-only selections independently of figures and private fits.
 
     Input keys are with_plan/with_source_report/direct_plan/direct_report
-    absolute paths. The immutable selection cache stores budget identifiers,
+    absolute paths; historical report paths are provenance only. Completed
+    source fits define membership. The selection cache stores budget identifiers,
     aggregate criteria and per-session raw/dummy losses; it never copies
     checkpoints or window inventories.
     """
     plans, groups, checksums = {}, {}, {}
     for variant, prefix in zip(VARIANTS, ("with", "direct")):
         plan_path = Path(inputs[f"{prefix}_plan"])
-        report = Path(inputs[
-            "with_source_report" if prefix == "with" else "direct_report"
-        ])
-        plans[variant] = json.loads(plan_path.read_text())
-        sources = decoding.checked_sources(plans[variant], report)
+        plan = json.loads(plan_path.read_text())
+        plans[variant] = plan
+        choices = []
+        for key in plan["source_references"]:
+            fit = fit_directory(plan, key)
+            checked_report(fit)
+            saved = json.loads((fit / "selection.json").read_text())
+            choices.append(dict(
+                source_fit=key, selected_budget=saved["selected_budget"],
+            ))
+        sources = decoding.checked_sources(plan, choices=choices)
         for source in sources:
             source["paths"] = inherited_paths(source["fit"])
             checksums[source["fit"].name] = checked_report(
@@ -1020,6 +1027,8 @@ def matched_coordinator(
         atomic_json(launch_dir / "error.json", dict(
             error=f"{type(error).__name__}: {error}",
         ))
+        if "preparation" in states:
+            states["preparation"] = "failed"
         baseline.status(launch_dir, states, "failed")
         raise
 
