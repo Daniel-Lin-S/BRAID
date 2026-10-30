@@ -114,10 +114,29 @@ def progress_path(launch: Path, key: str, budget: int) -> Path:
 def prefix_component(
     plan: dict, launch: Path, key: str, budget: int,
 ) -> Path | None:
-    """Resolve a checksum-valid RNN1 main checkpoint marker."""
+    """Resolve a checksum-valid main checkpoint or completed budget path."""
     marker = progress_path(launch, key, budget)
     if not marker.is_file():
-        return None
+        if key not in plan.get("continuation", {}):
+            return None
+        saved = budget_directory(plan, key, budget)
+        if completed(saved) is None:
+            return None
+        row = json.loads((saved / "path.json").read_text())
+        if row["budget"] != budget:
+            raise ValueError(
+                f"Saved neural budget differs: {saved.resolve()}."
+            )
+        from experiments.multisession.compute_scaling.ancestry import (
+            main_prefix,
+        )
+
+        branch = (
+            Path(plan["settings"]["paths"]["artifact_root"])
+            / "multi_session_training" / "source_components"
+            / row["stages"]["neural"]["component_id"]
+        )
+        return main_prefix(branch)
     record = json.loads(marker.read_text())
     component = (
         Path(plan["settings"]["paths"]["artifact_root"])

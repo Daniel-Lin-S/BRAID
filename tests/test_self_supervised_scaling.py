@@ -62,6 +62,66 @@ def test_extended_budget_uses_saved_path_without_refitting(
     ) != saved
 
 
+def test_completed_branches_restore_missing_prefix_markers(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """A resumed queue recognizes old and new completed main checkpoints."""
+    import json
+
+    from experiments.multisession.behavior_compute_scaling import (
+        budget_parallel,
+    )
+    from experiments.multisession.compute_scaling import ancestry
+
+    plan = source_plan(tmp_path)
+    plan["jobs"]["4"]["source_training"]["checkpoints"] = [
+        160, 320,
+    ]
+    old_budget = tmp_path / "previous" / "budget160"
+    plan["continuation"] = {
+        "4": {"budgets": {"160": str(old_budget)}},
+    }
+    active = set()
+    component_root = (
+        tmp_path / "multi_session_training" / "source_components"
+    )
+    for budget in (160, 320):
+        directory = budget_parallel.budget_directory(
+            plan, "4", budget
+        )
+        directory.mkdir(parents=True)
+        branch = component_root / f"branch{budget}"
+        branch.mkdir(parents=True)
+        parent = component_root / f"main{budget}"
+        parent.mkdir()
+        (branch / "identity.json").write_text(json.dumps(
+            {"branch": True, "parent": parent.name}
+        ))
+        (directory / "path.json").write_text(json.dumps({
+            "budget": budget,
+            "stages": {"neural": {"component_id": branch.name}},
+        }))
+        active.update((directory, branch, parent))
+
+    def completion(path: Path) -> dict | None:
+        """Treat only constructed budget and component paths as complete."""
+        return {"checksums": {}} if path in active else None
+
+    monkeypatch.setattr(budget_parallel, "completed", completion)
+    monkeypatch.setattr(ancestry, "completed", completion)
+    monkeypatch.setattr(budget_queue, "completed", completion)
+    launch = tmp_path / "new_launch"
+    assert budget_parallel.prefix_component(
+        plan, launch, "4", 160
+    ) == component_root / "main160"
+    prefix = next(
+        row for row in budget_queue.task_plan(plan)["jobs"].values()
+        if row["source_count"] == 4
+        and row["task_kind"] == "prefix"
+    )
+    assert budget_queue.task_complete(plan, launch, prefix)
+
+
 def test_extended_schedule_changes_only_budget_fields() -> None:
     """The main and decay ladder may extend without changing sampling."""
     from experiments.multisession.compute_scaling.self_supervised import (
