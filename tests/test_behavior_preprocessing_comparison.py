@@ -170,3 +170,61 @@ def test_worker_command_uses_importable_module() -> None:
     command = comparison.matched_command(inputs, "matched-worker")
     assert command[2] == comparison.MODULE
     assert "__main__" not in command
+
+
+def test_paired_views_match_recordings_and_orient_all_metrics() -> None:
+    """Both references use the same recording and positive means better."""
+    scores, controls = [], []
+    sessions = [f"session_{index}" for index in range(4)]
+    for variant in comparison.VARIANTS:
+        for group in comparison.GROUPS:
+            for horizon in comparison.HORIZONS:
+                for index, session in enumerate(sessions):
+                    common = dict(
+                        variant=variant, group=group, horizon=horizon,
+                        session=session, samples=100,
+                        dummy_mse=1.0, evaluation_set_id="fixed",
+                    )
+                    controls.append(dict(
+                        common, source_count=1, cc=0.4, r2=0.2,
+                        mse=0.8, mse_ratio=0.8,
+                    ))
+                    for count in comparison.COUNTS:
+                        gain = (count - 4) * 0.001 * (index + 1)
+                        scores.append(dict(
+                            common, source_count=count,
+                            cc=0.5 + gain, r2=0.3 + gain,
+                            mse=0.7 - gain,
+                            mse_ratio=0.7 - gain,
+                        ))
+    single = comparison.paired_gain_rows(
+        scores, controls, "single_session"
+    )
+    four = comparison.paired_gain_rows(scores, controls, "four_source")
+    selected = [row for row in four if (
+        row["variant"] == comparison.VARIANTS[0]
+        and row["source_count"] == 33
+        and row["group"] == "position"
+        and row["horizon"] == 1
+        and row["metric"] == "mse_ratio"
+    )]
+    assert [row["gain"] for row in selected] == pytest.approx(
+        [0.029, 0.058, 0.087, 0.116]
+    )
+    summary = comparison.gain_summary(four)
+    point = next(row for row in summary if (
+        row["reference"] == "four_source"
+        and row["variant"] == comparison.VARIANTS[0]
+        and row["source_count"] == 33
+        and row["group"] == "position"
+        and row["horizon"] == 1
+        and row["metric"] == "mse_ratio"
+    ))
+    assert point["mean_gain"] == pytest.approx(0.0725)
+    assert point["improved_sessions"] == 4
+    assert point["worsened_sessions"] == 0
+    assert len(single) == len(four) == 1152
+    bad = [dict(row) for row in controls]
+    bad[0]["dummy_mse"] = 2.0
+    with pytest.raises(ValueError, match="different samples"):
+        comparison.paired_gain_rows(scores, bad, "single_session")

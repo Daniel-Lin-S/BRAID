@@ -16,6 +16,8 @@ validation and queue one complete report; --stage matched-report regenerates
 that report from completed fits. --microbatch changes runtime accumulation.
 Lifecycle logs contain no performance tables; private worker logs are nested
 by model family and recording. No held-out session adaptations are launched.
+--stage paired-gain-report --matched-report ABSOLUTE_REPORT publishes paired
+recording views from saved complete scores without fitting.
 """
 
 import argparse
@@ -32,6 +34,7 @@ from textwrap import fill
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import numpy as np
 
 from experiments.multisession.behavior_compute_scaling import (
@@ -84,6 +87,11 @@ STYLES = {
 }
 FIGURE_SIZE = (15, 10)
 DPI = 180
+GAIN_PREFIX = "comparison-paired-gains-single-and-four-source"
+GAIN_PROTOCOL = "paired_recording_gain_views_v1"
+GAIN_MARKERS = ("o", "s", "^", "D")
+GAIN_REFERENCES = ("single_session", "four_source")
+SIGN_TOLERANCE = 1e-6
 GUIDE = """# Behavioral preprocessing comparison
 
 The purple model has the original n0=150 neural preprocessing, generated
@@ -651,7 +659,7 @@ def matched_sources(inputs: dict) -> tuple[dict, dict, Path]:
 
     Input keys are with_plan/with_source_report/direct_plan/direct_report
     absolute paths; historical report paths are provenance only. Completed
-    source fits define membership. The selection cache stores budget identifiers,
+    source fits define membership. The cache stores budget identifiers,
     aggregate criteria and per-session raw/dummy losses; it never copies
     checkpoints or window inventories.
     """
@@ -1076,29 +1084,400 @@ def launch_matched(inputs: dict, microbatch: int) -> Path:
     return launch_dir
 
 
+GAIN_GUIDE = """# Paired recording gains for BRAID source scaling
+
+The nine `vs_single` figures compare each multi-session protocol with its
+architecture-matched, independently fitted single-session BRAID on the same
+four recordings. The nine `vs_four` figures show the additional change from
+four to 8, 16, or 33 source recordings. Both protocols appear in every panel:
+purple is five-stage preprocessing BRAID plus n3=16; blue is three-stage
+direct-behavior BRAID without n3. Four thin marked lines show individual
+recordings; a thick line is their equal mean. The gray zero line means no
+change. The four-source gain is exactly zero at four sources by definition.
+
+For recording s, count c, metric m and reference r, the gain is
+`m(s,c) - m(s,r)` for CC and R2; for MSE/dummy MSE it is
+`m(s,r) - m(s,c)`. Thus positive means improvement for every metric.
+Single-session reference r=1 uses the matched control for that protocol and
+recording. Four-source reference r=4 uses that protocol's four-source fit.
+MSE/dummy MSE first divides each recording's model MSE by its own observed
+training-target-mean dummy MSE on the identical chronological test samples.
+Ratios above one remain valid. Positive/negative session counts classify
+gains outside an absolute tolerance of 1e-6; near-zero gains are neutral.
+
+The figures preserve all four trained horizons, position, velocity and full
+neural forecast, with CC, R2 and MSE/dummy MSE. Exact paired gains, means,
+minima, maxima and sign counts are in the tables. Source-loss panels link to
+the immutable input snapshot, and the original absolute-score tables remain
+there. These four seen recordings were present in source training on earlier
+chronological windows. Checkpoints and early stopping were selected using
+inner validation. Earlier historical outer-test inspection still limits a
+blind-test claim. One fit per configuration cannot estimate variation from
+training seeds; the four recording lines expose heterogeneity rather than
+formal statistical significance. No new model fit or adaptation is run.
+"""
+
+
+def gain_key(row: dict) -> tuple:
+    """Identify one protocol, recording, coordinate group and horizon."""
+    return (
+        row["variant"], row["session"], row["group"],
+        int(row["horizon"]),
+    )
+
+
+def checked_gain_scores(
+    rows: list[dict], counts: tuple[int, ...],
+) -> dict[tuple, dict]:
+    """Validate complete finite per-recording metrics and index them.
+
+    The returned dictionary keys append source count to ``gain_key``.
+    Expected rows cover two protocols, four recordings, three groups,
+    four horizons and every requested source count.
+    """
+    indexed = {}
+    for row in rows:
+        count = int(row["source_count"])
+        if count not in counts or row["variant"] not in VARIANTS:
+            raise ValueError("Unexpected protocol or source count in scores.")
+        key = (*gain_key(row), count)
+        if key in indexed:
+            raise ValueError(f"Duplicate recording score {key}.")
+        if int(row["samples"]) <= 0:
+            raise ValueError(f"Empty scored recording {key}.")
+        values = [float(row[metric]) for metric in METRICS]
+        values += [float(row["mse"]), float(row["dummy_mse"])]
+        if not np.isfinite(values).all() or values[-1] <= 0:
+            raise ValueError(f"Invalid recording metric or dummy MSE {key}.")
+        indexed[key] = row
+    expected = len(VARIANTS) * COMMON_SESSIONS
+    expected *= len(GROUPS) * len(HORIZONS) * len(counts)
+    if len(indexed) != expected:
+        raise ValueError(
+            f"Expected {expected} complete recording scores, "
+            f"got {len(indexed)}."
+        )
+    return indexed
+
+
+def paired_gain_rows(
+    scores: list[dict], controls: list[dict], reference: str,
+) -> list[dict]:
+    """Subtract a recording-matched control or four-source score.
+
+    Parameters
+    ----------
+    scores : list of dict
+        Selected multi-session per-recording scores at counts 4/8/16/33.
+    controls : list of dict
+        One single-session score per recording and protocol.
+    reference : str
+        ``single_session`` or ``four_source``.
+
+    Returns
+    -------
+    list of dict
+        One positive-is-better gain per metric and saved source score.
+    """
+    if reference not in GAIN_REFERENCES:
+        raise ValueError(f"Unknown paired reference {reference}.")
+    source = checked_gain_scores(scores, COUNTS)
+    baseline = checked_gain_scores(controls, (1,))
+    rows = []
+    for key, model in sorted(source.items()):
+        variant, session, group, horizon, count = key
+        baseline_count = 1 if reference == "single_session" else 4
+        paired = (baseline if baseline_count == 1 else source)[
+            (variant, session, group, horizon, baseline_count)
+        ]
+        if (
+            int(model["samples"]) != int(paired["samples"])
+            or not np.isclose(
+                float(model["dummy_mse"]), float(paired["dummy_mse"]),
+                rtol=1e-5, atol=1e-6,
+            )
+        ):
+            raise ValueError(
+                f"Paired model and reference use different samples: {key}."
+            )
+        if reference == "four_source" and (
+            model["evaluation_set_id"] != paired["evaluation_set_id"]
+        ):
+            raise ValueError(f"Source test identity changed for {key}.")
+        for metric in METRICS:
+            value = float(model[metric])
+            anchor = float(paired[metric])
+            gain = (
+                anchor - value if metric == "mse_ratio"
+                else value - anchor
+            )
+            if not np.isfinite(gain):
+                raise FloatingPointError(f"Nonfinite paired gain {key}.")
+            rows.append(dict(
+                reference=reference, variant=variant,
+                source_count=count, session=session,
+                group=group, horizon=horizon, metric=metric,
+                gain=gain, model_score=value, reference_score=anchor,
+                samples=int(model["samples"]),
+            ))
+    return rows
+
+
+def gain_summary(rows: list[dict]) -> list[dict]:
+    """Summarize paired effects across the four visible recordings."""
+    grouped = {}
+    for row in rows:
+        key = tuple(row[field] for field in (
+            "reference", "variant", "source_count", "group",
+            "horizon", "metric",
+        ))
+        grouped.setdefault(key, []).append(row)
+    summary = []
+    for key, values in sorted(grouped.items()):
+        sessions = {row["session"] for row in values}
+        if len(values) != COMMON_SESSIONS or len(sessions) != COMMON_SESSIONS:
+            raise ValueError(f"Expected four paired recordings for {key}.")
+        gains = np.asarray([row["gain"] for row in values], dtype=float)
+        if not np.isfinite(gains).all():
+            raise FloatingPointError(f"Nonfinite paired gains for {key}.")
+        summary.append(dict(
+            zip(("reference", "variant", "source_count", "group",
+                 "horizon", "metric"), key),
+            mean_gain=float(gains.mean()),
+            minimum_gain=float(gains.min()),
+            maximum_gain=float(gains.max()),
+            improved_sessions=int(np.sum(gains > SIGN_TOLERANCE)),
+            worsened_sessions=int(np.sum(gains < -SIGN_TOLERANCE)),
+            near_zero_sessions=int(np.sum(
+                np.abs(gains) <= SIGN_TOLERANCE
+            )),
+        ))
+    return summary
+
+
+def gain_figure(
+    rows: list[dict], summary: list[dict], reference: str,
+    group: str, metric: str, directory: Path,
+) -> Path:
+    """Draw four horizon panels with both model families and four sessions."""
+    if reference not in GAIN_REFERENCES:
+        raise ValueError(f"Unknown gain reference {reference}.")
+    names = sorted({row["session"] for row in rows})
+    if len(names) != COMMON_SESSIONS:
+        raise ValueError("Expected four recording names in gain figure.")
+    with plt.rc_context(READABLE_TEXT_STYLE):
+        figure, axes = plt.subplots(2, 2, figsize=(16, 11))
+        for axis, horizon in zip(axes.flat, HORIZONS):
+            extent = [0.0]
+            for variant in VARIANTS:
+                style = STYLES[variant]
+                for index, name in enumerate(names):
+                    selected = sorted((row for row in rows if (
+                        row["reference"] == reference
+                        and row["variant"] == variant
+                        and row["session"] == name
+                        and row["group"] == group
+                        and row["horizon"] == horizon
+                        and row["metric"] == metric
+                    )), key=lambda row: row["source_count"])
+                    if [
+                        row["source_count"] for row in selected
+                    ] != list(COUNTS):
+                        raise ValueError("Incomplete recording gain curve.")
+                    values = [row["gain"] for row in selected]
+                    extent.extend(values)
+                    plot_line(
+                        x=COUNTS, y=values, ax=axis,
+                        color=style["color"],
+                        linestyle=style["linestyle"],
+                        marker=GAIN_MARKERS[index],
+                        linewidth=1.3, markersize=5, alpha=0.48,
+                        label="_nolegend_",
+                    )
+                selected = sorted((row for row in summary if (
+                    row["reference"] == reference
+                    and row["variant"] == variant
+                    and row["group"] == group
+                    and row["horizon"] == horizon
+                    and row["metric"] == metric
+                )), key=lambda row: row["source_count"])
+                if [row["source_count"] for row in selected] != list(COUNTS):
+                    raise ValueError("Incomplete four-recording mean curve.")
+                values = [row["mean_gain"] for row in selected]
+                extent.extend(values)
+                plot_line(
+                    x=COUNTS, y=values, ax=axis,
+                    color=style["color"],
+                    linestyle=style["linestyle"],
+                    marker=style["marker"], linewidth=3.5,
+                    markersize=10, label="_nolegend_",
+                )
+            data = np.asarray(extent, dtype=float)
+            if not np.isfinite(data).all():
+                raise FloatingPointError("Nonfinite gain figure values.")
+            padding = max(0.01, 0.08 * float(np.ptp(data)))
+            axis.set_ylim(float(data.min() - padding),
+                          float(data.max() + padding))
+            axis.set_xscale("log", base=2)
+            axis.set_xlim(min(COUNTS) / 1.08, max(COUNTS) * 1.08)
+            axis.set_xticks(COUNTS, labels=[str(x) for x in COUNTS])
+            axis.axhline(0, color="#777777", linestyle=":", linewidth=1.5)
+            axis.set_title(f"{horizon * 50} ms", pad=11)
+            axis.set_xlabel("Source sessions")
+            axis.set_ylabel(
+                f"Improvement in {decoding.METRIC_LABELS[metric]}"
+            )
+            axis.grid(alpha=0.15)
+        label = (
+            "matched single-session BRAID" if reference == "single_session"
+            else "the four-source model"
+        )
+        figure.suptitle(
+            fill(f"{group.capitalize()}: gain over {label}", 54),
+            fontsize=22, y=0.97,
+        )
+        handles = [
+            Line2D([0], [0], color=STYLES[variant]["color"],
+                   marker=STYLES[variant]["marker"],
+                   linestyle=STYLES[variant]["linestyle"],
+                   linewidth=3.5, markersize=9,
+                   label=STYLES[variant]["label"] + " mean")
+            for variant in VARIANTS
+        ]
+        handles.extend(
+            Line2D([0], [0], color="#777777", linestyle="-",
+                   marker=GAIN_MARKERS[index], linewidth=1.3,
+                   markersize=7, label=(
+                       f"{name[5:9]}-{name[9:11]}-{name[11:13]}"
+                       f" ({name[-2:]})"
+                   ))
+            for index, name in enumerate(names)
+        )
+        figure.legend(
+            handles=handles, loc="lower center",
+            bbox_to_anchor=(0.5, 0.015), ncol=3, frameon=False,
+            title="Thick: four-recording mean   Thin: individual recording",
+        )
+        figure.subplots_adjust(
+            left=0.09, right=0.98, top=0.87, bottom=0.20,
+            hspace=0.43, wspace=0.29,
+        )
+        output = directory / f"{group}_{metric}_vs_{reference}.png"
+        figure.savefig(output, dpi=DPI, bbox_inches="tight")
+        plt.close(figure)
+    return output
+
+
+def publish_gain_views(report: Path) -> Path:
+    """Publish complete paired views from saved scores without fitting.
+
+    Input is one checksum-valid matched comparison report with the source
+    and single-session per-recording score tables. Output is a sibling
+    immutable report with paired tables and 18 performance figures. The four
+    source-loss panels are linked to the input report and checksum-pinned.
+    """
+    marker = checked_report(report)
+    identity = dict(
+        protocol=GAIN_PROTOCOL, source=report.name,
+        source_checksums=marker["checksums"],
+        references=list(GAIN_REFERENCES), groups=list(GROUPS),
+        horizons=list(HORIZONS), metrics=list(METRICS),
+        style="four_recording_curves_and_mean",
+        guide=GAIN_GUIDE,
+    )
+    destination = report.parent / f"{GAIN_PREFIX}-{fingerprint(identity)}"
+    with job(destination, identity) as needed:
+        if needed:
+            scores = read_rows(report / "tables" / "session_scores.csv")
+            controls = read_rows(report / "tables" / "baseline_scores.csv")
+            rows = [
+                row for reference in GAIN_REFERENCES
+                for row in paired_gain_rows(scores, controls, reference)
+            ]
+            summary = gain_summary(rows)
+            tables = destination / "tables"
+            figures = destination / "figures"
+            tables.mkdir()
+            figures.mkdir()
+            write_table(tables / "paired_recording_gains.csv", rows)
+            write_table(tables / "paired_gain_summary.csv", summary)
+            for name in (
+                "direct_no_n3_source_behavior_relevant.png",
+                "direct_no_n3_source_residual.png",
+                "with_preprocessing_n3_16_source_behavior_relevant.png",
+                "with_preprocessing_n3_16_source_residual.png",
+            ):
+                target = report / "figures" / name
+                if not target.is_file():
+                    raise ValueError(f"Missing source-loss panel {target}.")
+                (figures / name).symlink_to(target)
+            for reference in GAIN_REFERENCES:
+                for group in GROUPS:
+                    for metric in METRICS:
+                        gain_figure(
+                            rows, summary, reference, group, metric, figures
+                        )
+            (destination / "guide.md").write_text(GAIN_GUIDE)
+            atomic_json(destination / "inputs.json", dict(
+                matched_report=str(report.resolve()),
+                matched_checksums=marker["checksums"],
+            ))
+    checked_report(destination)
+    pointer = dict(
+        snapshot=str(destination.resolve()),
+        figures=str((destination / "figures").resolve()),
+        identity=fingerprint(identity),
+    )
+    root = report.parent.parent
+    for name in (
+        "latest_paired_gain_comparison.json",
+        "latest_matched_baseline_comparison.json",
+        "latest_preprocessing_comparison.json",
+        "latest_report.json",
+        "latest_figures.json",
+        "latest_source_figures.json",
+        "latest_performance_figures.json",
+    ):
+        atomic_json(root / name, pointer)
+    figure_dir = (destination / "figures").resolve()
+    print(f"Saved paired comparison figures: {figure_dir}")
+    return destination
+
+
 def main() -> None:
     """Compare each campaign at its saved best-budget checkpoints."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage", default="saved", choices=(
         "saved", "matched-launch", "matched-audit", "matched-prepare",
         "matched-worker", "matched-coordinator", "matched-report",
+        "paired-gain-report",
     ))
     parser.add_argument("--microbatch", type=int, default=4)
     parser.add_argument("--task-index", type=int)
     parser.add_argument("--launch-dir", type=Path)
+    parser.add_argument("--matched-report", type=Path)
     for name in (
         "with-plan", "with-source-report", "with-n3-report",
         "direct-plan", "direct-report",
     ):
         parser.add_argument(
-            f"--{name}", required=name != "with-n3-report", type=Path
+            f"--{name}", type=Path
         )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
+    if args.stage == "paired-gain-report":
+        if args.matched_report is None:
+            raise ValueError("Paired gains require --matched-report.")
+        publish_gain_views(args.matched_report.resolve())
+        return
+    required = (
+        "with_plan", "with_source_report", "direct_plan", "direct_report"
+    )
+    missing = [key for key in required if getattr(args, key) is None]
+    if missing:
+        raise ValueError(f"Missing required comparison inputs: {missing}.")
     inputs = {
-        key: str(getattr(args, key).resolve()) for key in (
-            "with_plan", "with_source_report", "direct_plan", "direct_report"
-        )
+        key: str(getattr(args, key).resolve()) for key in required
     }
     if args.stage != "saved":
         if args.stage in ("matched-audit", "matched-prepare", "matched-worker"):
