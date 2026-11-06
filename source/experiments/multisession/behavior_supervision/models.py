@@ -80,3 +80,31 @@ def rnn2_model(
         forward_dimensions=latent + TASK_WIDTH,
         session_devices=devices,
     )
+
+
+def rnn2_direct_model(
+    dimensions: list[tuple[int, int]], spec: dict,
+    devices: tuple[str, str] | None = None,
+) -> MixedForecaster:
+    """Build RNN2 to forecast neural channels without RNN1 state input.
+
+    Parameters
+    ----------
+    dimensions : list of tuple of int
+        Per-session (neural channels, behavioral channels).
+    spec : dict
+        Scientific specification with latent width and paired seed.
+    devices : tuple of str, optional
+        Private-map device cycle; default None uses caller placement.
+
+    Returns
+    -------
+    MixedForecaster
+        Direct neural forecaster with inputs (Y, U), targets Y, and
+        horizon-first predictions (4, windows, 128, neural channels).
+    """
+    return MixedForecaster(
+        [(neural, neural) for neural, _ in dimensions],
+        spec["latent"], STAGE2_SHARING, spec["seed"] + 4,
+        session_devices=devices,
+    )

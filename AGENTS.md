@@ -64,6 +64,12 @@ You should parallelise independent neural fits whenever possible. Independent ex
 
 For multi-stage experiment with cross-stage dependencies, DONT parallelise.
 
+## Computational efficiency
+
+Cache and reuse intermediate results that are shared for multiple times. This includes cleaned neural recordings, features extracted by pre-trained mdoels used for several times, models sharing the same initial stages etc.
+
+However, DONT overload disk space by trying to save checkpoint and results for every step.
+
 ## Configurations and compaign identity
 
 ONLY hash a model's fit using its scientific parameters (e.g., batch size, number of epochs, architectural parameters).
